@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use server::create_router;
+use server::{create_router, run_reconciler_loop, AppState};
 use tracing::info;
 
 #[tokio::main]
@@ -10,6 +10,11 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let state = AppState::from_env().context("failed to initialize server state")?;
+    if state.reconciler_enabled() {
+        tokio::spawn(run_reconciler_loop(state.clone()));
+    }
+
     let addr = read_bind_addr().context("failed to parse bind address")?;
     let listener = tokio::net::TcpListener::bind(addr)
         .await
@@ -17,7 +22,7 @@ async fn main() -> Result<()> {
 
     info!(%addr, "rustploy-server listening");
 
-    axum::serve(listener, create_router())
+    axum::serve(listener, create_router(state))
         .await
         .context("server exited with error")
 }

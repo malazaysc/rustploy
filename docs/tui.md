@@ -16,17 +16,15 @@ Rustploy should provide a first-party terminal interface for operators working d
 
 ## Core screens (v0.1)
 
-- Apps list with health and last deploy status.
-- App detail with environments, domains, and deployment history.
-- Live logs viewer via SSE/WebSocket bridge.
+- Command-driven app list and deployment history views.
 - Deployment trigger and rollback actions.
-- Token status and API connectivity checks.
+- API connectivity and auth checks through token-backed requests.
 
 ## Interaction model
 
-- Keyboard-first navigation (`j/k`, arrows, quick actions).
-- Command palette for frequent actions.
-- Read-only mode when token scope is limited.
+- Keyboard-only command loop for SSH sessions.
+- Quick commands for `apps`, `deployments`, `deploy`, and `rollback`.
+- Scope-aware behavior (`read` token cannot deploy).
 
 ## Delivery model
 

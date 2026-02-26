@@ -1,6 +1,6 @@
 # TASK-013: Public API and token access
 
-- Status: Todo
+- Status: Done
 - Priority: P0
 - Estimate: 5-7 days
 - Owner: Unassigned

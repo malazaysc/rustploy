@@ -1,6 +1,6 @@
 # TASK-015: Next.js zero-config builds and package manager support
 
-- Status: Todo
+- Status: In Progress
 - Priority: P0
 - Estimate: 6-9 days
 - Owner: Unassigned

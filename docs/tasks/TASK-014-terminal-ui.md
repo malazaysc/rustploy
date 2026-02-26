@@ -1,6 +1,6 @@
 # TASK-014: Terminal UI (TUI)
 
-- Status: Todo
+- Status: In Progress
 - Priority: P1
 - Estimate: 6-8 days
 - Owner: Unassigned

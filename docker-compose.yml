@@ -1,0 +1,33 @@
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_BIN: server
+    environment:
+      RUSTPLOY_SERVER_ADDR: 0.0.0.0:8080
+      RUSTPLOY_DB_PATH: /data/rustploy.db
+      # RUSTPLOY_AGENT_TOKEN: change-me
+      # RUSTPLOY_GITHUB_WEBHOOK_SECRET: change-me
+    ports:
+      - "8080:8080"
+    volumes:
+      - rustploy-data:/data
+
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_BIN: agent
+    environment:
+      RUSTPLOY_SERVER_ADDR: server:8080
+      RUSTPLOY_HEARTBEAT_INTERVAL_SECS: 10
+      # RUSTPLOY_AGENT_TOKEN: change-me
+    depends_on:
+      - server
+    restart: unless-stopped
+
+volumes:
+  rustploy-data:

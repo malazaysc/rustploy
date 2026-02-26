@@ -1,6 +1,6 @@
 # TASK-004: GitHub App integration
 
-- Status: Todo
+- Status: Done
 - Priority: P0
 - Estimate: 6-8 days
 - Owner: Unassigned

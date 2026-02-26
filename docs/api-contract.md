@@ -1,6 +1,6 @@
 # API Contract (v0.1)
 
-This document defines wire-level request/response shapes for Rustploy API endpoints used by Web UI, TUI, and external clients.
+This document summarizes the currently implemented wire contract.
 The canonical machine-readable source is [`../openapi.yaml`](../openapi.yaml).
 
 Base path: `/api/v1`
@@ -8,45 +8,53 @@ Base path: `/api/v1`
 ## Common conventions
 
 - `Content-Type: application/json`
-- Authentication: `Authorization: Bearer <token>` for token clients
-- Timestamps: RFC 3339 UTC strings
+- Token auth: `Authorization: Bearer <token>`
+- Agent auth (optional): `x-rustploy-agent-token: <token>`
 - IDs: UUID strings
+- Timestamps: unix milliseconds
 
-## Error format
+## Bootstrap behavior
 
-All non-2xx responses return:
+- If no API token exists yet, privileged endpoints are temporarily open.
+- After the first token is created, token auth is required.
+
+## Implemented endpoint groups
+
+- Health: `GET /health`
+- Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
+- Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
+- GitHub: `POST /apps/{app_id}/github`, `POST /integrations/github/webhook`
+- Deployments: `GET/POST /apps/{app_id}/deployments`, `POST /apps/{app_id}/rollback`
+- Tokens: `GET/POST /tokens`, `DELETE /tokens/{token_id}`
+
+## Example: create admin token
 
 ```json
 {
-  "error": {
-    "code": "invalid_request",
-    "message": "Human readable summary",
-    "details": {
-      "field": "repository_url"
-    },
-    "request_id": "req_01J..."
+  "name": "admin",
+  "scopes": ["admin"],
+  "expires_in_seconds": null
+}
+```
+
+Response (201):
+
+```json
+{
+  "token": "rp_<redacted>",
+  "summary": {
+    "id": "f3f8c0ed-c2d1-46c6-9a24-910398f7afc0",
+    "name": "admin",
+    "scopes": ["admin", "deploy", "read"],
+    "created_at_unix_ms": 1708980000000,
+    "expires_at_unix_ms": null,
+    "revoked_at_unix_ms": null,
+    "last_used_at_unix_ms": null
   }
 }
 ```
 
-Error codes (initial):
-
-- `invalid_request`
-- `unauthorized`
-- `forbidden`
-- `not_found`
-- `conflict`
-- `rate_limited`
-- `build_detection_failed`
-- `internal_error`
-
-## Import endpoint
-
-`POST /apps/import`
-
-Purpose: import a GitHub repository and detect build profile/package manager.
-
-### Request
+## Example: import app
 
 ```json
 {
@@ -60,75 +68,8 @@ Purpose: import a GitHub repository and detect build profile/package manager.
     "branch": "main",
     "commit_sha": null
   },
-  "build_mode": "auto",
-  "runtime": {
-    "port": 3000,
-    "healthcheck_path": "/"
-  },
-  "dependency_profile": {
-    "postgres": false,
-    "redis": false
-  }
+  "build_mode": "auto"
 }
 ```
 
-### Response (201)
-
-```json
-{
-  "app": {
-    "id": "6e7d3b70-b02d-4dc0-bd8e-f4b7e6e9d845",
-    "name": "next-app",
-    "created_at": "2026-02-26T18:20:00Z"
-  },
-  "detection": {
-    "framework": "nextjs",
-    "package_manager": "pnpm",
-    "lockfile": "pnpm-lock.yaml",
-    "build_profile": "nextjs-standalone-v1",
-    "dockerfile_present": false
-  },
-  "next_action": {
-    "type": "create_deployment",
-    "deploy_endpoint": "/api/v1/apps/6e7d3b70-b02d-4dc0-bd8e-f4b7e6e9d845/deployments"
-  }
-}
-```
-
-## Deployment create endpoint
-
-`POST /apps/{app_id}/deployments`
-
-### Request
-
-```json
-{
-  "source": {
-    "type": "repo",
-    "branch": "main",
-    "commit_sha": "a1b2c3d4"
-  },
-  "build": {
-    "mode": "auto",
-    "profile": "nextjs-standalone-v1"
-  },
-  "reason": "manual"
-}
-```
-
-### Response (202)
-
-```json
-{
-  "deployment_id": "8fc14d1f-4f9b-4c24-9f35-2032a8b31f7f",
-  "status": "queued",
-  "queued_at": "2026-02-26T18:25:00Z"
-}
-```
-
-## Pagination
-
-List endpoints use cursor pagination:
-
-- Request: `?limit=50&cursor=<opaque>`
-- Response: `{ "items": [...], "next_cursor": "..." }`
+Response includes detected framework/package manager and deploy endpoint for the imported app.

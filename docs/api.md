@@ -22,31 +22,33 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 
 ## Minimum v0.1 endpoints
 
+- `POST /api/v1/apps/import`
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
-- `GET /api/v1/apps/{app_id}`
-- `PATCH /api/v1/apps/{app_id}`
-- `POST /api/v1/apps/import` (repo import + build profile detection)
+- `POST /api/v1/apps/{app_id}/github`
 - `POST /api/v1/apps/{app_id}/deployments`
 - `GET /api/v1/apps/{app_id}/deployments`
 - `POST /api/v1/apps/{app_id}/rollback`
-- `POST /api/v1/apps/{app_id}/domains`
-- `GET /api/v1/apps/{app_id}/logs/stream` (SSE)
 - `POST /api/v1/tokens`
 - `GET /api/v1/tokens`
 - `DELETE /api/v1/tokens/{token_id}`
+- `POST /api/v1/integrations/github/webhook`
 
 ## Security requirements
 
 - Token hashes stored, never raw tokens.
 - Expiration and revocation support.
-- Rate limits per token and per IP.
+- Token scope enforcement (`read`, `deploy`, `admin`).
 - Full webhook signature verification.
 
 ## Developer experience
 
 - Publish OpenAPI spec from source.
-- Generate API docs page from OpenAPI.
 - Include curl examples in user docs.
 - Keep API compatibility stable across web and TUI client releases.
 - Return detected package manager and build profile in import responses.
+
+## Bootstrap behavior
+
+- If there are no API tokens yet, privileged endpoints are temporarily open.
+- After the first token is created, `Authorization: Bearer <token>` is required.

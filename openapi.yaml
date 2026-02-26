@@ -2,20 +2,419 @@ openapi: 3.1.0
 info:
   title: Rustploy API
   version: 0.1.0
-  description: |
-    Source OpenAPI definition for Rustploy v0.1.
+  description: OpenAPI definition for the currently implemented Rustploy control-plane API.
 servers:
   - url: /api/v1
-tags:
-  - name: Apps
-  - name: Deployments
-  - name: Tokens
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Token
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+    CreateAppRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    App:
+      type: object
+      required: [id, name, created_at_unix_ms, updated_at_unix_ms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        created_at_unix_ms:
+          type: integer
+          format: int64
+        updated_at_unix_ms:
+          type: integer
+          format: int64
+    AppListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/App'
+    CreateDeploymentRequest:
+      type: object
+      properties:
+        source_ref:
+          type: [string, 'null']
+        simulate_failures:
+          type: [integer, 'null']
+          minimum: 0
+    CreateDeploymentAccepted:
+      type: object
+      required: [deployment_id, status, queued_at_unix_ms]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [queued, deploying, retrying, healthy, failed]
+        queued_at_unix_ms:
+          type: integer
+          format: int64
+    Deployment:
+      type: object
+      required: [id, app_id, status, created_at_unix_ms, updated_at_unix_ms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        app_id:
+          type: string
+          format: uuid
+        source_ref:
+          type: [string, 'null']
+        status:
+          type: string
+          enum: [queued, deploying, retrying, healthy, failed]
+        last_error:
+          type: [string, 'null']
+        created_at_unix_ms:
+          type: integer
+          format: int64
+        updated_at_unix_ms:
+          type: integer
+          format: int64
+    DeploymentListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Deployment'
+    GithubConnectRequest:
+      type: object
+      required: [owner, repo, branch]
+      properties:
+        owner:
+          type: string
+        repo:
+          type: string
+        branch:
+          type: string
+        installation_id:
+          type: [integer, 'null']
+          format: int64
+    GithubIntegrationSummary:
+      type: object
+      required: [app_id, owner, repo, branch]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        owner:
+          type: string
+        repo:
+          type: string
+        branch:
+          type: string
+        installation_id:
+          type: [integer, 'null']
+          format: int64
+    GithubWebhookAccepted:
+      type: object
+      required: [accepted, matched_integrations, queued_deployments]
+      properties:
+        accepted:
+          type: boolean
+        matched_integrations:
+          type: integer
+        queued_deployments:
+          type: integer
+    RepositoryRef:
+      type: object
+      required: [provider, owner, name]
+      properties:
+        provider:
+          type: string
+          example: github
+        owner:
+          type: string
+        name:
+          type: string
+        clone_url:
+          type: [string, 'null']
+        default_branch:
+          type: [string, 'null']
+    SourceRef:
+      type: object
+      properties:
+        branch:
+          type: [string, 'null']
+        commit_sha:
+          type: [string, 'null']
+    DependencyProfile:
+      type: object
+      properties:
+        postgres:
+          type: [boolean, 'null']
+        redis:
+          type: [boolean, 'null']
+    ImportAppRequest:
+      type: object
+      required: [repository]
+      properties:
+        repository:
+          $ref: '#/components/schemas/RepositoryRef'
+        source:
+          $ref: '#/components/schemas/SourceRef'
+        build_mode:
+          type: [string, 'null']
+          enum: [auto, dockerfile, null]
+        runtime:
+          type: [object, 'null']
+        dependency_profile:
+          $ref: '#/components/schemas/DependencyProfile'
+    DetectionResult:
+      type: object
+      required: [framework, package_manager, build_profile, dockerfile_present]
+      properties:
+        framework:
+          type: string
+        package_manager:
+          type: string
+          enum: [npm, pnpm, yarn]
+        lockfile:
+          type: [string, 'null']
+        build_profile:
+          type: string
+        dockerfile_present:
+          type: boolean
+    NextAction:
+      type: object
+      required: [action_type, deploy_endpoint]
+      properties:
+        action_type:
+          type: string
+        deploy_endpoint:
+          type: string
+    ImportAppResponse:
+      type: object
+      required: [app, detection, next_action]
+      properties:
+        app:
+          $ref: '#/components/schemas/App'
+        detection:
+          $ref: '#/components/schemas/DetectionResult'
+        next_action:
+          $ref: '#/components/schemas/NextAction'
+    CreateTokenRequest:
+      type: object
+      required: [name, scopes]
+      properties:
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [read, deploy, admin]
+        expires_in_seconds:
+          type: [integer, 'null']
+          format: int64
+    TokenSummary:
+      type: object
+      required: [id, name, scopes, created_at_unix_ms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        created_at_unix_ms:
+          type: integer
+          format: int64
+        expires_at_unix_ms:
+          type: [integer, 'null']
+          format: int64
+        revoked_at_unix_ms:
+          type: [integer, 'null']
+          format: int64
+        last_used_at_unix_ms:
+          type: [integer, 'null']
+          format: int64
+    TokenListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TokenSummary'
+    CreateTokenResponse:
+      type: object
+      required: [token, summary]
+      properties:
+        token:
+          type: string
+        summary:
+          $ref: '#/components/schemas/TokenSummary'
+    AgentRegisterRequest:
+      type: object
+      required: [agent_id, agent_version]
+      properties:
+        agent_id:
+          type: string
+          format: uuid
+        agent_version:
+          type: string
+    AgentRegistered:
+      type: object
+      required: [accepted, created]
+      properties:
+        accepted:
+          type: boolean
+        created:
+          type: boolean
+    AgentHeartbeat:
+      type: object
+      required: [agent_id, timestamp_unix_ms, agent_version]
+      properties:
+        agent_id:
+          type: string
+          format: uuid
+        timestamp_unix_ms:
+          type: integer
+          format: int64
+        agent_version:
+          type: string
+    HeartbeatAccepted:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+    AgentSummary:
+      type: object
+      required: [agent_id, agent_version, first_seen_unix_ms, last_seen_unix_ms, status]
+      properties:
+        agent_id:
+          type: string
+          format: uuid
+        agent_version:
+          type: string
+        first_seen_unix_ms:
+          type: integer
+          format: int64
+        last_seen_unix_ms:
+          type: integer
+          format: int64
+        status:
+          type: string
+          enum: [online, offline]
+    AgentListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentSummary'
 paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /agents:
+    get:
+      summary: List agents
+      operationId: listAgents
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Agent list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentListResponse'
+  /agents/register:
+    post:
+      summary: Register agent
+      operationId: registerAgent
+      parameters:
+        - name: x-rustploy-agent-token
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegisterRequest'
+      responses:
+        '200':
+          description: Updated existing agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistered'
+        '201':
+          description: Created new agent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegistered'
+  /agents/heartbeat:
+    post:
+      summary: Record heartbeat
+      operationId: heartbeatAgent
+      parameters:
+        - name: x-rustploy-agent-token
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentHeartbeat'
+      responses:
+        '202':
+          description: Heartbeat accepted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatAccepted'
   /apps/import:
     post:
-      tags: [Apps]
-      summary: Import repository and detect build profile
+      summary: Import app from repository and detect build profile
       operationId: importApp
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -24,42 +423,29 @@ paths:
               $ref: '#/components/schemas/ImportAppRequest'
       responses:
         '201':
-          description: App imported and detection completed
+          description: Imported app
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportAppResponse'
-        '400':
-          description: Invalid request
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
   /apps:
     get:
-      tags: [Apps]
       summary: List apps
       operationId: listApps
-      parameters:
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+      security:
+        - bearerAuth: []
       responses:
         '200':
-          description: Paginated list of apps
+          description: App list
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppListResponse'
     post:
-      tags: [Apps]
       summary: Create app
       operationId: createApp
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -73,67 +459,64 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/App'
-  /apps/{app_id}:
-    get:
-      tags: [Apps]
-      summary: Get app
-      operationId: getApp
+  /apps/{app_id}/github:
+    post:
+      summary: Connect app to a GitHub owner/repo/branch mapping
+      operationId: connectGithub
+      security:
+        - bearerAuth: []
       parameters:
-        - $ref: '#/components/parameters/AppId'
-      responses:
-        '200':
-          description: App details
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/App'
-        '404':
-          description: Not found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-    patch:
-      tags: [Apps]
-      summary: Update app
-      operationId: updateApp
-      parameters:
-        - $ref: '#/components/parameters/AppId'
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UpdateAppRequest'
+              $ref: '#/components/schemas/GithubConnectRequest'
       responses:
         '200':
-          description: Updated app
+          description: Mapping stored
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/App'
+                $ref: '#/components/schemas/GithubIntegrationSummary'
   /apps/{app_id}/deployments:
     get:
-      tags: [Deployments]
       summary: List deployments
       operationId: listDeployments
+      security:
+        - bearerAuth: []
       parameters:
-        - $ref: '#/components/parameters/AppId'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
         '200':
-          description: Paginated list of deployments
+          description: Deployment list
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/DeploymentListResponse'
     post:
-      tags: [Deployments]
       summary: Create deployment
       operationId: createDeployment
+      security:
+        - bearerAuth: []
       parameters:
-        - $ref: '#/components/parameters/AppId'
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       requestBody:
         required: true
         content:
@@ -146,51 +529,73 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CreateDeploymentResponse'
+                $ref: '#/components/schemas/CreateDeploymentAccepted'
   /apps/{app_id}/rollback:
     post:
-      tags: [Deployments]
-      summary: Roll back app to previous healthy deployment
+      summary: Rollback to latest healthy source
       operationId: rollbackDeployment
+      security:
+        - bearerAuth: []
       parameters:
-        - $ref: '#/components/parameters/AppId'
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
       responses:
         '202':
-          description: Rollback queued
+          description: Rollback deployment queued
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CreateDeploymentResponse'
-  /apps/{app_id}/logs/stream:
-    get:
-      tags: [Deployments]
-      summary: Stream app logs
-      operationId: streamLogs
+                $ref: '#/components/schemas/CreateDeploymentAccepted'
+  /integrations/github/webhook:
+    post:
+      summary: Receive GitHub webhook events
+      operationId: githubWebhook
       parameters:
-        - $ref: '#/components/parameters/AppId'
+        - name: x-github-event
+          in: header
+          required: false
+          schema:
+            type: string
+        - name: x-hub-signature-256
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
       responses:
-        '200':
-          description: Server-Sent Events stream
+        '202':
+          description: Event accepted
           content:
-            text/event-stream:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/GithubWebhookAccepted'
   /tokens:
     get:
-      tags: [Tokens]
       summary: List API tokens
       operationId: listTokens
+      security:
+        - bearerAuth: []
       responses:
         '200':
-          description: Token metadata list
+          description: Token list
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TokenListResponse'
     post:
-      tags: [Tokens]
       summary: Create API token
       operationId: createToken
+      security:
+        - bearerAuth: []
       requestBody:
         required: true
         content:
@@ -199,16 +604,17 @@ paths:
               $ref: '#/components/schemas/CreateTokenRequest'
       responses:
         '201':
-          description: Token created (secret shown once)
+          description: Created token (secret shown once)
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateTokenResponse'
   /tokens/{token_id}:
     delete:
-      tags: [Tokens]
-      summary: Revoke token
-      operationId: deleteToken
+      summary: Revoke API token
+      operationId: revokeToken
+      security:
+        - bearerAuth: []
       parameters:
         - name: token_id
           in: path
@@ -218,300 +624,4 @@ paths:
             format: uuid
       responses:
         '204':
-          description: Token revoked
-components:
-  securitySchemes:
-    bearerAuth:
-      type: http
-      scheme: bearer
-      bearerFormat: Token
-  parameters:
-    AppId:
-      name: app_id
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    Limit:
-      name: limit
-      in: query
-      schema:
-        type: integer
-        minimum: 1
-        maximum: 200
-        default: 50
-    Cursor:
-      name: cursor
-      in: query
-      schema:
-        type: string
-  schemas:
-    RepositoryRef:
-      type: object
-      required: [provider, owner, name]
-      properties:
-        provider:
-          type: string
-          enum: [github]
-        owner:
-          type: string
-        name:
-          type: string
-        default_branch:
-          type: string
-          default: main
-    SourceRef:
-      type: object
-      properties:
-        branch:
-          type: string
-          default: main
-        commit_sha:
-          type: [string, 'null']
-    RuntimeConfig:
-      type: object
-      properties:
-        port:
-          type: integer
-          minimum: 1
-          maximum: 65535
-        healthcheck_path:
-          type: string
-          default: /
-    DependencyProfile:
-      type: object
-      properties:
-        postgres:
-          type: boolean
-          default: false
-        redis:
-          type: boolean
-          default: false
-    ImportAppRequest:
-      type: object
-      required: [repository]
-      properties:
-        repository:
-          $ref: '#/components/schemas/RepositoryRef'
-        source:
-          $ref: '#/components/schemas/SourceRef'
-        build_mode:
-          type: string
-          enum: [auto, dockerfile]
-          default: auto
-        runtime:
-          $ref: '#/components/schemas/RuntimeConfig'
-        dependency_profile:
-          $ref: '#/components/schemas/DependencyProfile'
-    App:
-      type: object
-      required: [id, name, created_at]
-      properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-    DetectionResult:
-      type: object
-      required: [framework, package_manager, build_profile, dockerfile_present]
-      properties:
-        framework:
-          type: string
-          example: nextjs
-        package_manager:
-          type: string
-          enum: [npm, pnpm, yarn]
-        lockfile:
-          type: [string, 'null']
-        build_profile:
-          type: string
-          example: nextjs-standalone-v1
-        dockerfile_present:
-          type: boolean
-    NextAction:
-      type: object
-      properties:
-        type:
-          type: string
-          enum: [create_deployment]
-        deploy_endpoint:
-          type: string
-    ImportAppResponse:
-      type: object
-      required: [app, detection]
-      properties:
-        app:
-          $ref: '#/components/schemas/App'
-        detection:
-          $ref: '#/components/schemas/DetectionResult'
-        next_action:
-          $ref: '#/components/schemas/NextAction'
-    CreateAppRequest:
-      type: object
-      required: [name]
-      properties:
-        name:
-          type: string
-        runtime:
-          $ref: '#/components/schemas/RuntimeConfig'
-    UpdateAppRequest:
-      type: object
-      properties:
-        name:
-          type: string
-        runtime:
-          $ref: '#/components/schemas/RuntimeConfig'
-    SourceSpec:
-      type: object
-      required: [type]
-      properties:
-        type:
-          type: string
-          enum: [repo, image]
-        branch:
-          type: string
-        commit_sha:
-          type: string
-        image:
-          type: string
-    BuildSpec:
-      type: object
-      properties:
-        mode:
-          type: string
-          enum: [auto, dockerfile, image]
-        profile:
-          type: string
-    CreateDeploymentRequest:
-      type: object
-      properties:
-        source:
-          $ref: '#/components/schemas/SourceSpec'
-        build:
-          $ref: '#/components/schemas/BuildSpec'
-        reason:
-          type: string
-          enum: [manual, webhook, api]
-          default: manual
-    CreateDeploymentResponse:
-      type: object
-      required: [deployment_id, status, queued_at]
-      properties:
-        deployment_id:
-          type: string
-          format: uuid
-        status:
-          type: string
-          enum: [queued]
-        queued_at:
-          type: string
-          format: date-time
-    Deployment:
-      type: object
-      properties:
-        id:
-          type: string
-          format: uuid
-        status:
-          type: string
-        created_at:
-          type: string
-          format: date-time
-    CursorPageMeta:
-      type: object
-      properties:
-        next_cursor:
-          type: [string, 'null']
-    AppListResponse:
-      type: object
-      properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/App'
-        next_cursor:
-          type: [string, 'null']
-    DeploymentListResponse:
-      type: object
-      properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/Deployment'
-        next_cursor:
-          type: [string, 'null']
-    Token:
-      type: object
-      properties:
-        id:
-          type: string
-          format: uuid
-        name:
-          type: string
-        scopes:
-          type: array
-          items:
-            type: string
-            enum: [read, deploy, admin]
-        expires_at:
-          type: [string, 'null']
-          format: date-time
-        revoked_at:
-          type: [string, 'null']
-          format: date-time
-    TokenListResponse:
-      type: object
-      properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/Token'
-    CreateTokenRequest:
-      type: object
-      required: [name, scopes]
-      properties:
-        name:
-          type: string
-        scopes:
-          type: array
-          items:
-            type: string
-            enum: [read, deploy, admin]
-        expires_at:
-          type: [string, 'null']
-          format: date-time
-    CreateTokenResponse:
-      type: object
-      required: [token]
-      properties:
-        token:
-          type: string
-          description: Returned only once at creation time.
-        metadata:
-          $ref: '#/components/schemas/Token'
-    ErrorObject:
-      type: object
-      required: [code, message]
-      properties:
-        code:
-          type: string
-        message:
-          type: string
-        details:
-          type: object
-          additionalProperties: true
-        request_id:
-          type: string
-    ErrorResponse:
-      type: object
-      required: [error]
-      properties:
-        error:
-          $ref: '#/components/schemas/ErrorObject'
-security:
-  - bearerAuth: []
+          description: Revoked

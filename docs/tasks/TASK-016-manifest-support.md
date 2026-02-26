@@ -1,6 +1,6 @@
 # TASK-016: rustploy.yaml manifest support
 
-- Status: Todo
+- Status: In Progress
 - Priority: P0
 - Estimate: 4-6 days
 - Owner: Unassigned

@@ -1,6 +1,6 @@
 # TASK-002: Control plane and agent skeleton
 
-- Status: Todo
+- Status: Done
 - Priority: P0
 - Estimate: 4-5 days
 - Owner: Unassigned

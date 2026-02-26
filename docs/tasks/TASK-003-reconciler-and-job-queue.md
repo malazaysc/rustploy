@@ -1,6 +1,6 @@
 # TASK-003: Reconciler and durable job queue
 
-- Status: Todo
+- Status: Done
 - Priority: P0
 - Estimate: 5-7 days
 - Owner: Unassigned
