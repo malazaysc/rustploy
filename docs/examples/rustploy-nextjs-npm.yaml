@@ -1,0 +1,18 @@
+version: 1
+app:
+  name: nextjs-npm-app
+  port: 3000
+  healthcheck_path: /
+build:
+  mode: auto
+  profile: nextjs-standalone-v1
+dependencies:
+  postgres:
+    enabled: false
+  redis:
+    enabled: false
+migrations:
+  enabled: false
+deploy:
+  auto_deploy_branch: main
+  strategy: rolling

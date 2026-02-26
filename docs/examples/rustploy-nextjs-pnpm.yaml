@@ -1,0 +1,21 @@
+version: 1
+app:
+  name: nextjs-pnpm-app
+  port: 3000
+  healthcheck_path: /
+build:
+  mode: auto
+  profile: nextjs-standalone-v1
+dependencies:
+  postgres:
+    enabled: true
+    version: "16"
+    storage_gb: 10
+  redis:
+    enabled: false
+migrations:
+  enabled: true
+  command: pnpm migrate:deploy
+deploy:
+  auto_deploy_branch: main
+  strategy: rolling
