@@ -134,7 +134,7 @@ async fn send_json_request<T: serde::Serialize>(
     let mut request = format!(
         "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n",
         host = config.server_addr,
-        len = body.as_bytes().len()
+        len = body.len()
     );
 
     if let Some(token) = &config.agent_token {
