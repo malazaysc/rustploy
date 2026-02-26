@@ -1,4 +1,10 @@
 services:
+  sqlite:
+    image: busybox:1.36
+    command: ["sh", "-c", "tail -f /dev/null"]
+    volumes:
+      - rustploy-data:/data
+
   server:
     build:
       context: .
@@ -8,12 +14,17 @@ services:
     environment:
       RUSTPLOY_SERVER_ADDR: 0.0.0.0:8080
       RUSTPLOY_DB_PATH: /data/rustploy.db
+      RUSTPLOY_CADDYFILE_PATH: /shared/Caddyfile
+      RUSTPLOY_UPSTREAM_ADDR: server:8080
+      RUSTPLOY_ADMIN_EMAIL: admin@localhost
+      RUSTPLOY_ADMIN_PASSWORD: admin
       # RUSTPLOY_AGENT_TOKEN: change-me
       # RUSTPLOY_GITHUB_WEBHOOK_SECRET: change-me
-    ports:
-      - "8080:8080"
     volumes:
       - rustploy-data:/data
+      - rustploy-shared:/shared
+    depends_on:
+      - sqlite
 
   agent:
     build:
@@ -29,5 +40,28 @@ services:
       - server
     restart: unless-stopped
 
+  caddy:
+    image: caddy:2.8
+    command:
+      [
+        "sh",
+        "-c",
+        "until [ -f /shared/Caddyfile ]; do sleep 1; done; exec caddy run --config /shared/Caddyfile --adapter caddyfile"
+      ]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8080:8080"
+    volumes:
+      - rustploy-shared:/shared:ro
+      - rustploy-caddy:/data
+      - rustploy-caddy-config:/config
+    depends_on:
+      - server
+    restart: unless-stopped
+
 volumes:
   rustploy-data:
+  rustploy-shared:
+  rustploy-caddy:
+  rustploy-caddy-config:

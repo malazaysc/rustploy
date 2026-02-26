@@ -25,8 +25,8 @@ Rustploy should provide a first-party terminal interface for operators working d
 ## Interaction model
 
 - Keyboard-only command loop for SSH sessions.
-- Quick commands for `apps`, `import`, `config`, `deployments`, `deploy`, and `rollback`.
-- Deployment log access with `logs <app_index> [deployment_index]`.
+- Quick commands for `apps`, `import`, `config`, `deployments`, `domains`, `deploy`, and `rollback`.
+- Deployment log access with `logs <app_index> [deployment_index]` and `watch-logs <app_index> [deployment_index]`.
 - Scope-aware behavior (`read` token cannot deploy).
 
 ## Delivery model

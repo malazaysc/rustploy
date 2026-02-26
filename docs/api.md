@@ -22,14 +22,24 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 
 ## Minimum v0.1 endpoints
 
+- `GET /api/v1/health`
+- `GET /metrics`
+- `POST /api/v1/auth/login`
+- `POST /api/v1/auth/logout`
+- `GET /api/v1/auth/me`
+- `POST /api/v1/auth/password-reset/request`
+- `POST /api/v1/auth/password-reset/confirm`
 - `POST /api/v1/apps/import`
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
 - `GET /api/v1/apps/{app_id}/config`
+- `POST /api/v1/apps/{app_id}/domains`
+- `GET /api/v1/apps/{app_id}/domains`
 - `POST /api/v1/apps/{app_id}/deployments`
 - `GET /api/v1/apps/{app_id}/deployments`
 - `GET /api/v1/apps/{app_id}/deployments/{deployment_id}/logs`
+- `GET /api/v1/apps/{app_id}/logs/stream`
 - `POST /api/v1/apps/{app_id}/rollback`
 - `POST /api/v1/tokens`
 - `GET /api/v1/tokens`
@@ -53,5 +63,5 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 
 ## Bootstrap behavior
 
-- If there are no API tokens yet, privileged endpoints are temporarily open.
-- After the first token is created, `Authorization: Bearer <token>` is required.
+- If there are no users and no API tokens yet, privileged endpoints are temporarily open.
+- Once a bootstrap admin user exists (default) or any token exists, auth is required.

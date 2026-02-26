@@ -1,6 +1,6 @@
 # TASK-008: Observability and logs
 
-- Status: Todo
+- Status: Done
 - Priority: P1
 - Estimate: 4-5 days
 - Owner: Unassigned
@@ -20,6 +20,12 @@ Add baseline metrics, tracing, and centralized app logs.
 - Key lifecycle metrics exposed.
 - Trace context preserved across server/agent actions.
 - Users can view recent app logs from dashboard.
+
+## Completion notes
+
+- `GET /metrics` exposes Prometheus-formatted counters/gauges.
+- Agent forwards `traceparent`; server logs trace context on register/heartbeat.
+- Deployment logs are persisted and exposed via API and SSE stream.
 
 ## Dependencies
 

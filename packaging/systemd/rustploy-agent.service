@@ -1,0 +1,18 @@
+[Unit]
+Description=Rustploy Agent
+After=network.target rustploy-server.service
+Wants=rustploy-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rustploy-agent
+Environment=RUST_LOG=info
+Environment=RUSTPLOY_SERVER_ADDR=127.0.0.1:8080
+Environment=RUSTPLOY_HEARTBEAT_INTERVAL_SECS=10
+Restart=on-failure
+RestartSec=3
+User=rustploy
+Group=rustploy
+
+[Install]
+WantedBy=multi-user.target

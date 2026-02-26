@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use shared::{
     AppListResponse, AppSummary, CreateDeploymentAccepted, CreateDeploymentRequest,
-    DeploymentListResponse, DeploymentLogsResponse, DeploymentSummary, EffectiveAppConfigResponse,
-    HealthResponse, ImportAppRequest, ImportAppResponse, RepositoryRef, SourceRef,
+    DeploymentListResponse, DeploymentLogsResponse, DeploymentSummary, DomainListResponse,
+    DomainSummary, EffectiveAppConfigResponse, HealthResponse, ImportAppRequest, ImportAppResponse,
+    RepositoryRef, SourceRef,
 };
 use std::io::{self, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -67,6 +68,20 @@ async fn main() -> Result<()> {
                     println!("invalid app index");
                 }
             }
+            "domains" => {
+                let Some(index) = parse_index(parts.next()) else {
+                    println!("usage: domains <app_index>");
+                    continue;
+                };
+                if let Some(app) = apps.get(index) {
+                    match fetch_domains(&config, app.id).await {
+                        Ok(items) => print_domains(app, &items),
+                        Err(error) => println!("error: {error}"),
+                    }
+                } else {
+                    println!("invalid app index");
+                }
+            }
             "deploy" => {
                 let Some(index) = parse_index(parts.next()) else {
                     println!("usage: deploy <app_index> [source_ref]");
@@ -103,6 +118,27 @@ async fn main() -> Result<()> {
                                     }
                                     Err(error) => println!("error: {error}"),
                                 }
+                            } else {
+                                println!("invalid deployment index");
+                            }
+                        }
+                        Err(error) => println!("error: {error}"),
+                    }
+                } else {
+                    println!("invalid app index");
+                }
+            }
+            "watch-logs" => {
+                let Some(app_index) = parse_index(parts.next()) else {
+                    println!("usage: watch-logs <app_index> [deployment_index]");
+                    continue;
+                };
+                let deployment_index = parse_index(parts.next()).unwrap_or(0);
+                if let Some(app) = apps.get(app_index) {
+                    match fetch_deployments(&config, app.id).await {
+                        Ok(deployments) => {
+                            if let Some(deployment) = deployments.get(deployment_index) {
+                                tail_logs(&config, app.id, deployment.id).await;
                             } else {
                                 println!("invalid deployment index");
                             }
@@ -190,7 +226,9 @@ fn print_help() {
     println!("  import <owner> <repo> <branch> [clone_url]");
     println!("  config <app_index>");
     println!("  deployments <app_index>");
+    println!("  domains <app_index>");
     println!("  logs <app_index> [deployment_index]");
+    println!("  watch-logs <app_index> [deployment_index]");
     println!("  deploy <app_index> [source_ref]");
     println!("  rollback <app_index>");
     println!("  help");
@@ -223,6 +261,18 @@ fn print_deployments(app: &AppSummary, items: &[DeploymentSummary]) {
             deployment.status.as_str(),
             source_ref
         );
+    }
+}
+
+fn print_domains(app: &AppSummary, items: &[DomainSummary]) {
+    println!("domains for {}", app.name);
+    if items.is_empty() {
+        println!("  none");
+        return;
+    }
+
+    for domain in items {
+        println!("  {} ({})", domain.domain, domain.tls_mode);
     }
 }
 
@@ -278,6 +328,22 @@ async fn fetch_deployments(config: &TuiConfig, app_id: Uuid) -> Result<Vec<Deplo
     Ok(payload.items)
 }
 
+async fn fetch_domains(config: &TuiConfig, app_id: Uuid) -> Result<Vec<DomainSummary>> {
+    let (status, body) = send_request(
+        config,
+        "GET",
+        &format!("/api/v1/apps/{app_id}/domains"),
+        None,
+    )
+    .await?;
+    if status != 200 {
+        anyhow::bail!("list domains failed with status {status}");
+    }
+    let payload: DomainListResponse =
+        serde_json::from_str(&body).context("invalid domain list payload")?;
+    Ok(payload.items)
+}
+
 async fn fetch_deployment_logs(
     config: &TuiConfig,
     app_id: Uuid,
@@ -294,6 +360,26 @@ async fn fetch_deployment_logs(
         anyhow::bail!("deployment logs request failed with status {status}");
     }
     serde_json::from_str(&body).context("invalid deployment logs payload")
+}
+
+async fn tail_logs(config: &TuiConfig, app_id: Uuid, deployment_id: Uuid) {
+    let mut last = String::new();
+    for _ in 0..30 {
+        match fetch_deployment_logs(config, app_id, deployment_id).await {
+            Ok(logs) => {
+                if logs.logs != last {
+                    println!("--- logs update ---");
+                    println!("{}", logs.logs);
+                    last = logs.logs;
+                }
+            }
+            Err(error) => {
+                println!("error: {error}");
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 async fn fetch_effective_config(
@@ -351,6 +437,8 @@ async fn trigger_deploy(
 ) -> Result<CreateDeploymentAccepted> {
     let payload = serde_json::to_string(&CreateDeploymentRequest {
         source_ref: Some(source_ref),
+        image_ref: None,
+        commit_sha: None,
         simulate_failures: Some(0),
     })
     .context("failed serializing deploy payload")?;

@@ -1,4 +1,6 @@
 use std::{
+    collections::HashMap,
+    convert::Infallible,
     fs,
     path::Path,
     process::Command,
@@ -10,7 +12,8 @@ use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
     extract::{Path as AxumPath, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
+    response::{sse::Event, sse::KeepAlive, Html, Sse},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -21,14 +24,17 @@ use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered, AgentStatus,
     AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppListResponse, AppSummary,
-    CreateAppRequest, CreateDeploymentAccepted, CreateDeploymentRequest, CreateTokenRequest,
-    CreateTokenResponse, DependencyProfile, DeploymentListResponse, DeploymentLogsResponse,
-    DeploymentStatus, DeploymentSummary, DetectionResult, EffectiveAppConfigResponse,
-    GithubConnectRequest, GithubIntegrationSummary, GithubWebhookAccepted, HealthResponse,
-    HeartbeatAccepted, ImportAppRequest, ImportAppResponse, NextAction, RepositoryRef, SourceRef,
-    TokenListResponse, TokenSummary,
+    AuthLoginRequest, AuthSessionResponse, CreateAppRequest, CreateDeploymentAccepted,
+    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
+    DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
+    DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
+    EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
+    GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
+    NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
+    PasswordResetRequestedResponse, RepositoryRef, SourceRef, TokenListResponse, TokenSummary,
 };
-use tracing::{error, warn};
+use tokio_stream::{wrappers::IntervalStream, StreamExt};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const DEFAULT_ONLINE_WINDOW_MS: u64 = 30_000;
@@ -38,10 +44,19 @@ const DEFAULT_RECONCILER_INTERVAL_MS: u64 = 1_000;
 const DEFAULT_JOB_BACKOFF_BASE_MS: u64 = 1_000;
 const DEFAULT_JOB_BACKOFF_MAX_MS: u64 = 30_000;
 const DEFAULT_JOB_MAX_ATTEMPTS: u32 = 5;
+const DEFAULT_API_RATE_LIMIT_PER_MINUTE: u32 = 300;
+const DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE: u32 = 120;
 const AGENT_TOKEN_HEADER: &str = "x-rustploy-agent-token";
 const GITHUB_SIGNATURE_HEADER: &str = "x-hub-signature-256";
 const GITHUB_EVENT_HEADER: &str = "x-github-event";
 const AUTHORIZATION_HEADER: &str = "authorization";
+const COOKIE_HEADER: &str = "cookie";
+const SESSION_COOKIE_NAME: &str = "rustploy_session";
+const DEFAULT_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const DEFAULT_PASSWORD_RESET_TTL_MS: u64 = 15 * 60 * 1000;
+const DEFAULT_ADMIN_EMAIL: &str = "admin@localhost";
+const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+const DEFAULT_CADDY_UPSTREAM: &str = "127.0.0.1:8080";
 
 const SCOPE_READ: u8 = 1;
 const SCOPE_DEPLOY: u8 = 1 << 1;
@@ -52,12 +67,17 @@ pub struct AppState {
     db: Database,
     agent_shared_token: Option<String>,
     github_webhook_secret: Option<String>,
+    session_ttl_ms: u64,
+    password_reset_ttl_ms: u64,
     online_window_ms: u64,
     reconciler_enabled: bool,
     reconciler_interval_ms: u64,
     job_backoff_base_ms: u64,
     job_backoff_max_ms: u64,
     job_max_attempts: u32,
+    api_rate_limit_per_minute: u32,
+    webhook_rate_limit_per_minute: u32,
+    rate_limit_state: Arc<Mutex<HashMap<String, (u64, u32)>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -65,12 +85,18 @@ struct AppStateConfig {
     db_path: String,
     agent_shared_token: Option<String>,
     github_webhook_secret: Option<String>,
+    session_ttl_ms: u64,
+    password_reset_ttl_ms: u64,
+    bootstrap_admin_email: Option<String>,
+    bootstrap_admin_password: Option<String>,
     online_window_ms: u64,
     reconciler_enabled: bool,
     reconciler_interval_ms: u64,
     job_backoff_base_ms: u64,
     job_backoff_max_ms: u64,
     job_max_attempts: u32,
+    api_rate_limit_per_minute: u32,
+    webhook_rate_limit_per_minute: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +116,13 @@ struct JobRecord {
 #[derive(Debug)]
 struct AuthenticatedToken {
     scope_mask: u8,
+}
+
+#[derive(Debug)]
+struct AuthenticatedSession {
+    user_id: Uuid,
+    email: String,
+    role: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -115,6 +148,26 @@ struct ImportConfigRecord {
     detection: DetectionResult,
     dependency_profile: Option<DependencyProfile>,
     manifest_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct ManagedServiceRecord {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    healthy: bool,
+}
+
+#[derive(Debug)]
+struct MetricsSnapshot {
+    apps_total: u64,
+    deployments_total: u64,
+    deployments_healthy: u64,
+    deployments_failed: u64,
+    deployments_queued: u64,
+    domains_total: u64,
+    tokens_total: u64,
 }
 
 #[derive(Debug)]
@@ -178,6 +231,19 @@ impl AppState {
                 .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
             agent_shared_token: std::env::var("RUSTPLOY_AGENT_TOKEN").ok(),
             github_webhook_secret: std::env::var("RUSTPLOY_GITHUB_WEBHOOK_SECRET").ok(),
+            session_ttl_ms: read_env_u64("RUSTPLOY_SESSION_TTL_MS", DEFAULT_SESSION_TTL_MS)?,
+            password_reset_ttl_ms: read_env_u64(
+                "RUSTPLOY_PASSWORD_RESET_TTL_MS",
+                DEFAULT_PASSWORD_RESET_TTL_MS,
+            )?,
+            bootstrap_admin_email: Some(
+                std::env::var("RUSTPLOY_ADMIN_EMAIL")
+                    .unwrap_or_else(|_| DEFAULT_ADMIN_EMAIL.to_string()),
+            ),
+            bootstrap_admin_password: Some(
+                std::env::var("RUSTPLOY_ADMIN_PASSWORD")
+                    .unwrap_or_else(|_| DEFAULT_ADMIN_PASSWORD.to_string()),
+            ),
             online_window_ms: read_env_u64(
                 "RUSTPLOY_AGENT_ONLINE_WINDOW_MS",
                 DEFAULT_ONLINE_WINDOW_MS,
@@ -199,6 +265,14 @@ impl AppState {
                 DEFAULT_JOB_BACKOFF_MAX_MS,
             )?,
             job_max_attempts: read_env_u32("RUSTPLOY_JOB_MAX_ATTEMPTS", DEFAULT_JOB_MAX_ATTEMPTS)?,
+            api_rate_limit_per_minute: read_env_u32(
+                "RUSTPLOY_API_RATE_LIMIT_PER_MINUTE",
+                DEFAULT_API_RATE_LIMIT_PER_MINUTE,
+            )?,
+            webhook_rate_limit_per_minute: read_env_u32(
+                "RUSTPLOY_WEBHOOK_RATE_LIMIT_PER_MINUTE",
+                DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE,
+            )?,
         })
     }
 
@@ -206,17 +280,35 @@ impl AppState {
         let db = Database::open(&config.db_path)
             .with_context(|| format!("failed to open db at {}", config.db_path))?;
 
-        Ok(Self {
+        if let (Some(email), Some(password)) = (
+            config.bootstrap_admin_email.as_deref(),
+            config.bootstrap_admin_password.as_deref(),
+        ) {
+            db.ensure_admin_user(email, password, now_unix_ms())?;
+        }
+
+        let state = Self {
             db,
             agent_shared_token: config.agent_shared_token,
             github_webhook_secret: config.github_webhook_secret,
+            session_ttl_ms: config.session_ttl_ms,
+            password_reset_ttl_ms: config.password_reset_ttl_ms,
             online_window_ms: config.online_window_ms,
             reconciler_enabled: config.reconciler_enabled,
             reconciler_interval_ms: config.reconciler_interval_ms,
             job_backoff_base_ms: config.job_backoff_base_ms,
             job_backoff_max_ms: config.job_backoff_max_ms,
             job_max_attempts: config.job_max_attempts,
-        })
+            api_rate_limit_per_minute: config.api_rate_limit_per_minute,
+            webhook_rate_limit_per_minute: config.webhook_rate_limit_per_minute,
+            rate_limit_state: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        if let Err(error) = sync_caddyfile_from_domains(&state) {
+            warn!(%error, "failed syncing caddyfile during startup");
+        }
+
+        Ok(state)
     }
 
     pub fn reconciler_enabled(&self) -> bool {
@@ -235,18 +327,45 @@ impl AppState {
         )
     }
 
+    fn check_rate_limit(&self, key: &str, limit_per_minute: u32) -> Result<(), StatusCode> {
+        if limit_per_minute == 0 {
+            return Ok(());
+        }
+        let now_minute = now_unix_ms() / 60_000;
+        let mut state = self
+            .rate_limit_state
+            .lock()
+            .expect("rate limit mutex poisoned");
+        let entry = state.entry(key.to_string()).or_insert((now_minute, 0));
+        if entry.0 != now_minute {
+            *entry = (now_minute, 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        if entry.1 > limit_per_minute {
+            Err(StatusCode::TOO_MANY_REQUESTS)
+        } else {
+            Ok(())
+        }
+    }
+
     #[cfg(test)]
     fn for_tests(db_path: &str, agent_shared_token: Option<String>) -> Self {
         Self::from_config(AppStateConfig {
             db_path: db_path.to_string(),
             agent_shared_token,
             github_webhook_secret: None,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: None,
+            bootstrap_admin_password: None,
             online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
             reconciler_enabled: true,
             reconciler_interval_ms: 1,
             job_backoff_base_ms: 1,
             job_backoff_max_ms: 100,
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
         })
         .expect("test state should initialize")
     }
@@ -698,6 +817,437 @@ impl Database {
         .context("failed checking token bootstrap state")
     }
 
+    fn has_users(&self) -> Result<bool> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.query_row("SELECT EXISTS(SELECT 1 FROM users)", [], |row| row.get(0))
+            .context("failed checking user bootstrap state")
+    }
+
+    fn ensure_admin_user(&self, email: &str, password: &str, now_unix_ms: u64) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE email = ?1)",
+                params![email],
+                |row| row.get(0),
+            )
+            .context("failed checking admin existence")?;
+        if exists {
+            return Ok(());
+        }
+
+        let now = to_i64(now_unix_ms)?;
+        conn.execute(
+            "INSERT INTO users (id, email, password_hash, role, created_at_unix_ms, updated_at_unix_ms)
+             VALUES (?1, ?2, ?3, 'owner', ?4, ?4)",
+            params![Uuid::new_v4().to_string(), email, token_hash(password), now],
+        )
+        .context("failed creating bootstrap admin user")?;
+        Ok(())
+    }
+
+    fn find_user_by_email(&self, email: &str) -> Result<Option<(Uuid, String, String)>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id, password_hash, role FROM users WHERE email = ?1",
+                params![email],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying user by email")?;
+
+        let Some((id_raw, password_hash, role)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some((
+            Uuid::parse_str(&id_raw).with_context(|| format!("invalid user id in db: {id_raw}"))?,
+            password_hash,
+            role,
+        )))
+    }
+
+    fn create_session(
+        &self,
+        user_id: Uuid,
+        session_token_hash: &str,
+        expires_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO sessions (
+                id, user_id, session_token_hash, expires_at_unix_ms, created_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                user_id.to_string(),
+                session_token_hash,
+                to_i64(expires_at_unix_ms)?,
+                to_i64(now_unix_ms)?,
+            ],
+        )
+        .context("failed creating auth session")?;
+        Ok(())
+    }
+
+    fn authenticate_session(
+        &self,
+        session_token_hash: &str,
+        now_unix_ms: u64,
+    ) -> Result<Option<AuthenticatedSession>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT users.id, users.email, users.role
+                 FROM sessions
+                 INNER JOIN users ON users.id = sessions.user_id
+                 WHERE sessions.session_token_hash = ?1
+                   AND sessions.revoked_at_unix_ms IS NULL
+                   AND sessions.expires_at_unix_ms > ?2
+                 LIMIT 1",
+                params![session_token_hash, to_i64(now_unix_ms)?],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed authenticating session")?;
+
+        let Some((user_id_raw, email, role)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(AuthenticatedSession {
+            user_id: Uuid::parse_str(&user_id_raw)
+                .with_context(|| format!("invalid session user id in db: {user_id_raw}"))?,
+            email,
+            role,
+        }))
+    }
+
+    fn revoke_session(&self, session_token_hash: &str, now_unix_ms: u64) -> Result<bool> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let updated = conn
+            .execute(
+                "UPDATE sessions
+                 SET revoked_at_unix_ms = ?2
+                 WHERE session_token_hash = ?1 AND revoked_at_unix_ms IS NULL",
+                params![session_token_hash, to_i64(now_unix_ms)?],
+            )
+            .context("failed revoking session")?;
+        Ok(updated > 0)
+    }
+
+    fn issue_password_reset(
+        &self,
+        email: &str,
+        reset_token_hash: &str,
+        expires_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Result<Option<Uuid>> {
+        let Some((user_id, _, _)) = self.find_user_by_email(email)? else {
+            return Ok(None);
+        };
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO password_reset_tokens (
+                id, user_id, token_hash, expires_at_unix_ms, created_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                user_id.to_string(),
+                reset_token_hash,
+                to_i64(expires_at_unix_ms)?,
+                to_i64(now_unix_ms)?
+            ],
+        )
+        .context("failed issuing password reset token")?;
+        Ok(Some(user_id))
+    }
+
+    fn confirm_password_reset(
+        &self,
+        reset_token_hash: &str,
+        new_password_hash: &str,
+        now_unix_ms: u64,
+    ) -> Result<bool> {
+        let mut conn = self.conn.lock().expect("database mutex poisoned");
+        let tx = conn
+            .transaction()
+            .context("failed opening password reset transaction")?;
+        let row = tx
+            .query_row(
+                "SELECT id, user_id
+                 FROM password_reset_tokens
+                 WHERE token_hash = ?1
+                   AND used_at_unix_ms IS NULL
+                   AND expires_at_unix_ms > ?2
+                 LIMIT 1",
+                params![reset_token_hash, to_i64(now_unix_ms)?],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .context("failed looking up password reset token")?;
+        let Some((token_id_raw, user_id_raw)) = row else {
+            tx.commit()
+                .context("failed committing empty password reset transaction")?;
+            return Ok(false);
+        };
+
+        tx.execute(
+            "UPDATE users SET password_hash = ?2, updated_at_unix_ms = ?3 WHERE id = ?1",
+            params![user_id_raw, new_password_hash, to_i64(now_unix_ms)?],
+        )
+        .context("failed updating user password")?;
+        tx.execute(
+            "UPDATE password_reset_tokens SET used_at_unix_ms = ?2 WHERE id = ?1",
+            params![token_id_raw, to_i64(now_unix_ms)?],
+        )
+        .context("failed consuming password reset token")?;
+        tx.execute(
+            "UPDATE sessions
+             SET revoked_at_unix_ms = ?2
+             WHERE user_id = ?1 AND revoked_at_unix_ms IS NULL",
+            params![user_id_raw, to_i64(now_unix_ms)?],
+        )
+        .context("failed revoking existing sessions after password reset")?;
+        tx.commit()
+            .context("failed committing password reset transaction")?;
+        Ok(true)
+    }
+
+    fn create_domain(
+        &self,
+        app_id: Uuid,
+        request: &CreateDomainRequest,
+        now_unix_ms: u64,
+    ) -> Result<Option<DomainSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let now = to_i64(now_unix_ms)?;
+        let domain = request.domain.trim().to_string();
+        if domain.is_empty() {
+            return Ok(None);
+        }
+
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domains WHERE domain = ?1)",
+                params![domain],
+                |row| row.get(0),
+            )
+            .context("failed checking domain uniqueness")?;
+        if exists {
+            return Ok(None);
+        }
+
+        let tls_mode = request.tls_mode.as_deref().unwrap_or("managed").to_string();
+        let domain_id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO domains (
+                id, app_id, domain, tls_mode, cert_path, key_path, created_at_unix_ms, updated_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                domain_id.to_string(),
+                app_id.to_string(),
+                domain,
+                tls_mode,
+                request.cert_path,
+                request.key_path,
+                now,
+            ],
+        )
+        .context("failed inserting domain mapping")?;
+
+        Ok(Some(DomainSummary {
+            id: domain_id,
+            app_id,
+            domain: request.domain.trim().to_string(),
+            tls_mode,
+            cert_path: request.cert_path.clone(),
+            key_path: request.key_path.clone(),
+            created_at_unix_ms: now_unix_ms,
+        }))
+    }
+
+    fn list_domains(&self, app_id: Uuid) -> Result<Vec<DomainSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, app_id, domain, tls_mode, cert_path, key_path, created_at_unix_ms
+                 FROM domains
+                 WHERE app_id = ?1
+                 ORDER BY created_at_unix_ms DESC",
+            )
+            .context("failed preparing domains query")?;
+        let mut rows = stmt
+            .query(params![app_id.to_string()])
+            .context("failed querying domains")?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().context("failed iterating domains")? {
+            let domain_id_raw: String = row.get(0).context("failed reading domain id")?;
+            let app_id_raw: String = row.get(1).context("failed reading domain app id")?;
+            let domain: String = row.get(2).context("failed reading domain name")?;
+            let tls_mode: String = row.get(3).context("failed reading tls_mode")?;
+            let cert_path: Option<String> = row.get(4).context("failed reading cert path")?;
+            let key_path: Option<String> = row.get(5).context("failed reading key path")?;
+            let created_raw: i64 = row.get(6).context("failed reading domain created time")?;
+
+            items.push(DomainSummary {
+                id: Uuid::parse_str(&domain_id_raw)
+                    .with_context(|| format!("invalid domain id in db: {domain_id_raw}"))?,
+                app_id: Uuid::parse_str(&app_id_raw)
+                    .with_context(|| format!("invalid domain app id in db: {app_id_raw}"))?,
+                domain,
+                tls_mode,
+                cert_path,
+                key_path,
+                created_at_unix_ms: to_u64(created_raw)?,
+            });
+        }
+        Ok(items)
+    }
+
+    fn list_all_domains(&self) -> Result<Vec<DomainSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, app_id, domain, tls_mode, cert_path, key_path, created_at_unix_ms
+                 FROM domains
+                 ORDER BY created_at_unix_ms ASC",
+            )
+            .context("failed preparing all domains query")?;
+        let mut rows = stmt.query([]).context("failed querying all domains")?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().context("failed iterating all domains")? {
+            let domain_id_raw: String = row.get(0).context("failed reading domain id")?;
+            let app_id_raw: String = row.get(1).context("failed reading domain app id")?;
+            let domain: String = row.get(2).context("failed reading domain name")?;
+            let tls_mode: String = row.get(3).context("failed reading tls_mode")?;
+            let cert_path: Option<String> = row.get(4).context("failed reading cert path")?;
+            let key_path: Option<String> = row.get(5).context("failed reading key path")?;
+            let created_raw: i64 = row.get(6).context("failed reading domain created time")?;
+
+            items.push(DomainSummary {
+                id: Uuid::parse_str(&domain_id_raw)
+                    .with_context(|| format!("invalid domain id in db: {domain_id_raw}"))?,
+                app_id: Uuid::parse_str(&app_id_raw)
+                    .with_context(|| format!("invalid domain app id in db: {app_id_raw}"))?,
+                domain,
+                tls_mode,
+                cert_path,
+                key_path,
+                created_at_unix_ms: to_u64(created_raw)?,
+            });
+        }
+        Ok(items)
+    }
+
+    fn metrics_snapshot(&self) -> Result<MetricsSnapshot> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let count = |sql: &str| -> Result<u64> {
+            let value: i64 = conn
+                .query_row(sql, [], |row| row.get(0))
+                .with_context(|| format!("failed metrics query: {sql}"))?;
+            to_u64(value)
+        };
+
+        Ok(MetricsSnapshot {
+            apps_total: count("SELECT COUNT(*) FROM apps")?,
+            deployments_total: count("SELECT COUNT(*) FROM deployments")?,
+            deployments_healthy: count(
+                "SELECT COUNT(*) FROM deployments WHERE status = 'healthy'",
+            )?,
+            deployments_failed: count(
+                "SELECT COUNT(*) FROM deployments WHERE status = 'failed'",
+            )?,
+            deployments_queued: count(
+                "SELECT COUNT(*) FROM deployments WHERE status IN ('queued','deploying','retrying')",
+            )?,
+            domains_total: count("SELECT COUNT(*) FROM domains")?,
+            tokens_total: count("SELECT COUNT(*) FROM api_tokens WHERE revoked_at_unix_ms IS NULL")?,
+        })
+    }
+
+    fn ensure_managed_service(
+        &self,
+        app_id: Uuid,
+        service_type: &str,
+        now_unix_ms: u64,
+    ) -> Result<ManagedServiceRecord> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT service_type, host, port, username, password, healthy
+                 FROM managed_services
+                 WHERE app_id = ?1 AND service_type = ?2",
+                params![app_id.to_string(), service_type],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed reading managed service")?;
+        if let Some((_service_type, host, port_raw, username, password, healthy_raw)) = row {
+            return Ok(ManagedServiceRecord {
+                host,
+                port: u16::try_from(port_raw).context("managed service port out of range")?,
+                username,
+                password,
+                healthy: healthy_raw == 1,
+            });
+        }
+
+        let (host, port) = match service_type {
+            "postgres" => (format!("postgres-{}.internal", app_id.simple()), 5432u16),
+            "redis" => (format!("redis-{}.internal", app_id.simple()), 6379u16),
+            _ => anyhow::bail!("unsupported managed service type: {service_type}"),
+        };
+        let username = format!("rp_{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let password = format!("rp_{}", Uuid::new_v4().simple());
+        conn.execute(
+            "INSERT INTO managed_services (
+                id, app_id, service_type, username, password, host, port, healthy, created_at_unix_ms, updated_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                app_id.to_string(),
+                service_type,
+                username,
+                password,
+                host,
+                i64::from(port),
+                to_i64(now_unix_ms)?,
+            ],
+        )
+        .context("failed creating managed service")?;
+        Ok(ManagedServiceRecord {
+            host,
+            port,
+            username,
+            password,
+            healthy: true,
+        })
+    }
+
     fn create_api_token(
         &self,
         name: &str,
@@ -1001,15 +1551,19 @@ impl Database {
                 id,
                 app_id,
                 source_ref,
+                image_ref,
+                commit_sha,
                 status,
                 simulate_failures,
                 created_at_unix_ms,
                 updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
             params![
                 deployment_id.to_string(),
                 app_id.to_string(),
-                request.source_ref,
+                request.source_ref.as_deref(),
+                request.image_ref.as_deref(),
+                request.commit_sha.as_deref(),
                 DeploymentStatus::Queued.as_str(),
                 to_i64(simulate_failures as u64)?,
                 now
@@ -1051,7 +1605,7 @@ impl Database {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT id, app_id, source_ref, status, last_error, created_at_unix_ms, updated_at_unix_ms
+                "SELECT id, app_id, source_ref, image_ref, commit_sha, status, last_error, created_at_unix_ms, updated_at_unix_ms
                  FROM deployments
                  WHERE app_id = ?1
                  ORDER BY created_at_unix_ms DESC",
@@ -1067,10 +1621,12 @@ impl Database {
             let deployment_id_raw: String = row.get(0).context("failed reading deployment id")?;
             let app_id_raw: String = row.get(1).context("failed reading deployment app id")?;
             let source_ref: Option<String> = row.get(2).context("failed reading source ref")?;
-            let status_raw: String = row.get(3).context("failed reading deployment status")?;
-            let last_error: Option<String> = row.get(4).context("failed reading last error")?;
-            let created_raw: i64 = row.get(5).context("failed reading created time")?;
-            let updated_raw: i64 = row.get(6).context("failed reading updated time")?;
+            let image_ref: Option<String> = row.get(3).context("failed reading image ref")?;
+            let commit_sha: Option<String> = row.get(4).context("failed reading commit sha")?;
+            let status_raw: String = row.get(5).context("failed reading deployment status")?;
+            let last_error: Option<String> = row.get(6).context("failed reading last error")?;
+            let created_raw: i64 = row.get(7).context("failed reading created time")?;
+            let updated_raw: i64 = row.get(8).context("failed reading updated time")?;
 
             let id = Uuid::parse_str(&deployment_id_raw)
                 .with_context(|| format!("invalid deployment id in db: {deployment_id_raw}"))?;
@@ -1083,6 +1639,8 @@ impl Database {
                 id,
                 app_id: parsed_app_id,
                 source_ref,
+                image_ref,
+                commit_sha,
                 status,
                 last_error,
                 created_at_unix_ms: to_u64(created_raw)?,
@@ -1091,6 +1649,26 @@ impl Database {
         }
 
         Ok(items)
+    }
+
+    fn latest_deployment_id_for_app(&self, app_id: Uuid) -> Result<Option<Uuid>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id FROM deployments WHERE app_id = ?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
+                params![app_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("failed querying latest deployment for app")?;
+        match row {
+            None => Ok(None),
+            Some(id_raw) => {
+                Ok(Some(Uuid::parse_str(&id_raw).with_context(|| {
+                    format!("invalid deployment id in db: {id_raw}")
+                })?))
+            }
+        }
     }
 
     fn run_reconciler_once(
@@ -1163,6 +1741,46 @@ impl Database {
                 ),
                 now_unix_ms,
             )?;
+            if let Some(profile) = config.dependency_profile {
+                if profile.postgres == Some(true) {
+                    let postgres =
+                        self.ensure_managed_service(payload.app_id, "postgres", now_unix_ms)?;
+                    if !postgres.healthy {
+                        anyhow::bail!("postgres managed service is unhealthy");
+                    }
+                    let _database_url = format!(
+                        "postgres://{}:{}@{}:{}/app",
+                        postgres.username, postgres.password, postgres.host, postgres.port
+                    );
+                    self.append_deployment_log(
+                        payload.deployment_id,
+                        &format!(
+                            "managed dependency ready: postgres at {}:{}",
+                            postgres.host, postgres.port
+                        ),
+                        now_unix_ms,
+                    )?;
+                }
+                if profile.redis == Some(true) {
+                    let redis =
+                        self.ensure_managed_service(payload.app_id, "redis", now_unix_ms)?;
+                    if !redis.healthy {
+                        anyhow::bail!("redis managed service is unhealthy");
+                    }
+                    let _redis_url = format!(
+                        "redis://{}:{}@{}:{}",
+                        redis.username, redis.password, redis.host, redis.port
+                    );
+                    self.append_deployment_log(
+                        payload.deployment_id,
+                        &format!(
+                            "managed dependency ready: redis at {}:{}",
+                            redis.host, redis.port
+                        ),
+                        now_unix_ms,
+                    )?;
+                }
+            }
             if config.build_mode == "dockerfile" && !config.detection.dockerfile_present {
                 self.append_deployment_log(
                     payload.deployment_id,
@@ -1476,8 +2094,40 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0004")?;
     conn.execute_batch(include_str!("../migrations/0005_deployment_logs.sql"))
         .context("failed running sqlite migration 0005")?;
+    conn.execute_batch(include_str!("../migrations/0006_auth_domains_services.sql"))
+        .context("failed running sqlite migration 0006")?;
+    ensure_deployments_metadata_columns(conn)?;
 
     Ok(())
+}
+
+fn ensure_deployments_metadata_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "deployments", "image_ref")? {
+        conn.execute_batch("ALTER TABLE deployments ADD COLUMN image_ref TEXT;")
+            .context("failed adding deployments.image_ref column")?;
+    }
+    if !column_exists(conn, "deployments", "commit_sha")? {
+        conn.execute_batch("ALTER TABLE deployments ADD COLUMN commit_sha TEXT;")
+            .context("failed adding deployments.commit_sha column")?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let query = format!("PRAGMA table_info({table})");
+    let mut stmt = conn
+        .prepare(&query)
+        .context("failed preparing table_info query")?;
+    let mut rows = stmt.query([]).context("failed querying table_info")?;
+    while let Some(row) = rows.next().context("failed iterating table_info")? {
+        let name: String = row
+            .get(1)
+            .context("failed reading table_info column name")?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn read_env_u64(name: &str, default: u64) -> Result<u64> {
@@ -1535,11 +2185,29 @@ fn compute_backoff_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics_prometheus))
         .route("/api/v1/health", get(health))
+        .route("/", get(dashboard_ui))
+        .route("/api/v1/auth/login", post(auth_login))
+        .route("/api/v1/auth/logout", post(auth_logout))
+        .route("/api/v1/auth/me", get(auth_me))
+        .route(
+            "/api/v1/auth/password-reset/request",
+            post(auth_password_reset_request),
+        )
+        .route(
+            "/api/v1/auth/password-reset/confirm",
+            post(auth_password_reset_confirm),
+        )
         .route("/api/v1/apps/import", post(import_app))
         .route("/api/v1/apps", get(list_apps).post(create_app))
         .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
         .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
+        .route(
+            "/api/v1/apps/:app_id/domains",
+            get(list_domains).post(create_domain),
+        )
+        .route("/api/v1/apps/:app_id/logs/stream", get(stream_app_logs))
         .route(
             "/api/v1/apps/:app_id/deployments",
             get(list_app_deployments).post(create_deployment),
@@ -1565,7 +2233,479 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse::ok())
 }
 
+async fn metrics_prometheus(
+    State(state): State<AppState>,
+) -> Result<impl axum::response::IntoResponse, StatusCode> {
+    let metrics = state.db.metrics_snapshot().map_err(internal_error)?;
+    let body = format!(
+        "# HELP rustploy_apps_total Total apps\n# TYPE rustploy_apps_total gauge\nrustploy_apps_total {}\n\
+         # HELP rustploy_deployments_total Total deployments\n# TYPE rustploy_deployments_total gauge\nrustploy_deployments_total {}\n\
+         # HELP rustploy_deployments_healthy Healthy deployments\n# TYPE rustploy_deployments_healthy gauge\nrustploy_deployments_healthy {}\n\
+         # HELP rustploy_deployments_failed Failed deployments\n# TYPE rustploy_deployments_failed gauge\nrustploy_deployments_failed {}\n\
+         # HELP rustploy_deployments_queued Queued/deploying/retrying deployments\n# TYPE rustploy_deployments_queued gauge\nrustploy_deployments_queued {}\n\
+         # HELP rustploy_domains_total Total mapped domains\n# TYPE rustploy_domains_total gauge\nrustploy_domains_total {}\n\
+         # HELP rustploy_tokens_total Active API tokens\n# TYPE rustploy_tokens_total gauge\nrustploy_tokens_total {}\n",
+        metrics.apps_total,
+        metrics.deployments_total,
+        metrics.deployments_healthy,
+        metrics.deployments_failed,
+        metrics.deployments_queued,
+        metrics.domains_total,
+        metrics.tokens_total
+    );
+    Ok((
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        body,
+    ))
+}
+
+async fn dashboard_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<&'static str> {
+    let session = authorize_session_request(&state, &headers).ok().flatten();
+    if session.is_some() {
+        Html(DASHBOARD_HTML)
+    } else {
+        Html(LOGIN_HTML)
+    }
+}
+
 type ApiJsonError = (StatusCode, Json<ApiErrorResponse>);
+
+const LOGIN_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rustploy Login</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap');
+    :root { --bg:#0b1220; --card:#14213d; --ink:#e5e7eb; --accent:#fca311; --muted:#9ca3af; }
+    * { box-sizing:border-box; font-family:'Space Grotesk',sans-serif; }
+    body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(circle at 15% 20%,#1f2937,#0b1220 55%); color:var(--ink);}
+    .card { width:min(420px,92vw); background:linear-gradient(160deg,#14213d,#1d3557); border:1px solid rgba(255,255,255,.12); border-radius:18px; padding:24px; }
+    h1 { margin:0 0 8px; font-size:1.9rem; }
+    p { color:var(--muted); margin:0 0 16px; }
+    input,button { width:100%; padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,.16); background:#0f172a; color:var(--ink); margin-top:10px; }
+    button { background:var(--accent); color:#111827; font-weight:700; border:none; cursor:pointer; }
+    .err { margin-top:10px; color:#fca5a5; min-height:1em; }
+  </style>
+</head>
+<body>
+  <form class="card" id="login-form">
+    <h1>Rustploy</h1>
+    <p>Sign in with your owner account.</p>
+    <input id="email" type="email" placeholder="admin@localhost" required />
+    <input id="password" type="password" placeholder="password" required />
+    <button type="submit">Sign In</button>
+    <div class="err" id="err"></div>
+  </form>
+  <script>
+    document.getElementById('login-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const email = document.getElementById('email').value;
+      const password = document.getElementById('password').value;
+      const res = await fetch('/api/v1/auth/login', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ email, password })
+      });
+      if (res.ok) {
+        window.location.href = '/';
+      } else {
+        document.getElementById('err').textContent = 'Invalid credentials';
+      }
+    });
+  </script>
+</body>
+</html>
+"#;
+
+const DASHBOARD_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rustploy Dashboard</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap');
+    :root { --bg:#f5f7fa; --ink:#101827; --accent:#0f766e; --card:#ffffff; --line:#d1d5db; }
+    * { box-sizing:border-box; font-family:'Outfit',sans-serif; }
+    body { margin:0; color:var(--ink); background:
+      radial-gradient(circle at 20% 0%, #a7f3d0 0%, transparent 35%),
+      radial-gradient(circle at 80% 100%, #bfdbfe 0%, transparent 40%),
+      var(--bg); }
+    .wrap { max-width:1050px; margin:0 auto; padding:24px; }
+    h1 { margin:0 0 14px; font-size:2rem; }
+    .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
+    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 8px 24px rgba(16,24,39,.08); }
+    input,button,select { padding:10px 12px; border:1px solid var(--line); border-radius:10px; }
+    button { background:var(--accent); color:#fff; border:none; font-weight:700; cursor:pointer; }
+    ul { padding-left:18px; }
+    pre { white-space:pre-wrap; background:#111827; color:#e5e7eb; border-radius:10px; padding:10px; max-height:220px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Rustploy Dashboard</h1>
+    <div class="grid">
+      <section class="card">
+        <h3>Create App</h3>
+        <input id="app-name" placeholder="my-app" />
+        <button onclick="createApp()">Create</button>
+      </section>
+      <section class="card">
+        <h3>Import GitHub Repo</h3>
+        <input id="owner" placeholder="owner" />
+        <input id="repo" placeholder="repo" />
+        <input id="branch" placeholder="main" value="main" />
+        <button onclick="importApp()">Import</button>
+      </section>
+      <section class="card">
+        <h3>Apps</h3>
+        <ul id="apps"></ul>
+      </section>
+      <section class="card">
+        <h3>Deployments</h3>
+        <ul id="deployments"></ul>
+        <pre id="logs"></pre>
+      </section>
+      <section class="card">
+        <h3>Domains</h3>
+        <input id="domain" placeholder="app.example.com" />
+        <button onclick="addDomain()">Add Domain</button>
+        <ul id="domains"></ul>
+      </section>
+      <section class="card">
+        <h3>Session</h3>
+        <button onclick="logout()">Logout</button>
+      </section>
+    </div>
+  </div>
+  <script>
+    let selectedApp = null;
+    let logsStream = null;
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { credentials: 'include', ...opts });
+      if (res.status === 401) { window.location.reload(); throw new Error('unauthorized'); }
+      return res;
+    }
+    async function refreshApps() {
+      const res = await api('/api/v1/apps');
+      const data = await res.json();
+      const apps = document.getElementById('apps');
+      apps.innerHTML = '';
+      for (const app of data.items) {
+        const li = document.createElement('li');
+        li.innerHTML = `<strong>${app.name}</strong> <button onclick="selectApp('${app.id}')">Open</button> <button onclick="deploy('${app.id}')">Deploy</button> <button onclick="rollback('${app.id}')">Rollback</button>`;
+        apps.appendChild(li);
+      }
+      if (!selectedApp && data.items.length > 0) {
+        await selectApp(data.items[0].id);
+      }
+    }
+    async function createApp() {
+      const name = document.getElementById('app-name').value.trim();
+      if (!name) return;
+      await api('/api/v1/apps', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({name}) });
+      refreshApps();
+    }
+    async function importApp() {
+      const owner = document.getElementById('owner').value.trim();
+      const repo = document.getElementById('repo').value.trim();
+      const branch = document.getElementById('branch').value.trim() || 'main';
+      await api('/api/v1/apps/import', {
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({ repository:{ provider:'github', owner, name:repo, default_branch:branch }, source:{ branch }, build_mode:'auto' })
+      });
+      refreshApps();
+    }
+    async function selectApp(appId) {
+      selectedApp = appId;
+      await refreshDeployments();
+      await refreshDomains();
+      startLogsStream();
+    }
+    function startLogsStream() {
+      if (logsStream) {
+        logsStream.close();
+        logsStream = null;
+      }
+      if (!selectedApp) return;
+      logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
+      logsStream.addEventListener('logs', (event) => {
+        document.getElementById('logs').textContent = (event.data || '').replaceAll('\\n', '\n') || '(no logs)';
+      });
+      logsStream.onerror = () => {};
+    }
+    async function refreshDeployments() {
+      if (!selectedApp) return;
+      const res = await api(`/api/v1/apps/${selectedApp}/deployments`);
+      const data = await res.json();
+      const el = document.getElementById('deployments');
+      el.innerHTML = '';
+      for (const d of data.items) {
+        const li = document.createElement('li');
+        li.innerHTML = `${d.status} ${d.source_ref || ''} <button onclick="showLogs('${selectedApp}','${d.id}')">Logs</button>`;
+        el.appendChild(li);
+      }
+    }
+    async function showLogs(appId, deploymentId) {
+      const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
+      const data = await res.json();
+      document.getElementById('logs').textContent = data.logs || '(no logs)';
+    }
+    async function refreshDomains() {
+      if (!selectedApp) return;
+      const res = await api(`/api/v1/apps/${selectedApp}/domains`);
+      const data = await res.json();
+      const el = document.getElementById('domains');
+      el.innerHTML = '';
+      for (const d of data.items) {
+        const li = document.createElement('li');
+        li.textContent = `${d.domain} (${d.tls_mode})`;
+        el.appendChild(li);
+      }
+    }
+    async function addDomain() {
+      if (!selectedApp) return;
+      const domain = document.getElementById('domain').value.trim();
+      if (!domain) return;
+      await api(`/api/v1/apps/${selectedApp}/domains`, {
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body:JSON.stringify({ domain, tls_mode:'managed' })
+      });
+      refreshDomains();
+    }
+    async function deploy(appId) {
+      await api(`/api/v1/apps/${appId}/deployments`, { method:'POST', headers:{'content-type':'application/json'}, body:'{}' });
+      if (selectedApp === appId) refreshDeployments();
+    }
+    async function rollback(appId) {
+      await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
+      if (selectedApp === appId) refreshDeployments();
+    }
+    async function logout() {
+      if (logsStream) { logsStream.close(); logsStream = null; }
+      await api('/api/v1/auth/logout', { method:'POST' });
+      window.location.reload();
+    }
+    window.addEventListener('beforeunload', () => { if (logsStream) logsStream.close(); });
+    refreshApps();
+    setInterval(refreshApps, 15000);
+    setInterval(refreshDeployments, 4000);
+  </script>
+</body>
+</html>
+"#;
+
+async fn auth_login(
+    State(state): State<AppState>,
+    Json(payload): Json<AuthLoginRequest>,
+) -> Result<impl axum::response::IntoResponse, ApiJsonError> {
+    state
+        .check_rate_limit("auth:login", state.api_rate_limit_per_minute)
+        .map_err(status_to_api_error)?;
+
+    let email = payload.email.trim().to_ascii_lowercase();
+    if email.is_empty() || payload.password.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "email and password are required",
+            Vec::new(),
+        ));
+    }
+
+    let Some((user_id, password_hash, role)) = state
+        .db
+        .find_user_by_email(&email)
+        .map_err(|error| status_to_api_error(internal_error(error)))?
+    else {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid credentials",
+            Vec::new(),
+        ));
+    };
+
+    if token_hash(&payload.password) != password_hash {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid credentials",
+            Vec::new(),
+        ));
+    }
+
+    let session_token = format!(
+        "sess_{}.{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let now = now_unix_ms();
+    let expires_at = now.saturating_add(state.session_ttl_ms);
+    state
+        .db
+        .create_session(user_id, &token_hash(&session_token), expires_at, now)
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+
+    let cookie = format!(
+        "{SESSION_COOKIE_NAME}={session_token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        state.session_ttl_ms / 1000
+    );
+
+    Ok((
+        StatusCode::OK,
+        [(header::SET_COOKIE, cookie)],
+        Json(AuthSessionResponse {
+            user_id,
+            email,
+            role,
+            session_expires_at_unix_ms: expires_at,
+        }),
+    ))
+}
+
+async fn auth_logout(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl axum::response::IntoResponse, ApiJsonError> {
+    if let Some(session_token) = extract_cookie_value(&headers, SESSION_COOKIE_NAME) {
+        let _ = state
+            .db
+            .revoke_session(&token_hash(&session_token), now_unix_ms());
+    }
+    let cookie =
+        format!("{SESSION_COOKIE_NAME}=deleted; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]))
+}
+
+async fn auth_me(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AuthSessionResponse>, ApiJsonError> {
+    let session = authorize_session_request(&state, &headers)
+        .map_err(status_to_api_error)?
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "active session required",
+                Vec::new(),
+            )
+        })?;
+    let now = now_unix_ms();
+    Ok(Json(AuthSessionResponse {
+        user_id: session.user_id,
+        email: session.email,
+        role: session.role,
+        session_expires_at_unix_ms: now.saturating_add(state.session_ttl_ms),
+    }))
+}
+
+async fn auth_password_reset_request(
+    State(state): State<AppState>,
+    Json(payload): Json<PasswordResetRequest>,
+) -> Result<(StatusCode, Json<PasswordResetRequestedResponse>), ApiJsonError> {
+    state
+        .check_rate_limit(
+            "auth:password_reset_request",
+            state.api_rate_limit_per_minute,
+        )
+        .map_err(status_to_api_error)?;
+
+    let email = payload.email.trim().to_ascii_lowercase();
+    if email.is_empty() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "email is required",
+            Vec::new(),
+        ));
+    }
+
+    let reset_token = format!(
+        "reset_{}.{}",
+        Uuid::new_v4().simple(),
+        Uuid::new_v4().simple()
+    );
+    let now = now_unix_ms();
+    let expires_at = now.saturating_add(state.password_reset_ttl_ms);
+    let issued = state
+        .db
+        .issue_password_reset(&email, &token_hash(&reset_token), expires_at, now)
+        .map_err(|error| status_to_api_error(internal_error(error)))?
+        .is_some();
+
+    if !issued {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "user not found",
+            Vec::new(),
+        ));
+    }
+
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PasswordResetRequestedResponse {
+            accepted: true,
+            reset_token,
+            expires_at_unix_ms: expires_at,
+        }),
+    ))
+}
+
+async fn auth_password_reset_confirm(
+    State(state): State<AppState>,
+    Json(payload): Json<PasswordResetConfirmRequest>,
+) -> Result<(StatusCode, Json<PasswordResetConfirmedResponse>), ApiJsonError> {
+    state
+        .check_rate_limit(
+            "auth:password_reset_confirm",
+            state.api_rate_limit_per_minute,
+        )
+        .map_err(status_to_api_error)?;
+
+    if payload.reset_token.trim().is_empty() || payload.new_password.len() < 8 {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "reset_token is required and new_password must be at least 8 chars",
+            Vec::new(),
+        ));
+    }
+
+    let updated = state
+        .db
+        .confirm_password_reset(
+            &token_hash(payload.reset_token.trim()),
+            &token_hash(&payload.new_password),
+            now_unix_ms(),
+        )
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+
+    if !updated {
+        return Err(api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "invalid or expired reset token",
+            Vec::new(),
+        ));
+    }
+
+    Ok((
+        StatusCode::OK,
+        Json(PasswordResetConfirmedResponse { accepted: true }),
+    ))
+}
 
 async fn import_app(
     State(state): State<AppState>,
@@ -1833,6 +2973,8 @@ async fn handle_github_webhook(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Json<GithubWebhookAccepted>), StatusCode> {
+    state.check_rate_limit("webhook:github", state.webhook_rate_limit_per_minute)?;
+
     if headers
         .get(GITHUB_EVENT_HEADER)
         .and_then(|value| value.to_str().ok())
@@ -1869,6 +3011,8 @@ async fn handle_github_webhook(
     for integration in &integrations {
         let request = CreateDeploymentRequest {
             source_ref: Some(format!("github:{}", payload.after)),
+            image_ref: None,
+            commit_sha: Some(payload.after.clone()),
             simulate_failures: Some(0),
         };
         state
@@ -1939,6 +3083,115 @@ async fn get_app_effective_config(
     Ok(Json(config))
 }
 
+async fn create_domain(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<CreateDomainRequest>,
+) -> Result<(StatusCode, Json<DomainSummary>), StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Admin,
+        "POST",
+        "/api/v1/apps/:app_id/domains",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let tls_mode = payload.tls_mode.as_deref().unwrap_or("managed").to_string();
+    if tls_mode != "managed" && tls_mode != "custom" {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    if tls_mode == "custom" && (payload.cert_path.is_none() || payload.key_path.is_none()) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let summary = state
+        .db
+        .create_domain(
+            app_id,
+            &CreateDomainRequest {
+                domain: payload.domain.trim().to_string(),
+                tls_mode: Some(tls_mode),
+                cert_path: payload.cert_path.clone(),
+                key_path: payload.key_path.clone(),
+            },
+            now_unix_ms(),
+        )
+        .map_err(internal_error)?
+        .ok_or(StatusCode::CONFLICT)?;
+
+    if let Err(error) = sync_caddyfile_from_domains(&state) {
+        warn!(%error, "failed syncing caddyfile after domain change");
+    }
+
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+async fn list_domains(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DomainListResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/domains",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let items = state.db.list_domains(app_id).map_err(internal_error)?;
+    Ok(Json(DomainListResponse { items }))
+}
+
+async fn stream_app_logs(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>>, StatusCode>
+{
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/logs/stream",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let state_for_stream = state.clone();
+    let stream =
+        IntervalStream::new(tokio::time::interval(Duration::from_secs(2))).map(move |_| {
+            let logs = state_for_stream
+                .db
+                .latest_deployment_id_for_app(app_id)
+                .ok()
+                .flatten()
+                .and_then(|deployment_id| {
+                    state_for_stream
+                        .db
+                        .deployment_log_output(deployment_id)
+                        .ok()
+                })
+                .unwrap_or_default();
+            Ok(Event::default()
+                .event("logs")
+                .data(logs.replace('\n', "\\n")))
+        });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
+}
+
 async fn get_deployment_logs(
     AxumPath((app_id, deployment_id)): AxumPath<(Uuid, Uuid)>,
     State(state): State<AppState>,
@@ -1999,6 +3252,21 @@ async fn create_deployment(
             }
         }
     }
+    if payload.commit_sha.is_none() {
+        if let Some(source_ref) = payload.source_ref.as_deref() {
+            if let Some(commit) = source_ref.strip_prefix("github:") {
+                payload.commit_sha = Some(commit.to_string());
+            }
+        }
+    }
+    if payload.image_ref.is_none() {
+        let tag = payload
+            .commit_sha
+            .as_deref()
+            .map(|sha| sha.chars().take(12).collect::<String>())
+            .unwrap_or_else(|| "latest".to_string());
+        payload.image_ref = Some(format!("rustploy/{app_id}:{tag}"));
+    }
 
     let accepted = state
         .db
@@ -2039,6 +3307,8 @@ async fn rollback_deployment(
             app_id,
             &CreateDeploymentRequest {
                 source_ref: Some(source_ref),
+                image_ref: Some(format!("rustploy/{app_id}:rollback")),
+                commit_sha: None,
                 simulate_failures: Some(0),
             },
             now_unix_ms(),
@@ -2153,6 +3423,11 @@ async fn register_agent(
     headers: HeaderMap,
     Json(payload): Json<AgentRegisterRequest>,
 ) -> Result<(StatusCode, Json<AgentRegistered>), StatusCode> {
+    let traceparent = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    info!(agent_id = %payload.agent_id, traceparent, "agent register request");
     authorize_agent_request(&headers, &state.agent_shared_token)?;
 
     let created = state
@@ -2174,6 +3449,11 @@ async fn agent_heartbeat(
     headers: HeaderMap,
     Json(payload): Json<AgentHeartbeat>,
 ) -> Result<(StatusCode, Json<HeartbeatAccepted>), StatusCode> {
+    let traceparent = headers
+        .get("traceparent")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    info!(agent_id = %payload.agent_id, traceparent, "agent heartbeat request");
     authorize_agent_request(&headers, &state.agent_shared_token)?;
 
     state
@@ -2212,6 +3492,43 @@ fn verify_github_signature(
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
+fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
+    let domains = state.db.list_all_domains()?;
+    let path =
+        std::env::var("RUSTPLOY_CADDYFILE_PATH").unwrap_or_else(|_| "data/Caddyfile".to_string());
+    let upstream = std::env::var("RUSTPLOY_UPSTREAM_ADDR")
+        .unwrap_or_else(|_| DEFAULT_CADDY_UPSTREAM.to_string());
+    if let Some(parent) = Path::new(&path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+    }
+
+    let mut content = String::new();
+    content.push_str("{\n  auto_https on\n}\n\n");
+    content.push_str(&format!(":80 {{\n  reverse_proxy {upstream}\n}}\n\n"));
+    if domains.is_empty() {
+        content.push_str(&format!("localhost {{\n  reverse_proxy {upstream}\n}}\n"));
+    } else {
+        for domain in domains {
+            content.push_str(&format!("{} {{\n", domain.domain));
+            if domain.tls_mode == "custom" {
+                if let (Some(cert), Some(key)) =
+                    (domain.cert_path.as_deref(), domain.key_path.as_deref())
+                {
+                    content.push_str(&format!("  tls {cert} {key}\n"));
+                }
+            }
+            content.push_str(&format!("  reverse_proxy {upstream}\n"));
+            content.push_str("}\n\n");
+        }
+    }
+
+    fs::write(&path, content).with_context(|| format!("failed writing caddyfile at {path}"))?;
+    Ok(())
+}
+
 fn authorize_api_request(
     state: &AppState,
     headers: &HeaderMap,
@@ -2219,27 +3536,78 @@ fn authorize_api_request(
     method: &str,
     path: &str,
 ) -> Result<(), StatusCode> {
+    state.check_rate_limit(
+        &format!("api:{method}:{path}"),
+        state.api_rate_limit_per_minute,
+    )?;
+
     let has_tokens = state.db.has_unrevoked_tokens().map_err(internal_error)?;
-    if !has_tokens {
+    let has_users = state.db.has_users().map_err(internal_error)?;
+    if !has_tokens && !has_users {
         return Ok(());
     }
 
-    let token = headers
+    if let Some(token) = headers
         .get(AUTHORIZATION_HEADER)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    {
+        let now = now_unix_ms();
+        let maybe_token = state
+            .db
+            .authenticate_api_token(&token_hash(token), now, method, path)
+            .map_err(internal_error)?;
+        let authenticated = maybe_token.ok_or(StatusCode::UNAUTHORIZED)?;
+        return if scope_allows(authenticated.scope_mask, required_scope) {
+            Ok(())
+        } else {
+            Err(StatusCode::FORBIDDEN)
+        };
+    }
 
-    let now = now_unix_ms();
-    let maybe_token = state
-        .db
-        .authenticate_api_token(&token_hash(token), now, method, path)
-        .map_err(internal_error)?;
-    let authenticated = maybe_token.ok_or(StatusCode::UNAUTHORIZED)?;
-    if scope_allows(authenticated.scope_mask, required_scope) {
-        Ok(())
+    let session = authorize_session_request(state, headers)?;
+    if let Some(session) = session {
+        if session_scope_allows(&session.role, required_scope) {
+            Ok(())
+        } else {
+            Err(StatusCode::FORBIDDEN)
+        }
     } else {
-        Err(StatusCode::FORBIDDEN)
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+fn authorize_session_request(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Option<AuthenticatedSession>, StatusCode> {
+    let Some(session_token) = extract_cookie_value(headers, SESSION_COOKIE_NAME) else {
+        return Ok(None);
+    };
+    state
+        .db
+        .authenticate_session(&token_hash(&session_token), now_unix_ms())
+        .map_err(internal_error)
+}
+
+fn extract_cookie_value(headers: &HeaderMap, key: &str) -> Option<String> {
+    let cookie = headers.get(COOKIE_HEADER)?.to_str().ok()?;
+    for part in cookie.split(';') {
+        let trimmed = part.trim();
+        let (k, v) = trimmed.split_once('=')?;
+        if k == key {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn session_scope_allows(role: &str, required_scope: RequiredScope) -> bool {
+    match role {
+        "owner" => true,
+        "maintainer" => matches!(required_scope, RequiredScope::Read | RequiredScope::Deploy),
+        "viewer" => matches!(required_scope, RequiredScope::Read),
+        _ => false,
     }
 }
 
@@ -2597,8 +3965,19 @@ fn authorize_agent_request(
 }
 
 fn internal_error(error: anyhow::Error) -> StatusCode {
-    error!(%error, "request failed");
+    error!(
+        error = %redact_secrets(&error.to_string()),
+        "request failed"
+    );
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn redact_secrets(input: &str) -> String {
+    input
+        .replace("Authorization: Bearer ", "Authorization: Bearer [redacted]")
+        .replace("rp_", "rp_[redacted]")
+        .replace("sess_", "sess_[redacted]")
+        .replace("reset_", "reset_[redacted]")
 }
 
 fn api_error(
@@ -2753,12 +4132,18 @@ mod tests {
             db_path: db_path.clone(),
             agent_shared_token: None,
             github_webhook_secret: Some(secret.clone()),
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: None,
+            bootstrap_admin_password: None,
             online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
             reconciler_enabled: false,
             reconciler_interval_ms: 1,
             job_backoff_base_ms: 1,
             job_backoff_max_ms: 100,
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
         })
         .unwrap();
         let app = create_router(state.clone());
@@ -3006,6 +4391,199 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_auth_allows_api_access_when_bootstrap_admin_exists() {
+        let db_path = test_db_path();
+        let state = AppState::from_config(AppStateConfig {
+            db_path: db_path.clone(),
+            agent_shared_token: None,
+            github_webhook_secret: None,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: Some("admin@localhost".to_string()),
+            bootstrap_admin_password: Some("password123".to_string()),
+            online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
+            reconciler_enabled: false,
+            reconciler_interval_ms: 1,
+            job_backoff_base_ms: 1,
+            job_backoff_max_ms: 100,
+            job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
+        })
+        .unwrap();
+        let app = create_router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"secure-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"admin@localhost","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let set_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+        let created = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie_pair)
+                    .body(Body::from(r#"{"name":"secure-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn sessions_expire_and_logout_revokes_access() {
+        let db_path = test_db_path();
+        let state = AppState::from_config(AppStateConfig {
+            db_path: db_path.clone(),
+            agent_shared_token: None,
+            github_webhook_secret: None,
+            session_ttl_ms: 5,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: Some("admin@localhost".to_string()),
+            bootstrap_admin_password: Some("password123".to_string()),
+            online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
+            reconciler_enabled: false,
+            reconciler_interval_ms: 1,
+            job_backoff_base_ms: 1,
+            job_backoff_max_ms: 100,
+            job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
+        })
+        .unwrap();
+        let app = create_router(state);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"admin@localhost","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let set_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let expired = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie_pair.clone())
+                    .body(Body::from(r#"{"name":"should-fail"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(expired.status(), StatusCode::UNAUTHORIZED);
+
+        let login_two = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"admin@localhost","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login_two.status(), StatusCode::OK);
+        let set_cookie_two = login_two
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair_two = set_cookie_two.split(';').next().unwrap().to_string();
+
+        let logout = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/logout")
+                    .header("cookie", cookie_pair_two.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logout.status(), StatusCode::NO_CONTENT);
+
+        let revoked = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .header("cookie", cookie_pair_two)
+                    .body(Body::from(r#"{"name":"should-fail-too"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
     async fn import_detects_nextjs_and_pnpm_and_applies_manifest_name() {
         let db_path = test_db_path();
         let app = create_router(AppState::for_tests(&db_path, None));
@@ -3080,6 +4658,126 @@ mod tests {
         assert_eq!(import_json["app"]["name"], json!("manifest-name"));
 
         let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn nextjs_import_and_deploy_detects_all_package_managers() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app = create_router(state.clone());
+
+        for (lockfile_name, lockfile_content, expected_manager) in [
+            ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n", "pnpm"),
+            ("yarn.lock", "# yarn lock\n", "yarn"),
+            (
+                "package-lock.json",
+                "{\n  \"lockfileVersion\": 3\n}\n",
+                "npm",
+            ),
+        ] {
+            let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&repo_path).unwrap();
+            std::fs::write(
+                repo_path.join("package.json"),
+                r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+            )
+            .unwrap();
+            std::fs::write(repo_path.join(lockfile_name), lockfile_content).unwrap();
+
+            run_git(&repo_path, &["init", "-b", "main"]);
+            run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+            run_git(&repo_path, &["config", "user.name", "Test User"]);
+            run_git(&repo_path, &["add", "."]);
+            run_git(&repo_path, &["commit", "-m", "init"]);
+
+            let import_payload = json!({
+                "repository": {
+                    "provider": "github",
+                    "owner": "acme",
+                    "name": format!("next-{expected_manager}"),
+                    "clone_url": repo_path.to_string_lossy(),
+                    "default_branch": "main"
+                },
+                "source": { "branch": "main" },
+                "build_mode": "auto"
+            });
+            let import_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/apps/import")
+                        .header("content-type", "application/json")
+                        .body(Body::from(import_payload.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(import_response.status(), StatusCode::CREATED);
+            let import_body = to_bytes(import_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+            assert_eq!(
+                import_json["detection"]["package_manager"],
+                json!(expected_manager)
+            );
+            let app_id = import_json["app"]["id"].as_str().unwrap();
+
+            let deploy_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/v1/apps/{app_id}/deployments"))
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(deploy_response.status(), StatusCode::ACCEPTED);
+            let deploy_body = to_bytes(deploy_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let deploy_json: Value = serde_json::from_slice(&deploy_body).unwrap();
+            let deployment_id = deploy_json["deployment_id"].as_str().unwrap();
+
+            assert!(state.run_reconciler_once().unwrap());
+
+            let logs_response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/apps/{app_id}/deployments/{deployment_id}/logs"
+                        ))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(logs_response.status(), StatusCode::OK);
+            let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let logs_json: Value = serde_json::from_slice(&logs_body).unwrap();
+            let logs = logs_json["logs"].as_str().unwrap();
+            assert!(logs.contains(&format!("package_manager={expected_manager}")));
+
+            let _ = std::fs::remove_dir_all(&repo_path);
+        }
+
         cleanup_db(&db_path);
     }
 
@@ -3240,6 +4938,64 @@ mod tests {
         assert_eq!(config_json["dependency_profile"]["redis"], json!(false));
 
         let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn domains_can_be_created_and_listed() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let app_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"domain-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_body = to_bytes(app_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_json: Value = serde_json::from_slice(&app_body).unwrap();
+        let app_id = app_json["id"].as_str().unwrap();
+
+        let create_domain = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/domains"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"example.test","tls_mode":"managed"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_domain.status(), StatusCode::CREATED);
+
+        let list_domains = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/domains"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list_domains.status(), StatusCode::OK);
+        let body = to_bytes(list_domains.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["items"][0]["domain"], json!("example.test"));
+
         cleanup_db(&db_path);
     }
 
@@ -3435,6 +5191,110 @@ mod tests {
         assert!(logs.contains("deployment started"));
         assert!(logs.contains("package_manager=pnpm"));
         assert!(logs.contains("deployment healthy"));
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn managed_dependencies_are_logged_and_gated() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app = create_router(state.clone());
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("package.json"),
+            r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            repo_path.join("rustploy.yaml"),
+            "version: 1\ndependencies:\n  postgres:\n    enabled: true\n  redis:\n    enabled: true\n",
+        )
+        .unwrap();
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "dep-app",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": { "branch": "main" }
+        });
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let import_body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+        let app_id = import_json["app"]["id"].as_str().unwrap();
+
+        let deploy_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/deployments"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deploy_body = to_bytes(deploy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let deploy_json: Value = serde_json::from_slice(&deploy_body).unwrap();
+        let deployment_id = deploy_json["deployment_id"].as_str().unwrap();
+
+        assert!(state.run_reconciler_once().unwrap());
+
+        let logs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{app_id}/deployments/{deployment_id}/logs"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_json: Value = serde_json::from_slice(&logs_body).unwrap();
+        let logs = logs_json["logs"].as_str().unwrap();
+        assert!(logs.contains("managed dependency ready: postgres"));
+        assert!(logs.contains("managed dependency ready: redis"));
 
         let _ = std::fs::remove_dir_all(&repo_path);
         cleanup_db(&db_path);

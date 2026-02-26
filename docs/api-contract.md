@@ -9,23 +9,26 @@ Base path: `/api/v1`
 
 - `Content-Type: application/json`
 - Token auth: `Authorization: Bearer <token>`
+- Session auth: cookie `rustploy_session=<token>`
 - Agent auth (optional): `x-rustploy-agent-token: <token>`
 - IDs: UUID strings
 - Timestamps: unix milliseconds
 
 ## Bootstrap behavior
 
-- If no API token exists yet, privileged endpoints are temporarily open.
-- After the first token is created, token auth is required.
+- If no users and no API tokens exist, privileged endpoints are temporarily open.
+- Once a user or token exists, bearer token or session auth is required.
 
 ## Implemented endpoint groups
 
-- Health: `GET /health`
+- Health/metrics: `GET /health`, `GET /metrics`
+- Auth: `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, password reset endpoints
 - Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
 - Effective config: `GET /apps/{app_id}/config`
+- Domains: `GET/POST /apps/{app_id}/domains`
 - GitHub: `POST /apps/{app_id}/github`, `POST /integrations/github/webhook`
-- Deployments: `GET/POST /apps/{app_id}/deployments`, `GET /apps/{app_id}/deployments/{deployment_id}/logs`, `POST /apps/{app_id}/rollback`
+- Deployments: `GET/POST /apps/{app_id}/deployments`, `GET /apps/{app_id}/deployments/{deployment_id}/logs`, `GET /apps/{app_id}/logs/stream`, `POST /apps/{app_id}/rollback`
 - Tokens: `GET/POST /tokens`, `DELETE /tokens/{token_id}`
 
 ## Example: create admin token

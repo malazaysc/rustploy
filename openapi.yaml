@@ -11,6 +11,10 @@ components:
       type: http
       scheme: bearer
       bearerFormat: Token
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: rustploy_session
   schemas:
     HealthResponse:
       type: object
@@ -53,6 +57,10 @@ components:
       properties:
         source_ref:
           type: [string, 'null']
+        image_ref:
+          type: [string, 'null']
+        commit_sha:
+          type: [string, 'null']
         simulate_failures:
           type: [integer, 'null']
           minimum: 0
@@ -80,6 +88,10 @@ components:
           type: string
           format: uuid
         source_ref:
+          type: [string, 'null']
+        image_ref:
+          type: [string, 'null']
+        commit_sha:
           type: [string, 'null']
         status:
           type: string
@@ -271,6 +283,102 @@ components:
       properties:
         error:
           $ref: '#/components/schemas/ApiError'
+    AuthLoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+    AuthSessionResponse:
+      type: object
+      required: [user_id, email, role, session_expires_at_unix_ms]
+      properties:
+        user_id:
+          type: string
+          format: uuid
+        email:
+          type: string
+        role:
+          type: string
+        session_expires_at_unix_ms:
+          type: integer
+          format: int64
+    PasswordResetRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+    PasswordResetRequestedResponse:
+      type: object
+      required: [accepted, reset_token, expires_at_unix_ms]
+      properties:
+        accepted:
+          type: boolean
+        reset_token:
+          type: string
+        expires_at_unix_ms:
+          type: integer
+          format: int64
+    PasswordResetConfirmRequest:
+      type: object
+      required: [reset_token, new_password]
+      properties:
+        reset_token:
+          type: string
+        new_password:
+          type: string
+    PasswordResetConfirmedResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+    CreateDomainRequest:
+      type: object
+      required: [domain]
+      properties:
+        domain:
+          type: string
+        tls_mode:
+          type: [string, 'null']
+          enum: [managed, custom, null]
+        cert_path:
+          type: [string, 'null']
+        key_path:
+          type: [string, 'null']
+    DomainSummary:
+      type: object
+      required: [id, app_id, domain, tls_mode, created_at_unix_ms]
+      properties:
+        id:
+          type: string
+          format: uuid
+        app_id:
+          type: string
+          format: uuid
+        domain:
+          type: string
+        tls_mode:
+          type: string
+        cert_path:
+          type: [string, 'null']
+        key_path:
+          type: [string, 'null']
+        created_at_unix_ms:
+          type: integer
+          format: int64
+    DomainListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DomainSummary'
     CreateTokenRequest:
       type: object
       required: [name, scopes]
@@ -399,12 +507,101 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
+  /metrics:
+    get:
+      summary: Prometheus metrics snapshot
+      operationId: metrics
+      responses:
+        '200':
+          description: Metrics payload
+          content:
+            text/plain:
+              schema:
+                type: string
+  /auth/login:
+    post:
+      summary: Login with local owner account
+      operationId: authLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthLoginRequest'
+      responses:
+        '200':
+          description: Session created
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSessionResponse'
+  /auth/logout:
+    post:
+      summary: Revoke current session
+      operationId: authLogout
+      security:
+        - cookieAuth: []
+      responses:
+        '204':
+          description: Session revoked
+  /auth/me:
+    get:
+      summary: Get active session identity
+      operationId: authMe
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: Session identity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthSessionResponse'
+  /auth/password-reset/request:
+    post:
+      summary: Issue password reset token
+      operationId: authPasswordResetRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetRequest'
+      responses:
+        '202':
+          description: Reset token issued
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordResetRequestedResponse'
+  /auth/password-reset/confirm:
+    post:
+      summary: Confirm password reset and set new password
+      operationId: authPasswordResetConfirm
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordResetConfirmRequest'
+      responses:
+        '200':
+          description: Password reset confirmed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PasswordResetConfirmedResponse'
   /agents:
     get:
       summary: List agents
       operationId: listAgents
       security:
         - bearerAuth: []
+        - cookieAuth: []
       responses:
         '200':
           description: Agent list
@@ -470,6 +667,7 @@ paths:
       operationId: importApp
       security:
         - bearerAuth: []
+        - cookieAuth: []
       requestBody:
         required: true
         content:
@@ -495,6 +693,7 @@ paths:
       operationId: listApps
       security:
         - bearerAuth: []
+        - cookieAuth: []
       responses:
         '200':
           description: App list
@@ -507,6 +706,7 @@ paths:
       operationId: createApp
       security:
         - bearerAuth: []
+        - cookieAuth: []
       requestBody:
         required: true
         content:
@@ -526,6 +726,7 @@ paths:
       operationId: connectGithub
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -552,6 +753,7 @@ paths:
       operationId: getAppEffectiveConfig
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -566,12 +768,81 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EffectiveAppConfigResponse'
+  /apps/{app_id}/domains:
+    get:
+      summary: List domains for app
+      operationId: listDomains
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Domain list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainListResponse'
+    post:
+      summary: Add domain mapping
+      operationId: createDomain
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDomainRequest'
+      responses:
+        '201':
+          description: Domain mapping created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DomainSummary'
+  /apps/{app_id}/logs/stream:
+    get:
+      summary: Stream latest app logs via SSE
+      operationId: streamAppLogs
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Server sent events
+          content:
+            text/event-stream:
+              schema:
+                type: string
   /apps/{app_id}/deployments:
     get:
       summary: List deployments
       operationId: listDeployments
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -591,6 +862,7 @@ paths:
       operationId: createDeployment
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -617,6 +889,7 @@ paths:
       operationId: getDeploymentLogs
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -643,6 +916,7 @@ paths:
       operationId: rollbackDeployment
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: app_id
           in: path
@@ -691,6 +965,7 @@ paths:
       operationId: listTokens
       security:
         - bearerAuth: []
+        - cookieAuth: []
       responses:
         '200':
           description: Token list
@@ -703,6 +978,7 @@ paths:
       operationId: createToken
       security:
         - bearerAuth: []
+        - cookieAuth: []
       requestBody:
         required: true
         content:
@@ -722,6 +998,7 @@ paths:
       operationId: revokeToken
       security:
         - bearerAuth: []
+        - cookieAuth: []
       parameters:
         - name: token_id
           in: path

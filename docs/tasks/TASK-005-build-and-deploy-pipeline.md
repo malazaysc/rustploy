@@ -1,6 +1,6 @@
 # TASK-005: Build and deploy pipeline
 
-- Status: Todo
+- Status: Done
 - Priority: P1
 - Estimate: 4-6 days
 - Owner: Unassigned
@@ -22,6 +22,12 @@ Define and implement image-based deployment flow with rollback support.
 - Auto-build flow produces runnable image for supported templates.
 - Rollback to previous deployment works.
 - Deployment timeline visible via API.
+
+## Completion notes
+
+- Deployment records now include `image_ref` and `commit_sha`.
+- API supports deploy + rollback and deployment history retrieval.
+- Import + deploy flow applies auto mode defaults and runtime config.
 
 ## Dependencies
 

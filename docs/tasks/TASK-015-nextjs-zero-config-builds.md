@@ -1,6 +1,6 @@
 # TASK-015: Next.js zero-config builds and package manager support
 
-- Status: In Progress
+- Status: Done
 - Priority: P0
 - Estimate: 6-9 days
 - Owner: Unassigned
@@ -22,6 +22,12 @@ Allow users to import and deploy common Next.js repositories from GitHub without
 - `pnpm`, `yarn`, and `npm` projects all build in integration tests.
 - Build logs clearly show detected package manager and steps.
 - Users can switch to Dockerfile mode when needed.
+
+## Completion notes
+
+- Import flow detects Next.js build profile from `package.json`.
+- Lockfile detection supports `pnpm`, `yarn`, and `npm` with test coverage.
+- Deployment logs include detected package manager/build mode and Dockerfile guardrails.
 
 ## Dependencies
 

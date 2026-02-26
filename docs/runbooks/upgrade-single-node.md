@@ -12,10 +12,11 @@ Upgrade Rustploy with minimal downtime and no state loss.
 
 ## Steps
 
-1. Pull new container images or binaries.
-2. Stop write-heavy operations (optional maintenance window).
-3. Apply DB migrations.
-4. Restart services in order: server, agent, ingress.
+1. Take backup using [`backup-and-restore.md`](./backup-and-restore.md).
+2. Pull latest code/images.
+3. Restart stack with rebuild:
+   - `docker compose up -d --build`
+4. Confirm migrations completed in server logs.
 5. Verify health and recent deployments.
 
 ## Validation
@@ -23,3 +24,4 @@ Upgrade Rustploy with minimal downtime and no state loss.
 - API and UI are reachable.
 - Existing apps are listed and healthy.
 - New deployments can be triggered successfully.
+- Existing domain/TLS configuration still works after restart.

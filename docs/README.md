@@ -13,6 +13,8 @@ This repository starts documentation-first. Use these docs as the product and de
 - [Terminal UI](./tui.md)
 - [Next.js Build Strategy](./build-nextjs.md)
 - [rustploy.yaml Manifest](./rustploy-manifest.md)
+- [Caddy Ingress](./caddy.md)
+- [Release Engineering](./release-engineering.md)
 - [Deployment State Machine](./deployment-state-machine.md)
 - [Examples](./examples/README.md)
 - [Runbooks](./runbooks/README.md)

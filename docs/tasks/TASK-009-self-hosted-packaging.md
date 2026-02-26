@@ -1,6 +1,6 @@
 # TASK-009: Self-hosted packaging
 
-- Status: Todo
+- Status: Done
 - Priority: P0
 - Estimate: 4-6 days
 - Owner: Unassigned
@@ -21,6 +21,12 @@ Make installation and upgrades straightforward for self-host users.
 - Fresh install works from a single documented path.
 - Upgrade path preserves app and certificate state.
 - Restore steps validated in local test.
+
+## Completion notes
+
+- Compose bundle now includes `server`, `agent`, `sqlite`, and `caddy`.
+- Added static binary/systemd unit templates and install runbook.
+- Backup/restore and upgrade runbooks document state preservation and validation.
 
 ## Dependencies
 

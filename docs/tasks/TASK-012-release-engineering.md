@@ -1,6 +1,6 @@
 # TASK-012: Release engineering
 
-- Status: Todo
+- Status: Done
 - Priority: P1
 - Estimate: 3-4 days
 - Owner: Unassigned
@@ -20,6 +20,12 @@ Establish repeatable open-source release process.
 - Tagged release pipeline produces installable artifacts.
 - Release notes are generated and published.
 - Provenance and SBOM assets are attached.
+
+## Completion notes
+
+- Added tag-driven GitHub Actions release workflow.
+- Workflow builds server/agent/tui binaries and publishes checksums.
+- SBOM and provenance attestation artifacts are generated and attached to releases.
 
 ## Dependencies
 

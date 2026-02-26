@@ -1,6 +1,6 @@
 # TASK-007: Web dashboard UI
 
-- Status: Todo
+- Status: Done
 - Priority: P1
 - Estimate: 7-10 days
 - Owner: Unassigned
@@ -21,6 +21,12 @@ Deliver a polished and efficient web UI for app/deploy operations.
 - User can create app and trigger deployment from UI.
 - Deployment status updates in real time.
 - UI remains usable on mobile and desktop.
+
+## Completion notes
+
+- Rust server now serves login and dashboard pages at `/`.
+- Dashboard supports app create/import, deploy/rollback, domain management, and log viewing.
+- Real-time log/status updates are delivered through SSE log stream plus periodic refresh.
 
 ## Dependencies
 

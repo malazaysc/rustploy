@@ -1,6 +1,6 @@
 # TASK-014: Terminal UI (TUI)
 
-- Status: In Progress
+- Status: Done
 - Priority: P1
 - Estimate: 6-8 days
 - Owner: Unassigned
@@ -22,6 +22,12 @@ Provide a first-party terminal UI for operating Rustploy in SSH and low-bandwidt
 - Operator can trigger deploy and rollback actions from TUI.
 - Live logs stream is visible in terminal session.
 - TUI runs reliably in common SSH terminal sizes.
+
+## Completion notes
+
+- `rustploy-tui` binary provides SSH-friendly command loop operations.
+- Supports app import/list, effective config, deployment list, deploy, rollback, and domains.
+- Supports log inspection and watch mode for live deployment output.
 
 ## Dependencies
 

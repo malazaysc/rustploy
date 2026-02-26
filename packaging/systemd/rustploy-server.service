@@ -1,0 +1,18 @@
+[Unit]
+Description=Rustploy Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rustploy
+ExecStart=/usr/local/bin/rustploy-server
+Environment=RUST_LOG=info
+Environment=RUSTPLOY_SERVER_ADDR=0.0.0.0:8080
+Environment=RUSTPLOY_DB_PATH=/var/lib/rustploy/rustploy.db
+Restart=on-failure
+RestartSec=3
+User=rustploy
+Group=rustploy
+
+[Install]
+WantedBy=multi-user.target

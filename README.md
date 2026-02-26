@@ -35,10 +35,14 @@ cargo test --workspace
 cargo run -p server
 ```
 
-3. Bootstrap an admin API token (first token can be created without auth):
+3. Login as bootstrap admin (`admin@localhost` / `admin` by default) and create an API token:
 
 ```bash
-curl -sS -X POST http://localhost:8080/api/v1/tokens \
+curl -sS -c /tmp/rustploy.cookies -X POST http://localhost:8080/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@localhost","password":"admin"}'
+
+curl -sS -b /tmp/rustploy.cookies -X POST http://localhost:8080/api/v1/tokens \
   -H 'content-type: application/json' \
   -d '{"name":"admin","scopes":["admin"]}'
 ```
@@ -55,6 +59,12 @@ RUSTPLOY_AGENT_ONESHOT=true cargo run -p agent
 RUSTPLOY_API_TOKEN=<token-from-step-3> cargo run -p tui
 ```
 
+6. Open the web dashboard:
+
+```bash
+open http://localhost:8080/
+```
+
 ## Run without local Rust
 
 Use Docker Compose to build and run Rustploy in containers:
@@ -65,7 +75,8 @@ docker compose up --build
 
 This starts:
 
-- `server` on `http://localhost:8080`
+- `caddy` on `http://localhost:8080` (front door for UI + API)
+- `server` and `agent` on the internal compose network
 - `agent` sending periodic heartbeats to `server`
 
 Useful checks:
@@ -73,7 +84,12 @@ Useful checks:
 ```bash
 curl http://localhost:8080/api/v1/health
 curl http://localhost:8080/api/v1/agents
-curl -X POST http://localhost:8080/api/v1/apps -H 'content-type: application/json' -d '{"name":"demo"}'
+curl -sS -c /tmp/rustploy.cookies -X POST http://localhost:8080/api/v1/auth/login \
+  -H 'content-type: application/json' \
+  -d '{"email":"admin@localhost","password":"admin"}'
+curl -b /tmp/rustploy.cookies -X POST http://localhost:8080/api/v1/apps \
+  -H 'content-type: application/json' \
+  -d '{"name":"demo"}'
 ```
 
 To enforce shared-token auth between agent and server, set the same `RUSTPLOY_AGENT_TOKEN` value in both services inside `docker-compose.yml`.
@@ -105,6 +121,15 @@ curl -X POST http://localhost:8080/api/v1/apps/<app-id>/rollback \
   -H "Authorization: Bearer <deploy-or-admin-token>"
 ```
 
+- Add domain mapping:
+
+```bash
+curl -X POST http://localhost:8080/api/v1/apps/<app-id>/domains \
+  -H "Authorization: Bearer <admin-token>" \
+  -H 'content-type: application/json' \
+  -d '{"domain":"app.example.com","tls_mode":"managed"}'
+```
+
 - GitHub webhook signature verification:
 
 Set `RUSTPLOY_GITHUB_WEBHOOK_SECRET` on the server and point your webhook to:
@@ -120,6 +145,8 @@ Set `RUSTPLOY_GITHUB_WEBHOOK_SECRET` on the server and point your webhook to:
 - `config <app_index>`
 - `deployments <app_index>`
 - `logs <app_index> [deployment_index]`
+- `watch-logs <app_index> [deployment_index]`
+- `domains <app_index>`
 - `deploy <app_index> [source_ref]`
 - `rollback <app_index>`
 - `help`

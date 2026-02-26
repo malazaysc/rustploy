@@ -95,6 +95,8 @@ pub struct AppListResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
     pub source_ref: Option<String>,
+    pub image_ref: Option<String>,
+    pub commit_sha: Option<String>,
     pub simulate_failures: Option<u32>,
 }
 
@@ -143,6 +145,8 @@ pub struct DeploymentSummary {
     pub id: Uuid,
     pub app_id: Uuid,
     pub source_ref: Option<String>,
+    pub image_ref: Option<String>,
+    pub commit_sha: Option<String>,
     pub status: DeploymentStatus,
     pub last_error: Option<String>,
     pub created_at_unix_ms: u64,
@@ -269,6 +273,67 @@ pub struct ApiError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorResponse {
     pub error: ApiError,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthSessionResponse {
+    pub user_id: Uuid,
+    pub email: String,
+    pub role: String,
+    pub session_expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordResetRequest {
+    pub email: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordResetRequestedResponse {
+    pub accepted: bool,
+    pub reset_token: String,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordResetConfirmRequest {
+    pub reset_token: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PasswordResetConfirmedResponse {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainSummary {
+    pub id: Uuid,
+    pub app_id: Uuid,
+    pub domain: String,
+    pub tls_mode: String,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+    pub created_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDomainRequest {
+    pub domain: String,
+    pub tls_mode: Option<String>,
+    pub cert_path: Option<String>,
+    pub key_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DomainListResponse {
+    pub items: Vec<DomainSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

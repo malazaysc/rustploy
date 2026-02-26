@@ -7,6 +7,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const AGENT_TOKEN_HEADER: &str = "x-rustploy-agent-token";
+const TRACEPARENT_HEADER: &str = "traceparent";
 
 #[derive(Debug, Clone)]
 struct AgentConfig {
@@ -136,6 +137,11 @@ async fn send_json_request<T: serde::Serialize>(
         host = config.server_addr,
         len = body.len()
     );
+    let trace_id = Uuid::new_v4().simple().to_string();
+    let span_id = &Uuid::new_v4().simple().to_string()[..16];
+    request.push_str(&format!(
+        "{TRACEPARENT_HEADER}: 00-{trace_id}{trace_id}-{span_id}-01\r\n"
+    ));
 
     if let Some(token) = &config.agent_token {
         request.push_str(&format!("{AGENT_TOKEN_HEADER}: {token}\r\n"));
