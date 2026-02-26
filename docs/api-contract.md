@@ -23,8 +23,9 @@ Base path: `/api/v1`
 - Health: `GET /health`
 - Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
+- Effective config: `GET /apps/{app_id}/config`
 - GitHub: `POST /apps/{app_id}/github`, `POST /integrations/github/webhook`
-- Deployments: `GET/POST /apps/{app_id}/deployments`, `POST /apps/{app_id}/rollback`
+- Deployments: `GET/POST /apps/{app_id}/deployments`, `GET /apps/{app_id}/deployments/{deployment_id}/logs`, `POST /apps/{app_id}/rollback`
 - Tokens: `GET/POST /tokens`, `DELETE /tokens/{token_id}`
 
 ## Example: create admin token
@@ -73,3 +74,9 @@ Response (201):
 ```
 
 Response includes detected framework/package manager and deploy endpoint for the imported app.
+
+If `rustploy.yaml` is invalid, response is `400` with structured fields under:
+
+- `error.code` (e.g. `invalid_manifest`)
+- `error.message`
+- `error.details[]` (`field`, `message`)

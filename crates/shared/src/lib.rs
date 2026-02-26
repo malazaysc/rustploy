@@ -155,6 +155,12 @@ pub struct DeploymentListResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeploymentLogsResponse {
+    pub deployment_id: Uuid,
+    pub logs: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GithubConnectRequest {
     pub owner: String,
     pub repo: String,
@@ -234,6 +240,35 @@ pub struct ImportAppResponse {
     pub app: AppSummary,
     pub detection: DetectionResult,
     pub next_action: NextAction,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EffectiveAppConfigResponse {
+    pub app_id: Uuid,
+    pub repository: RepositoryRef,
+    pub source: SourceRef,
+    pub build_mode: String,
+    pub detection: DetectionResult,
+    pub dependency_profile: Option<DependencyProfile>,
+    pub manifest: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorDetail {
+    pub field: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiError {
+    pub code: String,
+    pub message: String,
+    pub details: Vec<ApiErrorDetail>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiErrorResponse {
+    pub error: ApiError,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

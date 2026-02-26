@@ -116,7 +116,10 @@ Set `RUSTPLOY_GITHUB_WEBHOOK_SECRET` on the server and point your webhook to:
 `rustploy-tui` supports:
 
 - `apps` / `refresh`
+- `import <owner> <repo> <branch> [clone_url]`
+- `config <app_index>`
 - `deployments <app_index>`
+- `logs <app_index> [deployment_index]`
 - `deploy <app_index> [source_ref]`
 - `rollback <app_index>`
 - `help`

@@ -20,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered, AgentStatus,
-    AgentSummary, AppListResponse, AppSummary, CreateAppRequest, CreateDeploymentAccepted,
-    CreateDeploymentRequest, CreateTokenRequest, CreateTokenResponse, DependencyProfile,
-    DeploymentListResponse, DeploymentStatus, DeploymentSummary, DetectionResult,
+    AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppListResponse, AppSummary,
+    CreateAppRequest, CreateDeploymentAccepted, CreateDeploymentRequest, CreateTokenRequest,
+    CreateTokenResponse, DependencyProfile, DeploymentListResponse, DeploymentLogsResponse,
+    DeploymentStatus, DeploymentSummary, DetectionResult, EffectiveAppConfigResponse,
     GithubConnectRequest, GithubIntegrationSummary, GithubWebhookAccepted, HealthResponse,
     HeartbeatAccepted, ImportAppRequest, ImportAppResponse, NextAction, RepositoryRef, SourceRef,
     TokenListResponse, TokenSummary,
@@ -114,6 +115,12 @@ struct ImportConfigRecord {
     detection: DetectionResult,
     dependency_profile: Option<DependencyProfile>,
     manifest_json: Option<String>,
+}
+
+#[derive(Debug)]
+struct ManifestValidationError {
+    field: String,
+    message: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -481,6 +488,19 @@ impl Database {
         .context("failed checking app existence")
     }
 
+    fn deployment_belongs_to_app(&self, app_id: Uuid, deployment_id: Uuid) -> Result<bool> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM deployments
+                WHERE id = ?1 AND app_id = ?2
+            )",
+            params![deployment_id.to_string(), app_id.to_string()],
+            |row| row.get(0),
+        )
+        .context("failed checking deployment ownership")
+    }
+
     fn upsert_import_config(&self, config: &ImportConfigRecord, now_unix_ms: u64) -> Result<()> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let now = to_i64(now_unix_ms)?;
@@ -547,6 +567,105 @@ impl Database {
         .context("failed upserting import config")?;
 
         Ok(())
+    }
+
+    fn get_import_config(&self, app_id: Uuid) -> Result<Option<EffectiveAppConfigResponse>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT
+                    app_id,
+                    repo_provider,
+                    repo_owner,
+                    repo_name,
+                    repo_branch,
+                    build_mode,
+                    package_manager,
+                    framework,
+                    lockfile,
+                    build_profile,
+                    dockerfile_present,
+                    dependency_profile_json,
+                    manifest_json
+                 FROM app_import_configs
+                 WHERE app_id = ?1",
+                params![app_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying import config")?;
+
+        let Some((
+            app_id_raw,
+            repo_provider,
+            repo_owner,
+            repo_name,
+            repo_branch,
+            build_mode,
+            package_manager,
+            framework,
+            lockfile,
+            build_profile,
+            dockerfile_present,
+            dependency_profile_raw,
+            manifest_raw,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let dependency_profile = dependency_profile_raw
+            .as_deref()
+            .map(serde_json::from_str::<DependencyProfile>)
+            .transpose()
+            .context("failed parsing dependency profile json")?;
+        let manifest = manifest_raw
+            .as_deref()
+            .map(serde_json::from_str::<serde_json::Value>)
+            .transpose()
+            .context("failed parsing manifest json")?;
+
+        Ok(Some(EffectiveAppConfigResponse {
+            app_id: Uuid::parse_str(&app_id_raw)
+                .with_context(|| format!("invalid app id in import config: {app_id_raw}"))?,
+            repository: RepositoryRef {
+                provider: repo_provider,
+                owner: repo_owner,
+                name: repo_name,
+                clone_url: None,
+                default_branch: Some(repo_branch.clone()),
+            },
+            source: SourceRef {
+                branch: Some(repo_branch),
+                commit_sha: None,
+            },
+            build_mode,
+            detection: DetectionResult {
+                framework,
+                package_manager,
+                lockfile,
+                build_profile,
+                dockerfile_present: dockerfile_present == 1,
+            },
+            dependency_profile,
+            manifest,
+        }))
     }
 
     fn latest_healthy_source_ref(&self, app_id: Uuid) -> Result<Option<String>> {
@@ -1029,7 +1148,45 @@ impl Database {
             now_unix_ms,
         )?;
 
+        self.append_deployment_log(payload.deployment_id, "deployment started", now_unix_ms)?;
+        if let Some(config) = self.get_import_config(payload.app_id)? {
+            self.append_deployment_log(
+                payload.deployment_id,
+                &format!("build mode: {}", config.build_mode),
+                now_unix_ms,
+            )?;
+            self.append_deployment_log(
+                payload.deployment_id,
+                &format!(
+                    "detected framework={} package_manager={}",
+                    config.detection.framework, config.detection.package_manager
+                ),
+                now_unix_ms,
+            )?;
+            if config.build_mode == "dockerfile" && !config.detection.dockerfile_present {
+                self.append_deployment_log(
+                    payload.deployment_id,
+                    "dockerfile mode selected but Dockerfile was not detected",
+                    now_unix_ms,
+                )?;
+                anyhow::bail!("dockerfile mode requires Dockerfile in repository");
+            }
+            self.append_deployment_log(
+                payload.deployment_id,
+                "build pipeline step simulation complete",
+                now_unix_ms,
+            )?;
+        }
+
         if job.attempt_count <= payload.simulate_failures {
+            self.append_deployment_log(
+                payload.deployment_id,
+                &format!(
+                    "simulated failure on attempt {} of {}",
+                    job.attempt_count, payload.simulate_failures
+                ),
+                now_unix_ms,
+            )?;
             anyhow::bail!(
                 "simulated deployment failure on attempt {} of {}",
                 job.attempt_count,
@@ -1043,6 +1200,7 @@ impl Database {
             None,
             now_unix_ms,
         )?;
+        self.append_deployment_log(payload.deployment_id, "deployment healthy", now_unix_ms)?;
         Ok(())
     }
 
@@ -1062,6 +1220,7 @@ impl Database {
             let next_run = now_unix_ms.saturating_add(delay_ms);
 
             self.mark_job_retry(job.id, next_run, now_unix_ms, error_message)?;
+            self.append_deployment_log(payload.deployment_id, error_message, now_unix_ms)?;
             self.set_deployment_state(
                 payload.deployment_id,
                 DeploymentStatus::Retrying,
@@ -1070,6 +1229,7 @@ impl Database {
             )?;
         } else {
             self.mark_job_failed(job.id, now_unix_ms, error_message)?;
+            self.append_deployment_log(payload.deployment_id, error_message, now_unix_ms)?;
             self.set_deployment_state(
                 payload.deployment_id,
                 DeploymentStatus::Failed,
@@ -1250,6 +1410,45 @@ impl Database {
         }
     }
 
+    fn append_deployment_log(
+        &self,
+        deployment_id: Uuid,
+        message: &str,
+        now_unix_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO deployment_logs (deployment_id, message, created_at_unix_ms)
+             VALUES (?1, ?2, ?3)",
+            params![deployment_id.to_string(), message, to_i64(now_unix_ms)?],
+        )
+        .context("failed writing deployment log")?;
+        Ok(())
+    }
+
+    fn deployment_log_output(&self, deployment_id: Uuid) -> Result<String> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT message
+                 FROM deployment_logs
+                 WHERE deployment_id = ?1
+                 ORDER BY created_at_unix_ms ASC, id ASC",
+            )
+            .context("failed preparing deployment log query")?;
+        let mut rows = stmt
+            .query(params![deployment_id.to_string()])
+            .context("failed querying deployment logs")?;
+        let mut lines = Vec::new();
+        while let Some(row) = rows.next().context("failed iterating deployment logs")? {
+            let message: String = row
+                .get(0)
+                .context("failed reading deployment log message")?;
+            lines.push(message);
+        }
+        Ok(lines.join("\n"))
+    }
+
     #[cfg(test)]
     fn force_jobs_due_for_tests(&self) {
         let conn = self.conn.lock().expect("database mutex poisoned");
@@ -1275,6 +1474,8 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0003")?;
     conn.execute_batch(include_str!("../migrations/0004_api_tokens_and_import.sql"))
         .context("failed running sqlite migration 0004")?;
+    conn.execute_batch(include_str!("../migrations/0005_deployment_logs.sql"))
+        .context("failed running sqlite migration 0005")?;
 
     Ok(())
 }
@@ -1338,9 +1539,14 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/apps/import", post(import_app))
         .route("/api/v1/apps", get(list_apps).post(create_app))
         .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
+        .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
         .route(
             "/api/v1/apps/:app_id/deployments",
             get(list_app_deployments).post(create_deployment),
+        )
+        .route(
+            "/api/v1/apps/:app_id/deployments/:deployment_id/logs",
+            get(get_deployment_logs),
         )
         .route("/api/v1/apps/:app_id/rollback", post(rollback_deployment))
         .route(
@@ -1359,23 +1565,34 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse::ok())
 }
 
+type ApiJsonError = (StatusCode, Json<ApiErrorResponse>);
+
 async fn import_app(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(payload): Json<ImportAppRequest>,
-) -> Result<(StatusCode, Json<ImportAppResponse>), StatusCode> {
+) -> Result<(StatusCode, Json<ImportAppResponse>), ApiJsonError> {
     authorize_api_request(
         &state,
         &headers,
         RequiredScope::Admin,
         "POST",
         "/api/v1/apps/import",
-    )?;
+    )
+    .map_err(status_to_api_error)?;
 
     let owner = payload.repository.owner.trim().to_string();
     let repo = payload.repository.name.trim().to_string();
     if owner.is_empty() || repo.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "repository owner and name are required",
+            vec![ApiErrorDetail {
+                field: "repository".to_string(),
+                message: "owner and name must be non-empty".to_string(),
+            }],
+        ));
     }
 
     let branch = payload
@@ -1391,15 +1608,45 @@ async fn import_app(
         .clone()
         .unwrap_or_else(|| format!("https://github.com/{owner}/{repo}.git"));
     let temp_path = std::env::temp_dir().join(format!("rustploy-import-{}", Uuid::new_v4()));
-    clone_repository(&clone_url, &branch, &temp_path)?;
-    let import_result = (|| -> Result<ImportAppResponse, StatusCode> {
-        let manifest = read_manifest(&temp_path).map_err(|_| StatusCode::BAD_REQUEST)?;
+    clone_repository(&clone_url, &branch, &temp_path).map_err(status_to_api_error)?;
+    let import_result = (|| -> Result<ImportAppResponse, ApiJsonError> {
+        let manifest = read_manifest(&temp_path).map_err(|errors| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_manifest",
+                "rustploy.yaml failed validation",
+                errors
+                    .into_iter()
+                    .map(|error| ApiErrorDetail {
+                        field: error.field,
+                        message: error.message,
+                    })
+                    .collect(),
+            )
+        })?;
         let manifest_json = manifest
             .as_ref()
             .map(serde_json::to_string)
             .transpose()
-            .map_err(|_| StatusCode::BAD_REQUEST)?;
-        let detection = detect_build_profile(&temp_path).map_err(|_| StatusCode::BAD_REQUEST)?;
+            .map_err(|_| {
+                api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "failed to serialize parsed manifest",
+                    Vec::new(),
+                )
+            })?;
+        let detection = detect_build_profile(&temp_path).map_err(|_| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "build_detection_failed",
+                "failed to detect project build profile",
+                vec![ApiErrorDetail {
+                    field: "package.json".to_string(),
+                    message: "missing or invalid package.json".to_string(),
+                }],
+            )
+        })?;
         let build_mode = payload
             .build_mode
             .clone()
@@ -1410,7 +1657,15 @@ async fn import_app(
             })
             .unwrap_or_else(|| "auto".to_string());
         if build_mode != "auto" && build_mode != "dockerfile" {
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "build_mode must be auto or dockerfile",
+                vec![ApiErrorDetail {
+                    field: "build_mode".to_string(),
+                    message: "supported values are auto and dockerfile".to_string(),
+                }],
+            ));
         }
 
         let app_name = manifest
@@ -1422,8 +1677,18 @@ async fn import_app(
         let app = state
             .db
             .create_app(&app_name, now)
-            .map_err(internal_error)?
-            .ok_or(StatusCode::CONFLICT)?;
+            .map_err(|error| status_to_api_error(internal_error(error)))?
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "app name already exists",
+                    vec![ApiErrorDetail {
+                        field: "app.name".to_string(),
+                        message: app_name.clone(),
+                    }],
+                )
+            })?;
 
         let dependency_profile =
             merge_dependency_profile(payload.dependency_profile.clone(), manifest.as_ref());
@@ -1440,7 +1705,7 @@ async fn import_app(
                 },
                 now,
             )
-            .map_err(internal_error)?;
+            .map_err(|error| status_to_api_error(internal_error(error)))?;
         state
             .db
             .upsert_import_config(
@@ -1467,7 +1732,7 @@ async fn import_app(
                 },
                 now,
             )
-            .map_err(internal_error)?;
+            .map_err(|error| status_to_api_error(internal_error(error)))?;
 
         Ok(ImportAppResponse {
             app: app.clone(),
@@ -1480,7 +1745,7 @@ async fn import_app(
     })();
     let _ = std::fs::remove_dir_all(&temp_path);
 
-    import_result.map(|payload| (StatusCode::CREATED, Json(payload)))
+    import_result.map(|imported| (StatusCode::CREATED, Json(imported)))
 }
 
 async fn create_app(
@@ -1649,6 +1914,65 @@ async fn list_app_deployments(
     Ok(Json(DeploymentListResponse { items }))
 }
 
+async fn get_app_effective_config(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EffectiveAppConfigResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/config",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let config = state
+        .db
+        .get_import_config(app_id)
+        .map_err(internal_error)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    Ok(Json(config))
+}
+
+async fn get_deployment_logs(
+    AxumPath((app_id, deployment_id)): AxumPath<(Uuid, Uuid)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<DeploymentLogsResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/deployments/:deployment_id/logs",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    if !state
+        .db
+        .deployment_belongs_to_app(app_id, deployment_id)
+        .map_err(internal_error)?
+    {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let logs = state
+        .db
+        .deployment_log_output(deployment_id)
+        .map_err(internal_error)?;
+    Ok(Json(DeploymentLogsResponse {
+        deployment_id,
+        logs,
+    }))
+}
+
 async fn create_deployment(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -1665,6 +1989,15 @@ async fn create_deployment(
 
     if !state.db.app_exists(app_id).map_err(internal_error)? {
         return Err(StatusCode::NOT_FOUND);
+    }
+
+    let mut payload = payload;
+    if payload.source_ref.is_none() {
+        if let Some(config) = state.db.get_import_config(app_id).map_err(internal_error)? {
+            if let Some(branch) = config.source.branch {
+                payload.source_ref = Some(format!("import:{branch}"));
+            }
+        }
     }
 
     let accepted = state
@@ -1983,27 +2316,40 @@ fn clone_repository(clone_url: &str, branch: &str, target_path: &Path) -> Result
     }
 }
 
-fn read_manifest(repo_path: &Path) -> Result<Option<RustployManifest>, StatusCode> {
+fn read_manifest(
+    repo_path: &Path,
+) -> std::result::Result<Option<RustployManifest>, Vec<ManifestValidationError>> {
     let manifest_path = repo_path.join("rustploy.yaml");
     if !manifest_path.exists() {
         return Ok(None);
     }
 
-    let content = fs::read_to_string(&manifest_path).map_err(|_| StatusCode::BAD_REQUEST)?;
-    let manifest = parse_manifest_yaml(&content).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let content = fs::read_to_string(&manifest_path).map_err(|error| {
+        vec![ManifestValidationError {
+            field: "rustploy.yaml".to_string(),
+            message: format!("unable to read manifest: {error}"),
+        }]
+    })?;
+    let manifest = parse_manifest_yaml(&content)?;
     if manifest.version.unwrap_or(1) != 1 {
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(vec![ManifestValidationError {
+            field: "version".to_string(),
+            message: "version must be 1".to_string(),
+        }]);
     }
     Ok(Some(manifest))
 }
 
-fn parse_manifest_yaml(content: &str) -> Result<RustployManifest> {
+fn parse_manifest_yaml(
+    content: &str,
+) -> std::result::Result<RustployManifest, Vec<ManifestValidationError>> {
     let mut manifest = RustployManifest {
         version: None,
         app: None,
         build: None,
         dependencies: None,
     };
+    let mut errors = Vec::new();
 
     let mut section = String::new();
     let mut dependency_key = String::new();
@@ -2020,8 +2366,15 @@ fn parse_manifest_yaml(content: &str) -> Result<RustployManifest> {
             0 => {
                 dependency_key.clear();
                 if let Some(value) = parse_yaml_value(trimmed, "version") {
-                    manifest.version =
-                        Some(value.parse::<u32>().context("invalid manifest version")?);
+                    match value.parse::<u32>() {
+                        Ok(parsed) => {
+                            manifest.version = Some(parsed);
+                        }
+                        Err(_) => errors.push(ManifestValidationError {
+                            field: "version".to_string(),
+                            message: format!("invalid version value: {value}"),
+                        }),
+                    }
                 } else if trimmed == "app:" {
                     section = "app".to_string();
                 } else if trimmed == "build:" {
@@ -2040,6 +2393,14 @@ fn parse_manifest_yaml(content: &str) -> Result<RustployManifest> {
                     }
                 } else if section == "build" {
                     if let Some(value) = parse_yaml_value(trimmed, "mode") {
+                        if value != "auto" && value != "dockerfile" {
+                            errors.push(ManifestValidationError {
+                                field: "build.mode".to_string(),
+                                message: format!(
+                                    "invalid mode '{value}', expected auto or dockerfile"
+                                ),
+                            });
+                        }
                         let build = manifest
                             .build
                             .get_or_insert(ManifestBuildConfig { mode: None });
@@ -2070,7 +2431,18 @@ fn parse_manifest_yaml(content: &str) -> Result<RustployManifest> {
             4 => {
                 if section == "dependencies" {
                     if let Some(value) = parse_yaml_value(trimmed, "enabled") {
-                        let enabled = parse_yaml_bool(value)?;
+                        let enabled = match parse_yaml_bool(value) {
+                            Ok(enabled) => enabled,
+                            Err(_) => {
+                                errors.push(ManifestValidationError {
+                                    field: format!("dependencies.{dependency_key}.enabled"),
+                                    message: format!(
+                                        "invalid boolean '{value}', expected true or false"
+                                    ),
+                                });
+                                continue;
+                            }
+                        };
                         let dependencies =
                             manifest.dependencies.get_or_insert(ManifestDependencies {
                                 postgres: None,
@@ -2094,7 +2466,11 @@ fn parse_manifest_yaml(content: &str) -> Result<RustployManifest> {
         }
     }
 
-    Ok(manifest)
+    if errors.is_empty() {
+        Ok(manifest)
+    } else {
+        Err(errors)
+    }
 }
 
 fn parse_yaml_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
@@ -2223,6 +2599,65 @@ fn authorize_agent_request(
 fn internal_error(error: anyhow::Error) -> StatusCode {
     error!(%error, "request failed");
     StatusCode::INTERNAL_SERVER_ERROR
+}
+
+fn api_error(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    details: Vec<ApiErrorDetail>,
+) -> ApiJsonError {
+    (
+        status,
+        Json(ApiErrorResponse {
+            error: ApiError {
+                code: code.to_string(),
+                message: message.to_string(),
+                details,
+            },
+        }),
+    )
+}
+
+fn status_to_api_error(status: StatusCode) -> ApiJsonError {
+    match status {
+        StatusCode::UNAUTHORIZED => api_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "authentication is required",
+            Vec::new(),
+        ),
+        StatusCode::FORBIDDEN => api_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "token scope does not allow this operation",
+            Vec::new(),
+        ),
+        StatusCode::NOT_FOUND => api_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "resource not found",
+            Vec::new(),
+        ),
+        StatusCode::CONFLICT => api_error(
+            StatusCode::CONFLICT,
+            "conflict",
+            "resource conflict",
+            Vec::new(),
+        ),
+        StatusCode::BAD_GATEWAY => api_error(
+            StatusCode::BAD_GATEWAY,
+            "upstream_error",
+            "failed to access upstream repository",
+            Vec::new(),
+        ),
+        _ => api_error(
+            status,
+            "invalid_request",
+            "request failed validation",
+            Vec::new(),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -2643,6 +3078,363 @@ mod tests {
         assert_eq!(import_json["detection"]["framework"], json!("nextjs"));
         assert_eq!(import_json["detection"]["package_manager"], json!("pnpm"));
         assert_eq!(import_json["app"]["name"], json!("manifest-name"));
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn import_invalid_manifest_returns_structured_validation_error() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("package.json"),
+            r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        std::fs::write(
+            repo_path.join("rustploy.yaml"),
+            "version: 1\nbuild:\n  mode: invalid\n",
+        )
+        .unwrap();
+
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "next-app",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": {
+                "branch": "main"
+            }
+        });
+
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["error"]["code"], json!("invalid_manifest"));
+        assert_eq!(payload["error"]["details"][0]["field"], json!("build.mode"));
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn effective_config_endpoint_returns_imported_values() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("package.json"),
+            r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("yarn.lock"), "# yarn lock\n").unwrap();
+        std::fs::write(
+            repo_path.join("rustploy.yaml"),
+            "version: 1\nbuild:\n  mode: dockerfile\ndependencies:\n  postgres:\n    enabled: true\n  redis:\n    enabled: false\n",
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("Dockerfile"), "FROM node:20-alpine\n").unwrap();
+
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "next-app",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": {
+                "branch": "main"
+            }
+        });
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_response.status(), StatusCode::CREATED);
+        let import_body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+        let app_id = import_json["app"]["id"].as_str().unwrap();
+
+        let config_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config_response.status(), StatusCode::OK);
+        let config_body = to_bytes(config_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let config_json: Value = serde_json::from_slice(&config_body).unwrap();
+        assert_eq!(config_json["build_mode"], json!("dockerfile"));
+        assert_eq!(config_json["detection"]["package_manager"], json!("yarn"));
+        assert_eq!(config_json["dependency_profile"]["postgres"], json!(true));
+        assert_eq!(config_json["dependency_profile"]["redis"], json!(false));
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn deployment_without_source_ref_uses_import_branch() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("package.json"),
+            r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("package-lock.json"), "{}\n").unwrap();
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "next-app",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": {
+                "branch": "main"
+            }
+        });
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_response.status(), StatusCode::CREATED);
+        let import_body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+        let app_id = import_json["app"]["id"].as_str().unwrap();
+
+        let deploy_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/deployments"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deploy_response.status(), StatusCode::ACCEPTED);
+
+        let deployments = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/deployments"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deployments_body = to_bytes(deployments.into_body(), usize::MAX).await.unwrap();
+        let deployments_json: Value = serde_json::from_slice(&deployments_body).unwrap();
+        assert_eq!(
+            deployments_json["items"][0]["source_ref"],
+            json!("import:main")
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn deployment_logs_endpoint_returns_build_step_output() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app = create_router(state.clone());
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("package.json"),
+            r#"{
+  "name": "demo",
+  "scripts": {
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "next": "14.2.0"
+  }
+}"#,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("pnpm-lock.yaml"), "lockfileVersion: '9.0'\n").unwrap();
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "next-app",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": {
+                "branch": "main"
+            }
+        });
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let import_body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+        let app_id = import_json["app"]["id"].as_str().unwrap();
+
+        let deploy_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/deployments"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let deploy_body = to_bytes(deploy_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let deploy_json: Value = serde_json::from_slice(&deploy_body).unwrap();
+        let deployment_id = deploy_json["deployment_id"].as_str().unwrap();
+
+        assert!(state.run_reconciler_once().unwrap());
+
+        let logs_response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{app_id}/deployments/{deployment_id}/logs"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(logs_response.status(), StatusCode::OK);
+        let logs_body = to_bytes(logs_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let logs_json: Value = serde_json::from_slice(&logs_body).unwrap();
+        let logs = logs_json["logs"].as_str().unwrap();
+        assert!(logs.contains("deployment started"));
+        assert!(logs.contains("package_manager=pnpm"));
+        assert!(logs.contains("deployment healthy"));
 
         let _ = std::fs::remove_dir_all(&repo_path);
         cleanup_db(&db_path);

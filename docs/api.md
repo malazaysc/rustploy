@@ -26,8 +26,10 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
+- `GET /api/v1/apps/{app_id}/config`
 - `POST /api/v1/apps/{app_id}/deployments`
 - `GET /api/v1/apps/{app_id}/deployments`
+- `GET /api/v1/apps/{app_id}/deployments/{deployment_id}/logs`
 - `POST /api/v1/apps/{app_id}/rollback`
 - `POST /api/v1/tokens`
 - `GET /api/v1/tokens`
@@ -47,6 +49,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Include curl examples in user docs.
 - Keep API compatibility stable across web and TUI client releases.
 - Return detected package manager and build profile in import responses.
+- Return structured validation errors for invalid `rustploy.yaml` manifests.
 
 ## Bootstrap behavior
 

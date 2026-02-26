@@ -100,6 +100,15 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Deployment'
+    DeploymentLogsResponse:
+      type: object
+      required: [deployment_id, logs]
+      properties:
+        deployment_id:
+          type: string
+          format: uuid
+        logs:
+          type: string
     GithubConnectRequest:
       type: object
       required: [owner, repo, branch]
@@ -216,6 +225,52 @@ components:
           $ref: '#/components/schemas/DetectionResult'
         next_action:
           $ref: '#/components/schemas/NextAction'
+    EffectiveAppConfigResponse:
+      type: object
+      required: [app_id, repository, source, build_mode, detection]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        repository:
+          $ref: '#/components/schemas/RepositoryRef'
+        source:
+          $ref: '#/components/schemas/SourceRef'
+        build_mode:
+          type: string
+          enum: [auto, dockerfile]
+        detection:
+          $ref: '#/components/schemas/DetectionResult'
+        dependency_profile:
+          $ref: '#/components/schemas/DependencyProfile'
+        manifest:
+          type: [object, 'null']
+    ApiErrorDetail:
+      type: object
+      required: [field, message]
+      properties:
+        field:
+          type: string
+        message:
+          type: string
+    ApiError:
+      type: object
+      required: [code, message, details]
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ApiErrorDetail'
+    ApiErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ApiError'
     CreateTokenRequest:
       type: object
       required: [name, scopes]
@@ -428,6 +483,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ImportAppResponse'
+        '400':
+          description: Manifest or request validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
   /apps:
     get:
       summary: List apps
@@ -485,6 +546,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GithubIntegrationSummary'
+  /apps/{app_id}/config:
+    get:
+      summary: Get effective import/build configuration for app
+      operationId: getAppEffectiveConfig
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Effective config
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EffectiveAppConfigResponse'
   /apps/{app_id}/deployments:
     get:
       summary: List deployments
@@ -530,6 +611,32 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CreateDeploymentAccepted'
+  /apps/{app_id}/deployments/{deployment_id}/logs:
+    get:
+      summary: Get deployment logs
+      operationId: getDeploymentLogs
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: deployment_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Deployment logs
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentLogsResponse'
   /apps/{app_id}/rollback:
     post:
       summary: Rollback to latest healthy source

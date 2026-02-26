@@ -28,3 +28,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App import endpoint with Git-based Next.js/package-manager detection and `rustploy.yaml` parsing (`/api/v1/apps/import`).
 - Rollback endpoint using latest healthy source (`/api/v1/apps/:id/rollback`).
 - Expanded `rustploy-tui` command mode for listing apps/deployments and triggering deploy/rollback with API tokens.
+- Structured manifest validation errors for import requests.
+- Effective app config endpoint (`GET /api/v1/apps/:id/config`) and TUI config inspection command.
+- Deployment logs persistence and logs endpoint (`GET /api/v1/apps/:id/deployments/:deployment_id/logs`) with TUI `logs` command.

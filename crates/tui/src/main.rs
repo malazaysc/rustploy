@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use shared::{
     AppListResponse, AppSummary, CreateDeploymentAccepted, CreateDeploymentRequest,
-    DeploymentListResponse, DeploymentSummary, HealthResponse,
+    DeploymentListResponse, DeploymentLogsResponse, DeploymentSummary, EffectiveAppConfigResponse,
+    HealthResponse, ImportAppRequest, ImportAppResponse, RepositoryRef, SourceRef,
 };
 use std::io::{self, Write};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -83,6 +84,35 @@ async fn main() -> Result<()> {
                     println!("invalid app index");
                 }
             }
+            "logs" => {
+                let Some(app_index) = parse_index(parts.next()) else {
+                    println!("usage: logs <app_index> [deployment_index]");
+                    continue;
+                };
+                let deployment_index = parse_index(parts.next()).unwrap_or(0);
+                if let Some(app) = apps.get(app_index) {
+                    match fetch_deployments(&config, app.id).await {
+                        Ok(deployments) => {
+                            if let Some(deployment) = deployments.get(deployment_index) {
+                                match fetch_deployment_logs(&config, app.id, deployment.id).await {
+                                    Ok(logs) => {
+                                        println!(
+                                            "logs for deployment {}:\n{}",
+                                            logs.deployment_id, logs.logs
+                                        );
+                                    }
+                                    Err(error) => println!("error: {error}"),
+                                }
+                            } else {
+                                println!("invalid deployment index");
+                            }
+                        }
+                        Err(error) => println!("error: {error}"),
+                    }
+                } else {
+                    println!("invalid app index");
+                }
+            }
             "rollback" => {
                 let Some(index) = parse_index(parts.next()) else {
                     println!("usage: rollback <app_index>");
@@ -99,6 +129,50 @@ async fn main() -> Result<()> {
                     println!("invalid app index");
                 }
             }
+            "config" => {
+                let Some(index) = parse_index(parts.next()) else {
+                    println!("usage: config <app_index>");
+                    continue;
+                };
+                if let Some(app) = apps.get(index) {
+                    match fetch_effective_config(&config, app.id).await {
+                        Ok(effective) => print_effective_config(app, &effective),
+                        Err(error) => println!("error: {error}"),
+                    }
+                } else {
+                    println!("invalid app index");
+                }
+            }
+            "import" => {
+                let Some(owner) = parts.next() else {
+                    println!("usage: import <owner> <repo> <branch> [clone_url]");
+                    continue;
+                };
+                let Some(repo) = parts.next() else {
+                    println!("usage: import <owner> <repo> <branch> [clone_url]");
+                    continue;
+                };
+                let Some(branch) = parts.next() else {
+                    println!("usage: import <owner> <repo> <branch> [clone_url]");
+                    continue;
+                };
+                let clone_url = parts.next().map(str::to_string);
+
+                match import_app(&config, owner, repo, branch, clone_url).await {
+                    Ok(imported) => {
+                        println!(
+                            "imported app {} ({}) framework={} package_manager={}",
+                            imported.app.name,
+                            imported.app.id,
+                            imported.detection.framework,
+                            imported.detection.package_manager
+                        );
+                        apps = fetch_apps(&config).await.unwrap_or_default();
+                        print_apps(&apps);
+                    }
+                    Err(error) => println!("error: {error}"),
+                }
+            }
             _ => println!("unknown command: {command}"),
         }
     }
@@ -113,7 +187,10 @@ fn parse_index(value: Option<&str>) -> Option<usize> {
 fn print_help() {
     println!("commands:");
     println!("  apps | refresh");
+    println!("  import <owner> <repo> <branch> [clone_url]");
+    println!("  config <app_index>");
     println!("  deployments <app_index>");
+    println!("  logs <app_index> [deployment_index]");
     println!("  deploy <app_index> [source_ref]");
     println!("  rollback <app_index>");
     println!("  help");
@@ -149,6 +226,27 @@ fn print_deployments(app: &AppSummary, items: &[DeploymentSummary]) {
     }
 }
 
+fn print_effective_config(app: &AppSummary, config: &EffectiveAppConfigResponse) {
+    let branch = config.source.branch.as_deref().unwrap_or("main");
+    println!("effective config for {} ({})", app.name, app.id);
+    println!(
+        "  repo={}/{} branch={}",
+        config.repository.owner, config.repository.name, branch
+    );
+    println!(
+        "  build_mode={} framework={} package_manager={}",
+        config.build_mode, config.detection.framework, config.detection.package_manager
+    );
+    if let Some(profile) = &config.dependency_profile {
+        println!(
+            "  dependencies postgres={:?} redis={:?}",
+            profile.postgres, profile.redis
+        );
+    } else {
+        println!("  dependencies none");
+    }
+}
+
 async fn fetch_health(config: &TuiConfig) -> Result<HealthResponse> {
     let (_, body) = send_request(config, "GET", "/api/v1/health", None).await?;
     serde_json::from_str::<HealthResponse>(&body).context("invalid health response payload")
@@ -178,6 +276,72 @@ async fn fetch_deployments(config: &TuiConfig, app_id: Uuid) -> Result<Vec<Deplo
     let payload: DeploymentListResponse =
         serde_json::from_str(&body).context("invalid deployment list payload")?;
     Ok(payload.items)
+}
+
+async fn fetch_deployment_logs(
+    config: &TuiConfig,
+    app_id: Uuid,
+    deployment_id: Uuid,
+) -> Result<DeploymentLogsResponse> {
+    let (status, body) = send_request(
+        config,
+        "GET",
+        &format!("/api/v1/apps/{app_id}/deployments/{deployment_id}/logs"),
+        None,
+    )
+    .await?;
+    if status != 200 {
+        anyhow::bail!("deployment logs request failed with status {status}");
+    }
+    serde_json::from_str(&body).context("invalid deployment logs payload")
+}
+
+async fn fetch_effective_config(
+    config: &TuiConfig,
+    app_id: Uuid,
+) -> Result<EffectiveAppConfigResponse> {
+    let (status, body) = send_request(
+        config,
+        "GET",
+        &format!("/api/v1/apps/{app_id}/config"),
+        None,
+    )
+    .await?;
+    if status != 200 {
+        anyhow::bail!("effective config request failed with status {status}");
+    }
+    serde_json::from_str(&body).context("invalid effective config payload")
+}
+
+async fn import_app(
+    config: &TuiConfig,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    clone_url: Option<String>,
+) -> Result<ImportAppResponse> {
+    let payload = serde_json::to_string(&ImportAppRequest {
+        repository: RepositoryRef {
+            provider: "github".to_string(),
+            owner: owner.to_string(),
+            name: repo.to_string(),
+            clone_url,
+            default_branch: Some(branch.to_string()),
+        },
+        source: Some(SourceRef {
+            branch: Some(branch.to_string()),
+            commit_sha: None,
+        }),
+        build_mode: Some("auto".to_string()),
+        runtime: None,
+        dependency_profile: None,
+    })
+    .context("failed to serialize import payload")?;
+    let (status, body) = send_request(config, "POST", "/api/v1/apps/import", Some(payload)).await?;
+    if status != 201 {
+        anyhow::bail!("import failed with status {status}: {body}");
+    }
+    serde_json::from_str(&body).context("invalid import response payload")
 }
 
 async fn trigger_deploy(

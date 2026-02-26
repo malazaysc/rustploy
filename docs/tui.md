@@ -17,13 +17,16 @@ Rustploy should provide a first-party terminal interface for operators working d
 ## Core screens (v0.1)
 
 - Command-driven app list and deployment history views.
+- Repository import command for GitHub-based app onboarding.
+- Effective config view (manifest + detected values).
 - Deployment trigger and rollback actions.
 - API connectivity and auth checks through token-backed requests.
 
 ## Interaction model
 
 - Keyboard-only command loop for SSH sessions.
-- Quick commands for `apps`, `deployments`, `deploy`, and `rollback`.
+- Quick commands for `apps`, `import`, `config`, `deployments`, `deploy`, and `rollback`.
+- Deployment log access with `logs <app_index> [deployment_index]`.
 - Scope-aware behavior (`read` token cannot deploy).
 
 ## Delivery model
