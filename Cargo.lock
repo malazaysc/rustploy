@@ -602,6 +602,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustploy-tui"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "shared",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -932,17 +943,6 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
-]
-
-[[package]]
-name = "tui"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde_json",
- "shared",
- "tokio",
- "uuid",
 ]
 
 [[package]]

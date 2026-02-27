@@ -56,7 +56,7 @@ RUSTPLOY_AGENT_ONESHOT=true cargo run -p agent
 5. Run terminal UI:
 
 ```bash
-RUSTPLOY_API_TOKEN=<token-from-step-3> cargo run -p tui
+RUSTPLOY_API_TOKEN=<token-from-step-3> cargo run -p rustploy-tui
 ```
 
 6. Open the web dashboard:

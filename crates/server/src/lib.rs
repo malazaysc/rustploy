@@ -3506,7 +3506,7 @@ fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
     }
 
     let mut content = String::new();
-    content.push_str("{\n  auto_https on\n}\n\n");
+    content.push_str(&format!(":8080 {{\n  reverse_proxy {upstream}\n}}\n\n"));
     content.push_str(&format!(":80 {{\n  reverse_proxy {upstream}\n}}\n\n"));
     if domains.is_empty() {
         content.push_str(&format!("localhost {{\n  reverse_proxy {upstream}\n}}\n"));

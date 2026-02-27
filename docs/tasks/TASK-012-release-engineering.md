@@ -24,7 +24,7 @@ Establish repeatable open-source release process.
 ## Completion notes
 
 - Added tag-driven GitHub Actions release workflow.
-- Workflow builds server/agent/tui binaries and publishes checksums.
+- Workflow builds server/agent/rustploy-tui binaries and publishes checksums.
 - SBOM and provenance attestation artifacts are generated and attached to releases.
 
 ## Dependencies

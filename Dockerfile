@@ -11,7 +11,7 @@ RUN cargo build --release -p ${APP_BIN}
 
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
 
 ARG APP_BIN=server

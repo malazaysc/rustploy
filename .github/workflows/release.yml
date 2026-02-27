@@ -23,11 +23,11 @@ jobs:
         run: |
           cargo build --release -p server
           cargo build --release -p agent
-          cargo build --release -p tui
+          cargo build --release -p rustploy-tui
           mkdir -p dist
           cp target/release/server dist/rustploy-server
           cp target/release/agent dist/rustploy-agent
-          cp target/release/tui dist/rustploy-tui
+          cp target/release/rustploy-tui dist/rustploy-tui
 
       - name: Generate checksums
         run: |
