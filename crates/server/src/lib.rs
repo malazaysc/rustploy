@@ -2,9 +2,11 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
+    process::{Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -2319,6 +2321,11 @@ impl Database {
             .into_iter()
             .map(|record| (record.key, record.value))
             .collect::<HashMap<_, _>>();
+        let mut log_redactions = app_env_vars.values().cloned().collect::<Vec<_>>();
+        log_redactions.push(clone_url.clone());
+        if let Some(credentials) = credentials_fragment_from_url(&clone_url) {
+            log_redactions.push(credentials);
+        }
 
         self.append_deployment_log(
             deployment_id,
@@ -2354,11 +2361,14 @@ impl Database {
             } else {
                 compose_file_path.as_path()
             };
-            if let Err(error) = run_compose_command(
+            if let Err(error) = run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[down_file],
                 &["down", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             ) {
                 self.append_deployment_log(
                     deployment_id,
@@ -2378,14 +2388,27 @@ impl Database {
         fs::create_dir_all(&checkout_path)
             .with_context(|| format!("failed creating checkout dir {}", checkout_path.display()))?;
 
-        clone_repository_for_deploy(&clone_url, &branch, &checkout_path)?;
+        clone_repository_for_deploy_with_live_logs(
+            &clone_url,
+            &branch,
+            &checkout_path,
+            self,
+            deployment_id,
+            &log_redactions,
+        )?;
         self.append_deployment_log(
             deployment_id,
             &format!("cloned {}@{}", config.repository.name, branch),
             now_unix_ms,
         )?;
         if let Some(commit) = resolved_commit.as_deref() {
-            checkout_commit_for_deploy(&checkout_path, commit)?;
+            checkout_commit_for_deploy_with_live_logs(
+                &checkout_path,
+                commit,
+                self,
+                deployment_id,
+                &log_redactions,
+            )?;
             self.append_deployment_log(
                 deployment_id,
                 &format!("checked out commit {commit}"),
@@ -2421,24 +2444,33 @@ impl Database {
         )?;
 
         if force_rebuild {
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["build", "--no-cache"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["up", "-d", "--force-recreate", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
         } else {
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["up", "-d", "--build", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
         }
         let mapped_port = resolve_compose_service_port(
@@ -5161,8 +5193,9 @@ async fn stream_app_logs(
     }
 
     let state_for_stream = state.clone();
-    let stream =
-        IntervalStream::new(tokio::time::interval(Duration::from_secs(2))).map(move |_| {
+    let mut last_sent: Option<String> = None;
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(750))).filter_map(
+        move |_| {
             let logs = state_for_stream
                 .db
                 .latest_deployment_id_for_app(app_id)
@@ -5175,10 +5208,15 @@ async fn stream_app_logs(
                         .ok()
                 })
                 .unwrap_or_default();
-            Ok(Event::default()
+            if last_sent.as_ref().is_some_and(|value| value == &logs) {
+                return None;
+            }
+            last_sent = Some(logs.clone());
+            Some(Ok(Event::default()
                 .event("logs")
-                .data(logs.replace('\n', "\\n")))
-        });
+                .data(logs.replace('\n', "\\n"))))
+        },
+    );
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
 }
 
@@ -5718,69 +5756,208 @@ fn clone_repository(clone_url: &str, branch: &str, target_path: &Path) -> Result
     }
 }
 
-fn clone_repository_for_deploy(clone_url: &str, branch: &str, target_path: &Path) -> Result<()> {
-    let output = Command::new("git")
+#[derive(Clone, Copy, Debug)]
+enum CommandOutputChannel {
+    Stdout,
+    Stderr,
+}
+
+fn run_command_with_live_output(
+    mut command: Command,
+    description: &str,
+    mut on_line: impl FnMut(CommandOutputChannel, &str),
+) -> Result<String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed starting command: {description}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed attaching command stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed attaching command stderr")?;
+    let (sender, receiver) = mpsc::channel::<(CommandOutputChannel, String)>();
+    let stdout_reader =
+        spawn_command_output_reader(stdout, CommandOutputChannel::Stdout, sender.clone());
+    let stderr_reader =
+        spawn_command_output_reader(stderr, CommandOutputChannel::Stderr, sender.clone());
+    drop(sender);
+
+    let mut rendered_lines = Vec::new();
+    for (channel, line) in receiver {
+        on_line(channel, &line);
+        match channel {
+            CommandOutputChannel::Stdout => rendered_lines.push(line),
+            CommandOutputChannel::Stderr => rendered_lines.push(format!("stderr: {line}")),
+        }
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed waiting for command: {description}"))?;
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let rendered = rendered_lines.join("\n");
+    if status.success() {
+        Ok(rendered)
+    } else if rendered.is_empty() {
+        anyhow::bail!("command failed ({description}) with no output");
+    } else {
+        anyhow::bail!("command failed ({description}): {rendered}");
+    }
+}
+
+fn spawn_command_output_reader<R: Read + Send + 'static>(
+    reader: R,
+    channel: CommandOutputChannel,
+    sender: mpsc::Sender<(CommandOutputChannel, String)>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let value = line.trim_end_matches(['\n', '\r']).to_string();
+                    if sender.send((channel, value)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send((channel, format!("<failed reading command output: {error}>")));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn append_streamed_command_log(
+    db: &Database,
+    deployment_id: Uuid,
+    source: &str,
+    line: &str,
+    redactions: &[String],
+) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let sanitized = redact_log_line(line, redactions);
+    let message = format!("{source}: {sanitized}");
+    if let Err(error) = db.append_deployment_log(deployment_id, &message, now_unix_ms()) {
+        warn!(%error, "failed persisting streamed deployment log line");
+    }
+}
+
+fn redact_log_line(line: &str, redactions: &[String]) -> String {
+    let mut sanitized = line.to_string();
+    for secret in redactions {
+        let value = secret.trim();
+        if value.len() < 4 {
+            continue;
+        }
+        if sanitized.contains(value) {
+            sanitized = sanitized.replace(value, "***");
+        }
+    }
+    sanitized
+}
+
+fn credentials_fragment_from_url(url: &str) -> Option<String> {
+    let (_, remainder) = url.split_once("://")?;
+    let (authority, _) = remainder.split_once('@')?;
+    if authority.is_empty() || authority.contains('/') {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+fn clone_repository_for_deploy_with_live_logs(
+    clone_url: &str,
+    branch: &str,
+    target_path: &Path,
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<()> {
+    let mut command = Command::new("git");
+    command
         .arg("clone")
         .arg("--depth")
         .arg("1")
         .arg("--branch")
         .arg(branch)
         .arg(clone_url)
-        .arg(target_path)
-        .output()
-        .with_context(|| format!("failed running git clone for {clone_url}@{branch}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    anyhow::bail!(
-        "git clone failed for {clone_url}@{branch}: {} {}",
-        stdout,
-        stderr
-    );
+        .arg(target_path);
+    run_command_with_live_output(
+        command,
+        &format!("git clone {clone_url}@{branch}"),
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
+    Ok(())
 }
 
-fn checkout_commit_for_deploy(repo_path: &Path, commit_sha: &str) -> Result<()> {
-    let fetch = Command::new("git")
+fn checkout_commit_for_deploy_with_live_logs(
+    repo_path: &Path,
+    commit_sha: &str,
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<()> {
+    let mut fetch = Command::new("git");
+    fetch
         .arg("-C")
         .arg(repo_path)
         .arg("fetch")
         .arg("--depth")
         .arg("1")
         .arg("origin")
-        .arg(commit_sha)
-        .output()
-        .with_context(|| format!("failed fetching commit {commit_sha}"))?;
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&fetch.stdout).trim().to_string();
-        anyhow::bail!(
-            "git fetch failed for commit {commit_sha}: {} {}",
-            stdout,
-            stderr
-        );
-    }
+        .arg(commit_sha);
+    run_command_with_live_output(
+        fetch,
+        &format!("git fetch {commit_sha}"),
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
 
-    let checkout = Command::new("git")
+    let mut checkout = Command::new("git");
+    checkout
         .arg("-C")
         .arg(repo_path)
         .arg("checkout")
         .arg("--detach")
-        .arg(commit_sha)
-        .output()
-        .with_context(|| format!("failed checking out commit {commit_sha}"))?;
-    if checkout.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&checkout.stdout).trim().to_string();
-        anyhow::bail!(
-            "git checkout failed for commit {commit_sha}: {} {}",
-            stdout,
-            stderr
-        );
-    }
+        .arg(commit_sha);
+    run_command_with_live_output(
+        checkout,
+        &format!("git checkout {commit_sha}"),
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
+    Ok(())
 }
 
 fn runtime_root_path() -> PathBuf {
@@ -6020,6 +6197,44 @@ fn run_compose_command(
             stderr
         );
     }
+}
+
+fn run_compose_command_with_live_logs(
+    working_dir: &Path,
+    project_name: &str,
+    files: &[&Path],
+    args: &[&str],
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<String> {
+    let base = compose_base_command()?;
+    let mut command = Command::new(&base[0]);
+    if base.len() > 1 {
+        command.arg(&base[1]);
+    }
+    command
+        .current_dir(working_dir)
+        .arg("--project-name")
+        .arg(project_name);
+    for file in files {
+        command.arg("-f").arg(file);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+
+    run_command_with_live_output(
+        command,
+        &format!("compose {}", args.join(" ")),
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "compose",
+                CommandOutputChannel::Stderr => "compose/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )
 }
 
 fn resolve_compose_service_port(

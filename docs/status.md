@@ -8,6 +8,7 @@
 - GitHub repository mapping + webhook-triggered deployments with signature verification.
 - Compose-first runtime deploys:
   - real clone/build/up/health checks
+  - streamed compose/git command output into deployment logs (live in dashboard/TUI via SSE polling)
   - app runtime routing via Caddy
   - per-app environment variable injection at deploy time
   - manual `force_rebuild` deploy option (no-cache rebuild)

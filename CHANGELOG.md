@@ -39,3 +39,4 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App environment variable management (`GET/PUT/DELETE /api/v1/apps/:id/env`) with dashboard controls and runtime injection into app service environment.
 - Manual deployment resync/rebuild support via `force_rebuild` deployment option and dashboard "Resync & Rebuild" action.
 - Documentation governance baseline: root `AGENTS.md`, `docs/status.md`, PR template checklist, and CI `docs-guard` enforcement.
+- Live deployment log piping for compose/git commands, persisted line-by-line and visible through `/api/v1/apps/{app_id}/logs/stream`.
