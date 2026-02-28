@@ -43,5 +43,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `d326974`
-- Note: dashboard reflects `queued/building` deployment state immediately; SSE log stream emits structured JSON payloads, escapes carriage returns, and clears stale output on deployment switches.
+- Commit base: `b8d37c5`
+- Note: dashboard reflects `queued/building` deployment state immediately; SSE log stream emits structured JSON payloads, escapes carriage returns, clears stale output on deployment switches, and uses an indexed cursor query in SQLite.

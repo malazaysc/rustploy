@@ -66,6 +66,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.
 - Streamed runtime command logs are UTF-8 tolerant (lossy decode) and apply redaction before surfaced failure text.
 - Stream payload encoding escapes both `\\n` and `\\r` via JSON encoding so SSE transport remains valid for multiline runtime logs.
+- Incremental log stream cursor reads are backed by a composite SQLite index on deployment log rows for lower polling cost under concurrent viewers.
 - Command execution failures now return concise errors while full command output remains in deployment logs.
 - Return detected package manager and build profile in import responses.
 - Return structured validation errors for invalid `rustploy.yaml` manifests.

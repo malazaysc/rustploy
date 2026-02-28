@@ -2829,6 +2829,10 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0008")?;
     conn.execute_batch(include_str!("../migrations/0009_app_env_vars.sql"))
         .context("failed running sqlite migration 0009")?;
+    conn.execute_batch(include_str!(
+        "../migrations/0010_deployment_logs_cursor_index.sql"
+    ))
+    .context("failed running sqlite migration 0010")?;
     ensure_deployments_metadata_columns(conn)?;
     ensure_import_config_columns(conn)?;
 

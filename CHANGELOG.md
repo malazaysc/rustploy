@@ -11,6 +11,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Improved live deployment log robustness and error handling, including tolerant decoding for non-UTF8 runtime output.
 - Improved live log stream efficiency by switching SSE updates to incremental log chunks per deployment.
+- Added a dedicated SQLite index for incremental deployment log stream queries to reduce polling overhead at scale.
 - Dashboard deployment UX now shows optimistic `queued/building` status immediately after deploy actions and keeps status pills updated during rollout.
 - Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
 
