@@ -11,6 +11,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Hardened live deploy log runner to sanitize failure-path command errors and tolerate non-UTF8 command output.
 - Tightened live log redaction by applying longest-first secret masking and concise failure text (avoids persisting full command output in `last_error`).
+- Dashboard deployment UX now shows optimistic `queued/building` status immediately after deploy actions and keeps status pills updated during rollout.
+- SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
 
 ### Added
 

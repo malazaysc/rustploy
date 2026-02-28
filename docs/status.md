@@ -43,5 +43,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `221f6d8`
-- Note: live log hardening includes longest-first overlapping secret redaction and concise command failure text.
+- Commit base: `54e8b51`
+- Note: dashboard now reflects `queued/building` deployment state immediately; SSE log stream escaping includes carriage returns to avoid stream panics.

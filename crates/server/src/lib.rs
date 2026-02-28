@@ -3704,6 +3704,27 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       background: rgba(0, 245, 212, 0.12);
       color: #8cfcee;
     }
+    .pill-status.status-queued,
+    .pill-status.status-deploying,
+    .pill-status.status-retrying {
+      border-color: #8a6b1a;
+      background: rgba(250, 198, 26, 0.2);
+      color: #ffd67a;
+    }
+    .pill-status.status-healthy {
+      border-color: #26706f;
+      background: rgba(0, 245, 212, 0.12);
+      color: #8cfcee;
+    }
+    .pill-status.status-failed {
+      border-color: #7a2634;
+      background: rgba(255, 88, 120, 0.15);
+      color: #ff8ca4;
+    }
+    .item-row.in-progress {
+      border-color: #8a6b1a;
+      background: rgba(250, 198, 26, 0.08);
+    }
     pre {
       margin: 0;
       min-height: 220px;
@@ -3828,6 +3849,52 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let logsStream = null;
     let statusTimeout = null;
     const selectedState = { domains: [], envVars: [], latestDeployment: null, config: null };
+    const pendingDeploymentsByApp = new Map();
+    const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+
+    function normalizeDeploymentStatus(value) {
+      return (value || 'queued').toString().toLowerCase();
+    }
+
+    function isActiveDeploymentStatus(value) {
+      return ACTIVE_DEPLOYMENT_STATUSES.has(normalizeDeploymentStatus(value));
+    }
+
+    function deploymentPillClass(value) {
+      const status = normalizeDeploymentStatus(value);
+      if (status === 'healthy') return 'status-healthy';
+      if (status === 'failed') return 'status-failed';
+      if (status === 'deploying') return 'status-deploying';
+      if (status === 'retrying') return 'status-retrying';
+      return 'status-queued';
+    }
+
+    function markPendingDeployment(appId, deploymentId, status, sourceRef) {
+      if (!appId || !deploymentId) return;
+      const now = Date.now();
+      pendingDeploymentsByApp.set(appId, {
+        id: deploymentId,
+        app_id: appId,
+        status: normalizeDeploymentStatus(status),
+        source_ref: sourceRef || 'manual',
+        image_ref: null,
+        commit_sha: null,
+        last_error: null,
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now
+      });
+    }
+
+    function mergePendingDeployment(appId, items) {
+      const pending = pendingDeploymentsByApp.get(appId);
+      if (!pending) return items;
+      const hasPending = items.some((item) => item.id === pending.id);
+      if (hasPending) {
+        pendingDeploymentsByApp.delete(appId);
+        return items;
+      }
+      return [pending, ...items];
+    }
 
     function setStatus(message, level = 'ok') {
       const el = document.getElementById('status');
@@ -3908,9 +3975,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       deploymentRow.className = 'item-row';
       if (selectedState.latestDeployment) {
         const sourceRef = selectedState.latestDeployment.source_ref || 'manual';
+        const status = normalizeDeploymentStatus(selectedState.latestDeployment.status);
+        const building = isActiveDeploymentStatus(status);
+        const statusLabel = building ? `${status} (building)` : status;
+        deploymentRow.className = `item-row ${building ? 'in-progress' : ''}`.trim();
         deploymentRow.innerHTML = `
           <div class="item-main">
-            <strong><span class="pill-status">${selectedState.latestDeployment.status}</span></strong>
+            <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
             <code>${sourceRef}</code>
           </div>
         `;
@@ -3978,8 +4049,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }
       }
 
-      note.textContent =
-        'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
+      if (selectedState.latestDeployment && isActiveDeploymentStatus(selectedState.latestDeployment.status)) {
+        note.textContent =
+          'Build in progress. Status auto-refreshes every few seconds; logs stream live below.';
+      } else {
+        note.textContent =
+          'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
+      }
     }
 
     async function api(path, opts = {}) {
@@ -4130,6 +4206,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
       logsStream.addEventListener('logs', (event) => {
         document.getElementById('logs').textContent = (event.data || '')
+          .replaceAll('\\r', '\r')
           .replaceAll('\\n', '\n') || '(no logs)';
       });
       logsStream.onerror = () => {};
@@ -4139,12 +4216,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (!selectedApp) return;
       const res = await api(`/api/v1/apps/${selectedApp}/deployments`);
       const data = await res.json();
-      selectedState.latestDeployment = data.items[0] || null;
+      const items = mergePendingDeployment(selectedApp, data.items || []);
+      selectedState.latestDeployment = items[0] || null;
       renderRoutes();
       const el = document.getElementById('deployments');
       el.innerHTML = '';
 
-      if (data.items.length === 0) {
+      if (items.length === 0) {
         const empty = document.createElement('li');
         empty.className = 'hint';
         empty.textContent = 'No deployments yet.';
@@ -4152,13 +4230,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         return;
       }
 
-      for (const d of data.items) {
+      for (const d of items) {
         const li = document.createElement('li');
         const sourceRef = d.source_ref || 'manual';
-        li.className = 'item-row';
+        const status = normalizeDeploymentStatus(d.status);
+        const building = isActiveDeploymentStatus(status);
+        const statusLabel = building ? `${status} (building)` : status;
+        li.className = `item-row ${building ? 'in-progress' : ''}`.trim();
         li.innerHTML = `
           <div class="item-main">
-            <strong><span class="pill-status">${d.status}</span></strong>
+            <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
             <code>${sourceRef}</code>
           </div>
           <div class="item-actions">
@@ -4326,13 +4407,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function deploy(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/deployments`, {
+        const res = await api(`/api/v1/apps/${appId}/deployments`, {
           method:'POST',
           headers:{'content-type':'application/json'},
           body:'{}'
         });
-        setStatus('Deployment queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'manual');
+        setStatus('Deployment queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Deploy failed: ${error.message}`, 'err');
       }
@@ -4340,13 +4423,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function resyncRebuild(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/deployments`, {
+        const res = await api(`/api/v1/apps/${appId}/deployments`, {
           method:'POST',
           headers:{'content-type':'application/json'},
           body:JSON.stringify({ force_rebuild: true })
         });
-        setStatus('Resync and rebuild queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'manual (rebuild)');
+        setStatus('Resync and rebuild queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Resync/rebuild failed: ${error.message}`, 'err');
       }
@@ -4354,9 +4439,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function rollback(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
-        setStatus('Rollback queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const res = await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'rollback');
+        setStatus('Rollback queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Rollback failed: ${error.message}`, 'err');
       }
@@ -5174,6 +5261,10 @@ async fn list_domains(
     Ok(Json(DomainListResponse { items }))
 }
 
+fn encode_sse_data(value: &str) -> String {
+    value.replace('\r', "\\r").replace('\n', "\\n")
+}
+
 async fn stream_app_logs(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -5214,7 +5305,7 @@ async fn stream_app_logs(
             last_sent = Some(logs.clone());
             Some(Ok(Event::default()
                 .event("logs")
-                .data(logs.replace('\n', "\\n"))))
+                .data(encode_sse_data(&logs))))
         },
     );
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
