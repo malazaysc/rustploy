@@ -5810,7 +5810,9 @@ fn run_command_with_live_output(
     } else if rendered.is_empty() {
         anyhow::bail!("command failed ({safe_description}) with no output");
     } else {
-        anyhow::bail!("command failed ({safe_description}): {rendered}");
+        anyhow::bail!(
+            "command failed ({safe_description}); command output was streamed to deployment logs"
+        );
     }
 }
 
@@ -5863,13 +5865,17 @@ fn append_streamed_command_log(
 
 fn redact_log_line(line: &str, redactions: &[String]) -> String {
     let mut sanitized = line.to_string();
-    for secret in redactions {
-        let value = secret.trim();
-        if value.len() < 4 {
-            continue;
-        }
-        if sanitized.contains(value) {
-            sanitized = sanitized.replace(value, "***");
+    let mut candidates = redactions
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() >= 4)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    candidates.dedup();
+
+    for value in candidates {
+        if sanitized.contains(&value) {
+            sanitized = sanitized.replace(&value, "***");
         }
     }
     sanitized

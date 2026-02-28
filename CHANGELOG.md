@@ -10,6 +10,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Hardened live deploy log runner to sanitize failure-path command errors and tolerate non-UTF8 command output.
+- Tightened live log redaction by applying longest-first secret masking and concise failure text (avoids persisting full command output in `last_error`).
 
 ### Added
 

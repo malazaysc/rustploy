@@ -43,5 +43,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `f8f75c1`
-- Note: live log streaming hardening now redacts failure-path command text and safely handles non-UTF8 process output.
+- Commit base: `221f6d8`
+- Note: live log hardening includes longest-first overlapping secret redaction and concise command failure text.
