@@ -5765,12 +5765,14 @@ enum CommandOutputChannel {
 fn run_command_with_live_output(
     mut command: Command,
     description: &str,
+    redactions: &[String],
     mut on_line: impl FnMut(CommandOutputChannel, &str),
 ) -> Result<String> {
+    let safe_description = redact_log_line(description, redactions);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
         .spawn()
-        .with_context(|| format!("failed starting command: {description}"))?;
+        .with_context(|| format!("failed starting command: {safe_description}"))?;
 
     let stdout = child
         .stdout
@@ -5798,17 +5800,17 @@ fn run_command_with_live_output(
 
     let status = child
         .wait()
-        .with_context(|| format!("failed waiting for command: {description}"))?;
+        .with_context(|| format!("failed waiting for command: {safe_description}"))?;
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
 
-    let rendered = rendered_lines.join("\n");
+    let rendered = redact_log_line(&rendered_lines.join("\n"), redactions);
     if status.success() {
         Ok(rendered)
     } else if rendered.is_empty() {
-        anyhow::bail!("command failed ({description}) with no output");
+        anyhow::bail!("command failed ({safe_description}) with no output");
     } else {
-        anyhow::bail!("command failed ({description}): {rendered}");
+        anyhow::bail!("command failed ({safe_description}): {rendered}");
     }
 }
 
@@ -5819,13 +5821,15 @@ fn spawn_command_output_reader<R: Read + Send + 'static>(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+        let mut buf = Vec::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line) {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {
-                    let value = line.trim_end_matches(['\n', '\r']).to_string();
+                    let value = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
                     if sender.send((channel, value)).is_err() {
                         break;
                     }
@@ -5900,6 +5904,7 @@ fn clone_repository_for_deploy_with_live_logs(
     run_command_with_live_output(
         command,
         &format!("git clone {clone_url}@{branch}"),
+        redactions,
         |channel, line| {
             let source = match channel {
                 CommandOutputChannel::Stdout => "git",
@@ -5930,6 +5935,7 @@ fn checkout_commit_for_deploy_with_live_logs(
     run_command_with_live_output(
         fetch,
         &format!("git fetch {commit_sha}"),
+        redactions,
         |channel, line| {
             let source = match channel {
                 CommandOutputChannel::Stdout => "git",
@@ -5949,6 +5955,7 @@ fn checkout_commit_for_deploy_with_live_logs(
     run_command_with_live_output(
         checkout,
         &format!("git checkout {commit_sha}"),
+        redactions,
         |channel, line| {
             let source = match channel {
                 CommandOutputChannel::Stdout => "git",
@@ -6227,6 +6234,7 @@ fn run_compose_command_with_live_logs(
     run_command_with_live_output(
         command,
         &format!("compose {}", args.join(" ")),
+        redactions,
         |channel, line| {
             let source = match channel {
                 CommandOutputChannel::Stdout => "compose",
