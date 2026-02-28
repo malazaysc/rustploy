@@ -8,7 +8,7 @@
 - GitHub repository mapping + webhook-triggered deployments with signature verification.
 - Compose-first runtime deploys:
   - real clone/build/up/health checks
-  - streamed compose/git command output into deployment logs (live in dashboard/TUI via SSE polling)
+  - streamed compose/git command output into deployment logs (live in dashboard/TUI via SSE streaming)
   - app runtime routing via Caddy
   - per-app environment variable injection at deploy time
   - manual `force_rebuild` deploy option (no-cache rebuild)
@@ -44,4 +44,4 @@
 
 - Date: 2026-02-28
 - Commit base: `54e8b51`
-- Note: dashboard now reflects `queued/building` deployment state immediately; SSE log stream escaping includes carriage returns to avoid stream panics.
+- Note: dashboard now reflects `queued/building` deployment state immediately; SSE log stream now emits structured JSON payloads and escapes carriage returns to avoid stream panics.

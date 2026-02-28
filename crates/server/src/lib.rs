@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     fs,
     io::{BufRead, BufReader, Read},
@@ -189,6 +189,12 @@ struct AppEnvVarRecord {
     key: String,
     value: String,
     updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DeploymentLogRow {
+    id: i64,
+    message: String,
 }
 
 #[derive(Debug)]
@@ -2723,26 +2729,69 @@ impl Database {
     }
 
     fn deployment_log_output(&self, deployment_id: Uuid) -> Result<String> {
+        let rows = self.deployment_log_rows_since(deployment_id, None)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.message)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn deployment_log_rows_since(
+        &self,
+        deployment_id: Uuid,
+        last_log_id: Option<i64>,
+    ) -> Result<Vec<DeploymentLogRow>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT message
-                 FROM deployment_logs
-                 WHERE deployment_id = ?1
-                 ORDER BY created_at_unix_ms ASC, id ASC",
-            )
-            .context("failed preparing deployment log query")?;
-        let mut rows = stmt
-            .query(params![deployment_id.to_string()])
-            .context("failed querying deployment logs")?;
-        let mut lines = Vec::new();
-        while let Some(row) = rows.next().context("failed iterating deployment logs")? {
-            let message: String = row
-                .get(0)
-                .context("failed reading deployment log message")?;
-            lines.push(message);
+        let mut entries = Vec::new();
+
+        if let Some(after_id) = last_log_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, message
+                     FROM deployment_logs
+                     WHERE deployment_id = ?1
+                       AND id > ?2
+                     ORDER BY id ASC",
+                )
+                .context("failed preparing incremental deployment log query")?;
+            let mut rows = stmt
+                .query(params![deployment_id.to_string(), after_id])
+                .context("failed querying incremental deployment logs")?;
+            while let Some(row) = rows
+                .next()
+                .context("failed iterating incremental deployment logs")?
+            {
+                entries.push(DeploymentLogRow {
+                    id: row.get(0).context("failed reading deployment log id")?,
+                    message: row
+                        .get(1)
+                        .context("failed reading deployment log message")?,
+                });
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, message
+                     FROM deployment_logs
+                     WHERE deployment_id = ?1
+                     ORDER BY id ASC",
+                )
+                .context("failed preparing deployment log query")?;
+            let mut rows = stmt
+                .query(params![deployment_id.to_string()])
+                .context("failed querying deployment logs")?;
+            while let Some(row) = rows.next().context("failed iterating deployment logs")? {
+                entries.push(DeploymentLogRow {
+                    id: row.get(0).context("failed reading deployment log id")?,
+                    message: row
+                        .get(1)
+                        .context("failed reading deployment log message")?,
+                });
+            }
         }
-        Ok(lines.join("\n"))
+
+        Ok(entries)
     }
 
     #[cfg(test)]
@@ -3846,6 +3895,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <script>
     let selectedApp = null;
     let selectedAppName = null;
+    let selectedLogsDeploymentId = null;
     let logsStream = null;
     let statusTimeout = null;
     const selectedState = { domains: [], envVars: [], latestDeployment: null, config: null };
@@ -4183,6 +4233,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     async function selectApp(appId, appName = null) {
       selectedApp = appId;
       selectedAppName = appName || selectedAppName;
+      selectedLogsDeploymentId = null;
       selectedState.domains = [];
       selectedState.envVars = [];
       selectedState.latestDeployment = null;
@@ -4203,11 +4254,42 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         logsStream = null;
       }
       if (!selectedApp) return;
+      selectedLogsDeploymentId = null;
+      document.getElementById('logs').textContent = '(waiting for logs...)';
       logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
       logsStream.addEventListener('logs', (event) => {
-        document.getElementById('logs').textContent = (event.data || '')
-          .replaceAll('\\r', '\r')
-          .replaceAll('\\n', '\n') || '(no logs)';
+        let payload = null;
+        try {
+          payload = JSON.parse(event.data || '{}');
+        } catch (_) {
+          return;
+        }
+
+        const deploymentId = payload && payload.deployment_id ? payload.deployment_id : null;
+        const logsChunk = payload && typeof payload.logs === 'string' ? payload.logs : '';
+        const reset = payload && payload.reset === true;
+        const logsEl = document.getElementById('logs');
+
+        if (!deploymentId && !logsChunk) {
+          selectedLogsDeploymentId = null;
+          logsEl.textContent = '(no logs)';
+          return;
+        }
+
+        if (reset || deploymentId !== selectedLogsDeploymentId) {
+          selectedLogsDeploymentId = deploymentId;
+          logsEl.textContent = logsChunk || '(no logs)';
+          return;
+        }
+
+        if (!logsChunk) {
+          return;
+        }
+
+        const current = logsEl.textContent === '(no logs)' || logsEl.textContent === '(waiting for logs...)'
+          ? ''
+          : logsEl.textContent;
+        logsEl.textContent = current ? `${current}\n${logsChunk}` : logsChunk;
       });
       logsStream.onerror = () => {};
     }
@@ -5261,8 +5343,24 @@ async fn list_domains(
     Ok(Json(DomainListResponse { items }))
 }
 
-fn encode_sse_data(value: &str) -> String {
-    value.replace('\r', "\\r").replace('\n', "\\n")
+#[derive(Debug, Serialize)]
+struct StreamLogsEventPayload {
+    deployment_id: Option<Uuid>,
+    logs: String,
+    reset: bool,
+}
+
+fn encode_stream_logs_event_payload(
+    deployment_id: Option<Uuid>,
+    logs: &str,
+    reset: bool,
+) -> Result<String> {
+    serde_json::to_string(&StreamLogsEventPayload {
+        deployment_id,
+        logs: logs.to_string(),
+        reset,
+    })
+    .context("failed encoding logs stream payload")
 }
 
 async fn stream_app_logs(
@@ -5284,28 +5382,76 @@ async fn stream_app_logs(
     }
 
     let state_for_stream = state.clone();
-    let mut last_sent: Option<String> = None;
+    let mut active_deployment_id: Option<Uuid> = None;
+    let mut last_log_id: Option<i64> = None;
+    let mut sent_empty = false;
     let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(750))).filter_map(
         move |_| {
-            let logs = state_for_stream
+            let latest_deployment_id = match state_for_stream
                 .db
                 .latest_deployment_id_for_app(app_id)
-                .ok()
-                .flatten()
-                .and_then(|deployment_id| {
-                    state_for_stream
-                        .db
-                        .deployment_log_output(deployment_id)
-                        .ok()
-                })
-                .unwrap_or_default();
-            if last_sent.as_ref().is_some_and(|value| value == &logs) {
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, %app_id, "failed fetching latest deployment for log stream");
+                    return None;
+                }
+            };
+
+            if latest_deployment_id != active_deployment_id {
+                active_deployment_id = latest_deployment_id;
+                last_log_id = None;
+                sent_empty = false;
+            }
+
+            let Some(deployment_id) = active_deployment_id else {
+                if sent_empty {
+                    return None;
+                }
+                sent_empty = true;
+                let payload = match encode_stream_logs_event_payload(None, "", true) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        warn!(%error, %app_id, "failed encoding empty logs stream payload");
+                        return None;
+                    }
+                };
+                return Some(Ok(Event::default().event("logs").data(payload)));
+            };
+
+            let rows = match state_for_stream
+                .db
+                .deployment_log_rows_since(deployment_id, last_log_id)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, %app_id, %deployment_id, "failed loading incremental deployment logs");
+                    return None;
+                }
+            };
+
+            if rows.is_empty() {
                 return None;
             }
-            last_sent = Some(logs.clone());
-            Some(Ok(Event::default()
-                .event("logs")
-                .data(encode_sse_data(&logs))))
+
+            sent_empty = false;
+            let reset = last_log_id.is_none();
+            last_log_id = rows.last().map(|row| row.id);
+            let logs = rows
+                .into_iter()
+                .map(|row| row.message)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let payload =
+                match encode_stream_logs_event_payload(Some(deployment_id), &logs, reset) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    warn!(%error, %app_id, %deployment_id, "failed encoding logs stream payload");
+                    return None;
+                }
+            };
+
+            Some(Ok(Event::default().event("logs").data(payload)))
         },
     );
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
@@ -5873,20 +6019,27 @@ fn run_command_with_live_output(
         .stderr
         .take()
         .context("failed attaching command stderr")?;
-    let (sender, receiver) = mpsc::channel::<(CommandOutputChannel, String)>();
+    const MAX_IN_FLIGHT_LINES: usize = 1_024;
+    const MAX_RETAINED_LINES: usize = 512;
+    let (sender, receiver) =
+        mpsc::sync_channel::<(CommandOutputChannel, String)>(MAX_IN_FLIGHT_LINES);
     let stdout_reader =
         spawn_command_output_reader(stdout, CommandOutputChannel::Stdout, sender.clone());
     let stderr_reader =
         spawn_command_output_reader(stderr, CommandOutputChannel::Stderr, sender.clone());
     drop(sender);
 
-    let mut rendered_lines = Vec::new();
+    let mut rendered_lines = VecDeque::with_capacity(MAX_RETAINED_LINES);
     for (channel, line) in receiver {
         on_line(channel, &line);
-        match channel {
-            CommandOutputChannel::Stdout => rendered_lines.push(line),
-            CommandOutputChannel::Stderr => rendered_lines.push(format!("stderr: {line}")),
+        if rendered_lines.len() == MAX_RETAINED_LINES {
+            rendered_lines.pop_front();
         }
+        let entry = match channel {
+            CommandOutputChannel::Stdout => line,
+            CommandOutputChannel::Stderr => format!("stderr: {line}"),
+        };
+        rendered_lines.push_back(entry);
     }
 
     let status = child
@@ -5895,22 +6048,31 @@ fn run_command_with_live_output(
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
 
-    let rendered = redact_log_line(&rendered_lines.join("\n"), redactions);
+    let rendered = redact_log_line(
+        &rendered_lines.into_iter().collect::<Vec<_>>().join("\n"),
+        redactions,
+    );
     if status.success() {
         Ok(rendered)
     } else if rendered.is_empty() {
-        anyhow::bail!("command failed ({safe_description}) with no output");
-    } else {
-        anyhow::bail!(
-            "command failed ({safe_description}); command output was streamed to deployment logs"
+        warn!(
+            command = %safe_description,
+            "command failed with no output; output was streamed to deployment logs"
         );
+        anyhow::bail!("command failed (redacted) with no output");
+    } else {
+        warn!(
+            command = %safe_description,
+            "command failed; output was streamed to deployment logs"
+        );
+        anyhow::bail!("command failed (redacted); command output was streamed to deployment logs");
     }
 }
 
 fn spawn_command_output_reader<R: Read + Send + 'static>(
     reader: R,
     channel: CommandOutputChannel,
-    sender: mpsc::Sender<(CommandOutputChannel, String)>,
+    sender: mpsc::SyncSender<(CommandOutputChannel, String)>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut reader = BufReader::new(reader);

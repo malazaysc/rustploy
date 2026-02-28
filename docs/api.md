@@ -62,9 +62,10 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Include curl examples in user docs.
 - Keep API compatibility stable across web and TUI client releases.
 - Track internal server refactors in docs even when no API contract fields change.
-- Stream endpoint pushes updated deployment log content whenever new lines arrive from compose/git runtime commands.
+- Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
+- Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.
 - Streamed runtime command logs are UTF-8 tolerant (lossy decode) and apply redaction before surfaced failure text.
-- Stream payload encoding escapes both `\\n` and `\\r` so SSE transport remains valid for multiline runtime logs.
+- Stream payload encoding escapes both `\\n` and `\\r` via JSON encoding so SSE transport remains valid for multiline runtime logs.
 - Command execution failures now return concise errors while full command output remains in deployment logs.
 - Return detected package manager and build profile in import responses.
 - Return structured validation errors for invalid `rustploy.yaml` manifests.
