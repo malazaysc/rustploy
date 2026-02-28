@@ -9,6 +9,17 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 ### Changed
 
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
+- Improved live deployment log robustness and error handling, including tolerant decoding for non-UTF8 runtime output.
+- Improved live log stream efficiency by switching SSE updates to incremental log chunks per deployment.
+- Added a dedicated SQLite index for incremental deployment log stream queries to reduce polling overhead at scale.
+- Dashboard deployment UX now shows optimistic `queued/building` status immediately after deploy actions and keeps status pills updated during rollout.
+- Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
+
+### Fixed
+
+- SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
+- Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
+- Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
 
 ### Added
 
@@ -39,3 +50,4 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App environment variable management (`GET/PUT/DELETE /api/v1/apps/:id/env`) with dashboard controls and runtime injection into app service environment.
 - Manual deployment resync/rebuild support via `force_rebuild` deployment option and dashboard "Resync & Rebuild" action.
 - Documentation governance baseline: root `AGENTS.md`, `docs/status.md`, PR template checklist, and CI `docs-guard` enforcement.
+- Live deployment log piping for compose/git commands, persisted line-by-line and visible through `/api/v1/apps/:id/logs/stream`.

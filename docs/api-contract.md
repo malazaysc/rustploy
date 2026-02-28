@@ -85,3 +85,20 @@ If `rustploy.yaml` is invalid, response is `400` with structured fields under:
 - `error.code` (e.g. `invalid_manifest`)
 - `error.message`
 - `error.details[]` (`field`, `message`)
+
+## SSE logs stream payload
+
+`GET /apps/{app_id}/logs/stream` emits `event: logs` events with JSON payloads:
+
+```json
+{
+  "deployment_id": "uuid-or-null",
+  "logs": "new log chunk text",
+  "reset": false
+}
+```
+
+- `deployment_id` changes when a newer deployment becomes the active stream source.
+- `logs` contains only newly appended lines for the active deployment (first event after connection/deployment change can include accumulated lines).
+- `reset` is `true` when clients should replace displayed content (initial snapshot/reconnect/deployment switch).
+- When a deployment switch has no log lines yet, the stream emits a single `reset: true` event with empty `logs` so clients can clear stale output.

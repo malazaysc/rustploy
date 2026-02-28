@@ -1,10 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     convert::Infallible,
     fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex},
+    process::{Command, Stdio},
+    sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -187,6 +189,12 @@ struct AppEnvVarRecord {
     key: String,
     value: String,
     updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct DeploymentLogRow {
+    id: i64,
+    message: String,
 }
 
 #[derive(Debug)]
@@ -2319,6 +2327,11 @@ impl Database {
             .into_iter()
             .map(|record| (record.key, record.value))
             .collect::<HashMap<_, _>>();
+        let mut log_redactions = app_env_vars.values().cloned().collect::<Vec<_>>();
+        log_redactions.push(clone_url.clone());
+        if let Some(credentials) = credentials_fragment_from_url(&clone_url) {
+            log_redactions.push(credentials);
+        }
 
         self.append_deployment_log(
             deployment_id,
@@ -2354,11 +2367,14 @@ impl Database {
             } else {
                 compose_file_path.as_path()
             };
-            if let Err(error) = run_compose_command(
+            if let Err(error) = run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[down_file],
                 &["down", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             ) {
                 self.append_deployment_log(
                     deployment_id,
@@ -2378,14 +2394,27 @@ impl Database {
         fs::create_dir_all(&checkout_path)
             .with_context(|| format!("failed creating checkout dir {}", checkout_path.display()))?;
 
-        clone_repository_for_deploy(&clone_url, &branch, &checkout_path)?;
+        clone_repository_for_deploy_with_live_logs(
+            &clone_url,
+            &branch,
+            &checkout_path,
+            self,
+            deployment_id,
+            &log_redactions,
+        )?;
         self.append_deployment_log(
             deployment_id,
             &format!("cloned {}@{}", config.repository.name, branch),
             now_unix_ms,
         )?;
         if let Some(commit) = resolved_commit.as_deref() {
-            checkout_commit_for_deploy(&checkout_path, commit)?;
+            checkout_commit_for_deploy_with_live_logs(
+                &checkout_path,
+                commit,
+                self,
+                deployment_id,
+                &log_redactions,
+            )?;
             self.append_deployment_log(
                 deployment_id,
                 &format!("checked out commit {commit}"),
@@ -2421,24 +2450,33 @@ impl Database {
         )?;
 
         if force_rebuild {
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["build", "--no-cache"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["up", "-d", "--force-recreate", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
         } else {
-            run_compose_command(
+            run_compose_command_with_live_logs(
                 &checkout_path,
                 &project_name,
                 &[runtime_compose_path.as_path()],
                 &["up", "-d", "--build", "--remove-orphans"],
+                self,
+                deployment_id,
+                &log_redactions,
             )?;
         }
         let mapped_port = resolve_compose_service_port(
@@ -2691,26 +2729,69 @@ impl Database {
     }
 
     fn deployment_log_output(&self, deployment_id: Uuid) -> Result<String> {
+        let rows = self.deployment_log_rows_since(deployment_id, None)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| row.message)
+            .collect::<Vec<_>>()
+            .join("\n"))
+    }
+
+    fn deployment_log_rows_since(
+        &self,
+        deployment_id: Uuid,
+        last_log_id: Option<i64>,
+    ) -> Result<Vec<DeploymentLogRow>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
-        let mut stmt = conn
-            .prepare(
-                "SELECT message
-                 FROM deployment_logs
-                 WHERE deployment_id = ?1
-                 ORDER BY created_at_unix_ms ASC, id ASC",
-            )
-            .context("failed preparing deployment log query")?;
-        let mut rows = stmt
-            .query(params![deployment_id.to_string()])
-            .context("failed querying deployment logs")?;
-        let mut lines = Vec::new();
-        while let Some(row) = rows.next().context("failed iterating deployment logs")? {
-            let message: String = row
-                .get(0)
-                .context("failed reading deployment log message")?;
-            lines.push(message);
+        let mut entries = Vec::new();
+
+        if let Some(after_id) = last_log_id {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, message
+                     FROM deployment_logs
+                     WHERE deployment_id = ?1
+                       AND id > ?2
+                     ORDER BY id ASC",
+                )
+                .context("failed preparing incremental deployment log query")?;
+            let mut rows = stmt
+                .query(params![deployment_id.to_string(), after_id])
+                .context("failed querying incremental deployment logs")?;
+            while let Some(row) = rows
+                .next()
+                .context("failed iterating incremental deployment logs")?
+            {
+                entries.push(DeploymentLogRow {
+                    id: row.get(0).context("failed reading deployment log id")?,
+                    message: row
+                        .get(1)
+                        .context("failed reading deployment log message")?,
+                });
+            }
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, message
+                     FROM deployment_logs
+                     WHERE deployment_id = ?1
+                     ORDER BY id ASC",
+                )
+                .context("failed preparing deployment log query")?;
+            let mut rows = stmt
+                .query(params![deployment_id.to_string()])
+                .context("failed querying deployment logs")?;
+            while let Some(row) = rows.next().context("failed iterating deployment logs")? {
+                entries.push(DeploymentLogRow {
+                    id: row.get(0).context("failed reading deployment log id")?,
+                    message: row
+                        .get(1)
+                        .context("failed reading deployment log message")?,
+                });
+            }
         }
-        Ok(lines.join("\n"))
+
+        Ok(entries)
     }
 
     #[cfg(test)]
@@ -2748,6 +2829,10 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0008")?;
     conn.execute_batch(include_str!("../migrations/0009_app_env_vars.sql"))
         .context("failed running sqlite migration 0009")?;
+    conn.execute_batch(include_str!(
+        "../migrations/0010_deployment_logs_cursor_index.sql"
+    ))
+    .context("failed running sqlite migration 0010")?;
     ensure_deployments_metadata_columns(conn)?;
     ensure_import_config_columns(conn)?;
 
@@ -3672,6 +3757,27 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       background: rgba(0, 245, 212, 0.12);
       color: #8cfcee;
     }
+    .pill-status.status-queued,
+    .pill-status.status-deploying,
+    .pill-status.status-retrying {
+      border-color: #8a6b1a;
+      background: rgba(250, 198, 26, 0.2);
+      color: #ffd67a;
+    }
+    .pill-status.status-healthy {
+      border-color: #26706f;
+      background: rgba(0, 245, 212, 0.12);
+      color: #8cfcee;
+    }
+    .pill-status.status-failed {
+      border-color: #7a2634;
+      background: rgba(255, 88, 120, 0.15);
+      color: #ff8ca4;
+    }
+    .item-row.in-progress {
+      border-color: #8a6b1a;
+      background: rgba(250, 198, 26, 0.08);
+    }
     pre {
       margin: 0;
       min-height: 220px;
@@ -3793,9 +3899,56 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <script>
     let selectedApp = null;
     let selectedAppName = null;
+    let selectedLogsDeploymentId = null;
     let logsStream = null;
     let statusTimeout = null;
     const selectedState = { domains: [], envVars: [], latestDeployment: null, config: null };
+    const pendingDeploymentsByApp = new Map();
+    const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+
+    function normalizeDeploymentStatus(value) {
+      return (value || 'queued').toString().toLowerCase();
+    }
+
+    function isActiveDeploymentStatus(value) {
+      return ACTIVE_DEPLOYMENT_STATUSES.has(normalizeDeploymentStatus(value));
+    }
+
+    function deploymentPillClass(value) {
+      const status = normalizeDeploymentStatus(value);
+      if (status === 'healthy') return 'status-healthy';
+      if (status === 'failed') return 'status-failed';
+      if (status === 'deploying') return 'status-deploying';
+      if (status === 'retrying') return 'status-retrying';
+      return 'status-queued';
+    }
+
+    function markPendingDeployment(appId, deploymentId, status, sourceRef) {
+      if (!appId || !deploymentId) return;
+      const now = Date.now();
+      pendingDeploymentsByApp.set(appId, {
+        id: deploymentId,
+        app_id: appId,
+        status: normalizeDeploymentStatus(status),
+        source_ref: sourceRef || 'manual',
+        image_ref: null,
+        commit_sha: null,
+        last_error: null,
+        created_at_unix_ms: now,
+        updated_at_unix_ms: now
+      });
+    }
+
+    function mergePendingDeployment(appId, items) {
+      const pending = pendingDeploymentsByApp.get(appId);
+      if (!pending) return items;
+      const hasPending = items.some((item) => item.id === pending.id);
+      if (hasPending) {
+        pendingDeploymentsByApp.delete(appId);
+        return items;
+      }
+      return [pending, ...items];
+    }
 
     function setStatus(message, level = 'ok') {
       const el = document.getElementById('status');
@@ -3876,9 +4029,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       deploymentRow.className = 'item-row';
       if (selectedState.latestDeployment) {
         const sourceRef = selectedState.latestDeployment.source_ref || 'manual';
+        const status = normalizeDeploymentStatus(selectedState.latestDeployment.status);
+        const building = isActiveDeploymentStatus(status);
+        const statusLabel = building ? `${status} (building)` : status;
+        deploymentRow.className = `item-row ${building ? 'in-progress' : ''}`.trim();
         deploymentRow.innerHTML = `
           <div class="item-main">
-            <strong><span class="pill-status">${selectedState.latestDeployment.status}</span></strong>
+            <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
             <code>${sourceRef}</code>
           </div>
         `;
@@ -3946,8 +4103,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }
       }
 
-      note.textContent =
-        'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
+      if (selectedState.latestDeployment && isActiveDeploymentStatus(selectedState.latestDeployment.status)) {
+        note.textContent =
+          'Build in progress. Status auto-refreshes every few seconds; logs stream live below.';
+      } else {
+        note.textContent =
+          'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
+      }
     }
 
     async function api(path, opts = {}) {
@@ -4075,6 +4237,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     async function selectApp(appId, appName = null) {
       selectedApp = appId;
       selectedAppName = appName || selectedAppName;
+      selectedLogsDeploymentId = null;
       selectedState.domains = [];
       selectedState.envVars = [];
       selectedState.latestDeployment = null;
@@ -4095,10 +4258,42 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         logsStream = null;
       }
       if (!selectedApp) return;
+      selectedLogsDeploymentId = null;
+      document.getElementById('logs').textContent = '(waiting for logs...)';
       logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
       logsStream.addEventListener('logs', (event) => {
-        document.getElementById('logs').textContent = (event.data || '')
-          .replaceAll('\\n', '\n') || '(no logs)';
+        let payload = null;
+        try {
+          payload = JSON.parse(event.data || '{}');
+        } catch (_) {
+          return;
+        }
+
+        const deploymentId = payload && payload.deployment_id ? payload.deployment_id : null;
+        const logsChunk = payload && typeof payload.logs === 'string' ? payload.logs : '';
+        const reset = payload && payload.reset === true;
+        const logsEl = document.getElementById('logs');
+
+        if (!deploymentId && !logsChunk) {
+          selectedLogsDeploymentId = null;
+          logsEl.textContent = '(no logs)';
+          return;
+        }
+
+        if (reset || deploymentId !== selectedLogsDeploymentId) {
+          selectedLogsDeploymentId = deploymentId;
+          logsEl.textContent = logsChunk || '(no logs)';
+          return;
+        }
+
+        if (!logsChunk) {
+          return;
+        }
+
+        const current = logsEl.textContent === '(no logs)' || logsEl.textContent === '(waiting for logs...)'
+          ? ''
+          : logsEl.textContent;
+        logsEl.textContent = current ? `${current}\n${logsChunk}` : logsChunk;
       });
       logsStream.onerror = () => {};
     }
@@ -4107,12 +4302,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (!selectedApp) return;
       const res = await api(`/api/v1/apps/${selectedApp}/deployments`);
       const data = await res.json();
-      selectedState.latestDeployment = data.items[0] || null;
+      const items = mergePendingDeployment(selectedApp, data.items || []);
+      selectedState.latestDeployment = items[0] || null;
       renderRoutes();
       const el = document.getElementById('deployments');
       el.innerHTML = '';
 
-      if (data.items.length === 0) {
+      if (items.length === 0) {
         const empty = document.createElement('li');
         empty.className = 'hint';
         empty.textContent = 'No deployments yet.';
@@ -4120,13 +4316,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         return;
       }
 
-      for (const d of data.items) {
+      for (const d of items) {
         const li = document.createElement('li');
         const sourceRef = d.source_ref || 'manual';
-        li.className = 'item-row';
+        const status = normalizeDeploymentStatus(d.status);
+        const building = isActiveDeploymentStatus(status);
+        const statusLabel = building ? `${status} (building)` : status;
+        li.className = `item-row ${building ? 'in-progress' : ''}`.trim();
         li.innerHTML = `
           <div class="item-main">
-            <strong><span class="pill-status">${d.status}</span></strong>
+            <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
             <code>${sourceRef}</code>
           </div>
           <div class="item-actions">
@@ -4141,6 +4340,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       try {
         const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
         const data = await res.json();
+        selectedLogsDeploymentId = deploymentId;
         document.getElementById('logs').textContent = data.logs || '(no logs)';
       } catch (error) {
         setStatus(`Unable to load logs: ${error.message}`, 'err');
@@ -4294,13 +4494,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function deploy(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/deployments`, {
+        const res = await api(`/api/v1/apps/${appId}/deployments`, {
           method:'POST',
           headers:{'content-type':'application/json'},
           body:'{}'
         });
-        setStatus('Deployment queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'manual');
+        setStatus('Deployment queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Deploy failed: ${error.message}`, 'err');
       }
@@ -4308,13 +4510,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function resyncRebuild(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/deployments`, {
+        const res = await api(`/api/v1/apps/${appId}/deployments`, {
           method:'POST',
           headers:{'content-type':'application/json'},
           body:JSON.stringify({ force_rebuild: true })
         });
-        setStatus('Resync and rebuild queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'manual (rebuild)');
+        setStatus('Resync and rebuild queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Resync/rebuild failed: ${error.message}`, 'err');
       }
@@ -4322,9 +4526,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function rollback(appId) {
       try {
-        await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
-        setStatus('Rollback queued.');
-        if (selectedApp === appId) refreshDeployments();
+        const res = await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
+        const accepted = await res.json();
+        markPendingDeployment(appId, accepted.deployment_id, accepted.status, 'rollback');
+        setStatus('Rollback queued. Build status will update live.');
+        if (selectedApp === appId) await refreshDeployments();
       } catch (error) {
         setStatus(`Rollback failed: ${error.message}`, 'err');
       }
@@ -5142,6 +5348,26 @@ async fn list_domains(
     Ok(Json(DomainListResponse { items }))
 }
 
+#[derive(Debug, Serialize)]
+struct StreamLogsEventPayload {
+    deployment_id: Option<Uuid>,
+    logs: String,
+    reset: bool,
+}
+
+fn encode_stream_logs_event_payload(
+    deployment_id: Option<Uuid>,
+    logs: &str,
+    reset: bool,
+) -> Result<String> {
+    serde_json::to_string(&StreamLogsEventPayload {
+        deployment_id,
+        logs: logs.to_string(),
+        reset,
+    })
+    .context("failed encoding logs stream payload")
+}
+
 async fn stream_app_logs(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -5161,24 +5387,95 @@ async fn stream_app_logs(
     }
 
     let state_for_stream = state.clone();
-    let stream =
-        IntervalStream::new(tokio::time::interval(Duration::from_secs(2))).map(move |_| {
-            let logs = state_for_stream
+    let mut active_deployment_id: Option<Uuid> = None;
+    let mut last_log_id: Option<i64> = None;
+    let mut sent_empty = false;
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(750))).filter_map(
+        move |_| {
+            let latest_deployment_id = match state_for_stream
                 .db
                 .latest_deployment_id_for_app(app_id)
-                .ok()
-                .flatten()
-                .and_then(|deployment_id| {
-                    state_for_stream
-                        .db
-                        .deployment_log_output(deployment_id)
-                        .ok()
-                })
-                .unwrap_or_default();
-            Ok(Event::default()
-                .event("logs")
-                .data(logs.replace('\n', "\\n")))
-        });
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, %app_id, "failed fetching latest deployment for log stream");
+                    return None;
+                }
+            };
+
+            if latest_deployment_id != active_deployment_id {
+                active_deployment_id = latest_deployment_id;
+                last_log_id = None;
+                sent_empty = false;
+            }
+
+            let Some(deployment_id) = active_deployment_id else {
+                if sent_empty {
+                    return None;
+                }
+                sent_empty = true;
+                let payload = match encode_stream_logs_event_payload(None, "", true) {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        warn!(%error, %app_id, "failed encoding empty logs stream payload");
+                        return None;
+                    }
+                };
+                return Some(Ok(Event::default().event("logs").data(payload)));
+            };
+
+            let rows = match state_for_stream
+                .db
+                .deployment_log_rows_since(deployment_id, last_log_id)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(%error, %app_id, %deployment_id, "failed loading incremental deployment logs");
+                    return None;
+                }
+            };
+
+            if rows.is_empty() {
+                if sent_empty {
+                    return None;
+                }
+                sent_empty = true;
+                let payload = match encode_stream_logs_event_payload(Some(deployment_id), "", true)
+                {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            %app_id,
+                            %deployment_id,
+                            "failed encoding empty deployment logs payload"
+                        );
+                        return None;
+                    }
+                };
+                return Some(Ok(Event::default().event("logs").data(payload)));
+            }
+
+            sent_empty = false;
+            let reset = last_log_id.is_none();
+            last_log_id = rows.last().map(|row| row.id);
+            let logs = rows
+                .into_iter()
+                .map(|row| row.message)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let payload =
+                match encode_stream_logs_event_payload(Some(deployment_id), &logs, reset) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    warn!(%error, %app_id, %deployment_id, "failed encoding logs stream payload");
+                    return None;
+                }
+            };
+
+            Some(Ok(Event::default().event("logs").data(payload)))
+        },
+    );
     Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
 }
 
@@ -5718,69 +6015,237 @@ fn clone_repository(clone_url: &str, branch: &str, target_path: &Path) -> Result
     }
 }
 
-fn clone_repository_for_deploy(clone_url: &str, branch: &str, target_path: &Path) -> Result<()> {
-    let output = Command::new("git")
+#[derive(Clone, Copy, Debug)]
+enum CommandOutputChannel {
+    Stdout,
+    Stderr,
+}
+
+fn run_command_with_live_output(
+    mut command: Command,
+    description: &str,
+    redactions: &[String],
+    mut on_line: impl FnMut(CommandOutputChannel, &str),
+) -> Result<String> {
+    let safe_description = redact_log_line(description, redactions);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed starting command: {safe_description}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .context("failed attaching command stdout")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("failed attaching command stderr")?;
+    const MAX_IN_FLIGHT_LINES: usize = 1_024;
+    const MAX_RETAINED_LINES: usize = 512;
+    let (sender, receiver) =
+        mpsc::sync_channel::<(CommandOutputChannel, String)>(MAX_IN_FLIGHT_LINES);
+    let stdout_reader =
+        spawn_command_output_reader(stdout, CommandOutputChannel::Stdout, sender.clone());
+    let stderr_reader =
+        spawn_command_output_reader(stderr, CommandOutputChannel::Stderr, sender.clone());
+    drop(sender);
+
+    let mut rendered_lines = VecDeque::with_capacity(MAX_RETAINED_LINES);
+    for (channel, line) in receiver {
+        on_line(channel, &line);
+        if rendered_lines.len() == MAX_RETAINED_LINES {
+            rendered_lines.pop_front();
+        }
+        let entry = match channel {
+            CommandOutputChannel::Stdout => line,
+            CommandOutputChannel::Stderr => format!("stderr: {line}"),
+        };
+        rendered_lines.push_back(entry);
+    }
+
+    let status = child
+        .wait()
+        .with_context(|| format!("failed waiting for command: {safe_description}"))?;
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+
+    let rendered = redact_log_line(
+        &rendered_lines.into_iter().collect::<Vec<_>>().join("\n"),
+        redactions,
+    );
+    if status.success() {
+        Ok(rendered)
+    } else if rendered.is_empty() {
+        warn!(
+            command = %safe_description,
+            "command failed with no output; output was streamed to deployment logs"
+        );
+        anyhow::bail!("command failed (redacted) with no output");
+    } else {
+        warn!(
+            command = %safe_description,
+            "command failed; output was streamed to deployment logs"
+        );
+        anyhow::bail!("command failed (redacted); command output was streamed to deployment logs");
+    }
+}
+
+fn spawn_command_output_reader<R: Read + Send + 'static>(
+    reader: R,
+    channel: CommandOutputChannel,
+    sender: mpsc::SyncSender<(CommandOutputChannel, String)>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) => break,
+                Ok(_) => {
+                    let value = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
+                    if sender.send((channel, value)).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ =
+                        sender.send((channel, format!("<failed reading command output: {error}>")));
+                    break;
+                }
+            }
+        }
+    })
+}
+
+fn append_streamed_command_log(
+    db: &Database,
+    deployment_id: Uuid,
+    source: &str,
+    line: &str,
+    redactions: &[String],
+) {
+    if line.trim().is_empty() {
+        return;
+    }
+    let sanitized = redact_log_line(line, redactions);
+    let message = format!("{source}: {sanitized}");
+    if let Err(error) = db.append_deployment_log(deployment_id, &message, now_unix_ms()) {
+        warn!(%error, "failed persisting streamed deployment log line");
+    }
+}
+
+fn redact_log_line(line: &str, redactions: &[String]) -> String {
+    let mut sanitized = line.to_string();
+    let mut candidates = redactions
+        .iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.len() >= 4)
+        .collect::<Vec<_>>();
+    candidates.sort_unstable_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    candidates.dedup();
+
+    for value in candidates {
+        if sanitized.contains(&value) {
+            sanitized = sanitized.replace(&value, "***");
+        }
+    }
+    sanitized
+}
+
+fn credentials_fragment_from_url(url: &str) -> Option<String> {
+    let (_, remainder) = url.split_once("://")?;
+    let (authority, _) = remainder.split_once('@')?;
+    if authority.is_empty() || authority.contains('/') {
+        return None;
+    }
+    Some(authority.to_string())
+}
+
+fn clone_repository_for_deploy_with_live_logs(
+    clone_url: &str,
+    branch: &str,
+    target_path: &Path,
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<()> {
+    let mut command = Command::new("git");
+    command
         .arg("clone")
         .arg("--depth")
         .arg("1")
         .arg("--branch")
         .arg(branch)
         .arg(clone_url)
-        .arg(target_path)
-        .output()
-        .with_context(|| format!("failed running git clone for {clone_url}@{branch}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    anyhow::bail!(
-        "git clone failed for {clone_url}@{branch}: {} {}",
-        stdout,
-        stderr
-    );
+        .arg(target_path);
+    run_command_with_live_output(
+        command,
+        &format!("git clone {clone_url}@{branch}"),
+        redactions,
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
+    Ok(())
 }
 
-fn checkout_commit_for_deploy(repo_path: &Path, commit_sha: &str) -> Result<()> {
-    let fetch = Command::new("git")
+fn checkout_commit_for_deploy_with_live_logs(
+    repo_path: &Path,
+    commit_sha: &str,
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<()> {
+    let mut fetch = Command::new("git");
+    fetch
         .arg("-C")
         .arg(repo_path)
         .arg("fetch")
         .arg("--depth")
         .arg("1")
         .arg("origin")
-        .arg(commit_sha)
-        .output()
-        .with_context(|| format!("failed fetching commit {commit_sha}"))?;
-    if !fetch.status.success() {
-        let stderr = String::from_utf8_lossy(&fetch.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&fetch.stdout).trim().to_string();
-        anyhow::bail!(
-            "git fetch failed for commit {commit_sha}: {} {}",
-            stdout,
-            stderr
-        );
-    }
+        .arg(commit_sha);
+    run_command_with_live_output(
+        fetch,
+        &format!("git fetch {commit_sha}"),
+        redactions,
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
 
-    let checkout = Command::new("git")
+    let mut checkout = Command::new("git");
+    checkout
         .arg("-C")
         .arg(repo_path)
         .arg("checkout")
         .arg("--detach")
-        .arg(commit_sha)
-        .output()
-        .with_context(|| format!("failed checking out commit {commit_sha}"))?;
-    if checkout.status.success() {
-        Ok(())
-    } else {
-        let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&checkout.stdout).trim().to_string();
-        anyhow::bail!(
-            "git checkout failed for commit {commit_sha}: {} {}",
-            stdout,
-            stderr
-        );
-    }
+        .arg(commit_sha);
+    run_command_with_live_output(
+        checkout,
+        &format!("git checkout {commit_sha}"),
+        redactions,
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "git",
+                CommandOutputChannel::Stderr => "git/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )?;
+    Ok(())
 }
 
 fn runtime_root_path() -> PathBuf {
@@ -6020,6 +6485,45 @@ fn run_compose_command(
             stderr
         );
     }
+}
+
+fn run_compose_command_with_live_logs(
+    working_dir: &Path,
+    project_name: &str,
+    files: &[&Path],
+    args: &[&str],
+    db: &Database,
+    deployment_id: Uuid,
+    redactions: &[String],
+) -> Result<String> {
+    let base = compose_base_command()?;
+    let mut command = Command::new(&base[0]);
+    if base.len() > 1 {
+        command.arg(&base[1]);
+    }
+    command
+        .current_dir(working_dir)
+        .arg("--project-name")
+        .arg(project_name);
+    for file in files {
+        command.arg("-f").arg(file);
+    }
+    for arg in args {
+        command.arg(arg);
+    }
+
+    run_command_with_live_output(
+        command,
+        &format!("compose {}", args.join(" ")),
+        redactions,
+        |channel, line| {
+            let source = match channel {
+                CommandOutputChannel::Stdout => "compose",
+                CommandOutputChannel::Stderr => "compose/stderr",
+            };
+            append_streamed_command_log(db, deployment_id, source, line, redactions);
+        },
+    )
 }
 
 fn resolve_compose_service_port(

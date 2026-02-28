@@ -123,6 +123,17 @@ components:
           format: uuid
         logs:
           type: string
+    StreamLogsEventPayload:
+      type: object
+      required: [deployment_id, logs, reset]
+      properties:
+        deployment_id:
+          type: [string, 'null']
+          format: uuid
+        logs:
+          type: string
+        reset:
+          type: boolean
     GithubConnectRequest:
       type: object
       required: [owner, repo, branch]
@@ -991,6 +1002,15 @@ paths:
             text/event-stream:
               schema:
                 type: string
+                description: |
+                  Emits `event: logs` frames where `data` is a JSON object matching
+                  `StreamLogsEventPayload`.
+              examples:
+                logs:
+                  summary: Incremental logs event
+                  value: |
+                    event: logs
+                    data: {"deployment_id":"2ed1ae6f-f12e-4fc7-8a4d-f96beff4fd16","logs":"compose: service healthy","reset":false}
   /apps/{app_id}/deployments:
     get:
       summary: List deployments
