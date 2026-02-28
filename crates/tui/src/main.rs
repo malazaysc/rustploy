@@ -440,6 +440,7 @@ async fn trigger_deploy(
         image_ref: None,
         commit_sha: None,
         simulate_failures: Some(0),
+        force_rebuild: None,
     })
     .context("failed serializing deploy payload")?;
     let (status, body) = send_request(

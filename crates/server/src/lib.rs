@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -23,15 +23,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered, AgentStatus,
-    AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppListResponse, AppSummary,
-    AuthLoginRequest, AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
-    CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
-    CreateTokenResponse, DependencyProfile, DeploymentListResponse, DeploymentLogsResponse,
-    DeploymentStatus, DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
+    AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppEnvVarListResponse,
+    AppEnvVarSummary, AppListResponse, AppSummary, AuthLoginRequest, AuthSessionResponse,
+    ComposeServiceSummary, ComposeSummary, CreateAppRequest, CreateDeploymentAccepted,
+    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
+    DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
+    DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
     EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
     GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
     NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
     PasswordResetRequestedResponse, RepositoryRef, SourceRef, TokenListResponse, TokenSummary,
+    UpsertAppEnvVarRequest,
 };
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tracing::{error, info, warn};
@@ -140,6 +142,12 @@ struct DeployJobPayload {
     deployment_id: Uuid,
     app_id: Uuid,
     simulate_failures: u32,
+    #[serde(default)]
+    source_ref: Option<String>,
+    #[serde(default)]
+    commit_sha: Option<String>,
+    #[serde(default)]
+    force_rebuild: bool,
 }
 
 #[derive(Debug)]
@@ -161,6 +169,24 @@ struct ManagedServiceRecord {
     username: String,
     password: String,
     healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+struct AppRuntimeRoute {
+    app_id: Uuid,
+    deployment_id: Uuid,
+    project_name: String,
+    service_name: String,
+    upstream_host: String,
+    upstream_port: u16,
+}
+
+#[derive(Debug, Clone)]
+struct AppEnvVarRecord {
+    app_id: Uuid,
+    key: String,
+    value: String,
+    updated_at_unix_ms: u64,
 }
 
 #[derive(Debug)]
@@ -220,6 +246,7 @@ struct ComposeServiceRaw {
     build: Option<serde_yaml::Value>,
     depends_on: Option<serde_yaml::Value>,
     ports: Option<Vec<serde_yaml::Value>>,
+    env_file: Option<serde_yaml::Value>,
     profiles: Option<Vec<String>>,
 }
 
@@ -322,7 +349,7 @@ impl AppState {
             rate_limit_state: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        if let Err(error) = sync_caddyfile_from_domains(&state) {
+        if let Err(error) = sync_caddyfile_from_db(&state.db) {
             warn!(%error, "failed syncing caddyfile during startup");
         }
 
@@ -729,6 +756,7 @@ impl Database {
                 repo_provider,
                 repo_owner,
                 repo_name,
+                repo_clone_url,
                 repo_branch,
                 build_mode,
                 package_manager,
@@ -741,11 +769,12 @@ impl Database {
                 manifest_json,
                 created_at_unix_ms,
                 updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
              ON CONFLICT(app_id) DO UPDATE SET
                 repo_provider = excluded.repo_provider,
                 repo_owner = excluded.repo_owner,
                 repo_name = excluded.repo_name,
+                repo_clone_url = excluded.repo_clone_url,
                 repo_branch = excluded.repo_branch,
                 build_mode = excluded.build_mode,
                 package_manager = excluded.package_manager,
@@ -762,6 +791,7 @@ impl Database {
                 &config.repository.provider,
                 &config.repository.owner,
                 &config.repository.name,
+                config.repository.clone_url.as_deref(),
                 config.source.branch.as_deref(),
                 &config.build_mode,
                 &config.detection.package_manager,
@@ -776,7 +806,7 @@ impl Database {
                 compose_json,
                 dependency_profile_json,
                 config.manifest_json.as_deref(),
-                now,
+                now
             ],
         )
         .context("failed upserting import config")?;
@@ -793,6 +823,7 @@ impl Database {
                     repo_provider,
                     repo_owner,
                     repo_name,
+                    repo_clone_url,
                     repo_branch,
                     build_mode,
                     package_manager,
@@ -812,16 +843,17 @@ impl Database {
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, String>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                        row.get::<_, String>(9)?,
-                        row.get::<_, i64>(10)?,
-                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
+                        row.get::<_, Option<String>>(14)?,
                     ))
                 },
             )
@@ -833,6 +865,7 @@ impl Database {
             repo_provider,
             repo_owner,
             repo_name,
+            repo_clone_url,
             repo_branch,
             build_mode,
             package_manager,
@@ -871,7 +904,7 @@ impl Database {
                 provider: repo_provider,
                 owner: repo_owner,
                 name: repo_name,
-                clone_url: None,
+                clone_url: repo_clone_url,
                 default_branch: Some(repo_branch.clone()),
             },
             source: SourceRef {
@@ -890,6 +923,175 @@ impl Database {
             dependency_profile,
             manifest,
         }))
+    }
+
+    fn upsert_app_runtime(&self, route: &AppRuntimeRoute, now_unix_ms: u64) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let now = to_i64(now_unix_ms)?;
+        conn.execute(
+            "INSERT INTO app_runtimes (
+                app_id,
+                deployment_id,
+                project_name,
+                service_name,
+                upstream_host,
+                upstream_port,
+                created_at_unix_ms,
+                updated_at_unix_ms
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+            ON CONFLICT(app_id) DO UPDATE SET
+                deployment_id = excluded.deployment_id,
+                project_name = excluded.project_name,
+                service_name = excluded.service_name,
+                upstream_host = excluded.upstream_host,
+                upstream_port = excluded.upstream_port,
+                updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![
+                route.app_id.to_string(),
+                route.deployment_id.to_string(),
+                route.project_name,
+                route.service_name,
+                route.upstream_host,
+                i64::from(route.upstream_port),
+                now,
+            ],
+        )
+        .context("failed upserting app runtime route")?;
+        Ok(())
+    }
+
+    fn list_app_runtimes(&self) -> Result<Vec<AppRuntimeRoute>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT app_id, deployment_id, project_name, service_name, upstream_host, upstream_port
+                 FROM app_runtimes",
+            )
+            .context("failed preparing app runtime query")?;
+        let mut rows = stmt.query([]).context("failed querying app runtimes")?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().context("failed iterating app runtimes")? {
+            let app_id_raw: String = row.get(0).context("failed reading app runtime app_id")?;
+            let deployment_id_raw: String = row
+                .get(1)
+                .context("failed reading app runtime deployment_id")?;
+            let project_name: String = row
+                .get(2)
+                .context("failed reading app runtime project_name")?;
+            let service_name: String = row
+                .get(3)
+                .context("failed reading app runtime service_name")?;
+            let upstream_host: String = row
+                .get(4)
+                .context("failed reading app runtime upstream_host")?;
+            let upstream_port_raw: i64 = row
+                .get(5)
+                .context("failed reading app runtime upstream_port")?;
+            items.push(AppRuntimeRoute {
+                app_id: Uuid::parse_str(&app_id_raw)
+                    .with_context(|| format!("invalid app runtime app_id: {app_id_raw}"))?,
+                deployment_id: Uuid::parse_str(&deployment_id_raw).with_context(|| {
+                    format!("invalid app runtime deployment_id: {deployment_id_raw}")
+                })?,
+                project_name,
+                service_name,
+                upstream_host,
+                upstream_port: to_u16(upstream_port_raw)?,
+            });
+        }
+        Ok(items)
+    }
+
+    fn upsert_app_env_var(
+        &self,
+        app_id: Uuid,
+        key: &str,
+        value: &str,
+        now_unix_ms: u64,
+    ) -> Result<AppEnvVarRecord> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let now = to_i64(now_unix_ms)?;
+        conn.execute(
+            "INSERT INTO app_env_vars (
+                app_id,
+                key,
+                value,
+                created_at_unix_ms,
+                updated_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(app_id, key) DO UPDATE SET
+                value = excluded.value,
+                updated_at_unix_ms = excluded.updated_at_unix_ms",
+            params![app_id.to_string(), key, value, now],
+        )
+        .context("failed upserting app env var")?;
+
+        conn.execute(
+            "UPDATE apps
+             SET updated_at_unix_ms = ?2
+             WHERE id = ?1",
+            params![app_id.to_string(), now],
+        )
+        .context("failed updating app timestamp after env var upsert")?;
+
+        Ok(AppEnvVarRecord {
+            app_id,
+            key: key.to_string(),
+            value: value.to_string(),
+            updated_at_unix_ms: now_unix_ms,
+        })
+    }
+
+    fn list_app_env_vars(&self, app_id: Uuid) -> Result<Vec<AppEnvVarRecord>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT app_id, key, value, updated_at_unix_ms
+                 FROM app_env_vars
+                 WHERE app_id = ?1
+                 ORDER BY key ASC",
+            )
+            .context("failed preparing app env var query")?;
+        let mut rows = stmt
+            .query(params![app_id.to_string()])
+            .context("failed querying app env vars")?;
+        let mut items = Vec::new();
+        while let Some(row) = rows.next().context("failed iterating app env vars")? {
+            let app_id_raw: String = row.get(0).context("failed reading env var app_id")?;
+            let key: String = row.get(1).context("failed reading env var key")?;
+            let value: String = row.get(2).context("failed reading env var value")?;
+            let updated_raw: i64 = row
+                .get(3)
+                .context("failed reading env var updated_at_unix_ms")?;
+            items.push(AppEnvVarRecord {
+                app_id: Uuid::parse_str(&app_id_raw)
+                    .with_context(|| format!("invalid app env var app_id: {app_id_raw}"))?,
+                key,
+                value,
+                updated_at_unix_ms: to_u64(updated_raw)?,
+            });
+        }
+        Ok(items)
+    }
+
+    fn delete_app_env_var(&self, app_id: Uuid, key: &str, now_unix_ms: u64) -> Result<bool> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let deleted = conn
+            .execute(
+                "DELETE FROM app_env_vars WHERE app_id = ?1 AND key = ?2",
+                params![app_id.to_string(), key],
+            )
+            .context("failed deleting app env var")?;
+        if deleted > 0 {
+            conn.execute(
+                "UPDATE apps
+                 SET updated_at_unix_ms = ?2
+                 WHERE id = ?1",
+                params![app_id.to_string(), to_i64(now_unix_ms)?],
+            )
+            .context("failed updating app timestamp after env var delete")?;
+        }
+        Ok(deleted > 0)
     }
 
     fn latest_healthy_source_ref(&self, app_id: Uuid) -> Result<Option<String>> {
@@ -1643,6 +1845,9 @@ impl Database {
             deployment_id,
             app_id,
             simulate_failures,
+            source_ref: request.source_ref.clone(),
+            commit_sha: request.commit_sha.clone(),
+            force_rebuild: request.force_rebuild.unwrap_or(false),
         };
         let payload_json =
             serde_json::to_string(&payload).context("failed serializing job payload")?;
@@ -1892,6 +2097,22 @@ impl Database {
         )?;
 
         self.append_deployment_log(payload.deployment_id, "deployment started", now_unix_ms)?;
+        if job.attempt_count <= payload.simulate_failures {
+            self.append_deployment_log(
+                payload.deployment_id,
+                &format!(
+                    "simulated failure on attempt {} of {}",
+                    job.attempt_count, payload.simulate_failures
+                ),
+                now_unix_ms,
+            )?;
+            anyhow::bail!(
+                "simulated deployment failure on attempt {} of {}",
+                job.attempt_count,
+                payload.simulate_failures
+            );
+        }
+
         if let Some(config) = self.get_import_config(payload.app_id)? {
             self.append_deployment_log(
                 payload.deployment_id,
@@ -1919,7 +2140,7 @@ impl Database {
                     now_unix_ms,
                 )?;
             }
-            if let Some(profile) = config.dependency_profile {
+            if let Some(profile) = config.dependency_profile.as_ref() {
                 if profile.postgres == Some(true) {
                     if let Some(image) =
                         compose_image_for_dependency(config.compose.as_ref(), "postgres")
@@ -1995,27 +2216,56 @@ impl Database {
                 )?;
                 anyhow::bail!("compose mode requires docker-compose.yml/compose.yml in repository");
             }
-            self.append_deployment_log(
-                payload.deployment_id,
-                "build pipeline step simulation complete",
-                now_unix_ms,
-            )?;
-        }
 
-        if job.attempt_count <= payload.simulate_failures {
-            self.append_deployment_log(
-                payload.deployment_id,
-                &format!(
-                    "simulated failure on attempt {} of {}",
-                    job.attempt_count, payload.simulate_failures
-                ),
-                now_unix_ms,
-            )?;
-            anyhow::bail!(
-                "simulated deployment failure on attempt {} of {}",
-                job.attempt_count,
-                payload.simulate_failures
-            );
+            if config.build_mode == "compose" {
+                let resolved_commit = payload
+                    .commit_sha
+                    .clone()
+                    .or_else(|| {
+                        payload.source_ref.as_deref().and_then(|value| {
+                            value.strip_prefix("github:").map(ToString::to_string)
+                        })
+                    })
+                    .filter(|value| !value.trim().is_empty());
+                if payload.force_rebuild {
+                    self.append_deployment_log(
+                        payload.deployment_id,
+                        "force rebuild requested (compose build --no-cache)",
+                        now_unix_ms,
+                    )?;
+                }
+                let route = self.deploy_compose_runtime(
+                    payload.app_id,
+                    payload.deployment_id,
+                    &resolved_commit,
+                    payload.force_rebuild,
+                    &config,
+                    now_unix_ms,
+                )?;
+                self.upsert_app_runtime(&route, now_unix_ms)?;
+                self.append_deployment_log(
+                    payload.deployment_id,
+                    &format!(
+                        "runtime upstream endpoint {}:{}",
+                        route.upstream_host, route.upstream_port
+                    ),
+                    now_unix_ms,
+                )?;
+                if let Err(error) = sync_caddyfile_from_db(self) {
+                    warn!(%error, "failed syncing caddyfile after deployment");
+                    self.append_deployment_log(
+                        payload.deployment_id,
+                        &format!("warning: failed to update routing: {error}"),
+                        now_unix_ms,
+                    )?;
+                }
+            } else {
+                self.append_deployment_log(
+                    payload.deployment_id,
+                    "build pipeline step simulation complete",
+                    now_unix_ms,
+                )?;
+            }
         }
 
         self.set_deployment_state(
@@ -2026,6 +2276,196 @@ impl Database {
         )?;
         self.append_deployment_log(payload.deployment_id, "deployment healthy", now_unix_ms)?;
         Ok(())
+    }
+
+    fn deploy_compose_runtime(
+        &self,
+        app_id: Uuid,
+        deployment_id: Uuid,
+        resolved_commit: &Option<String>,
+        force_rebuild: bool,
+        config: &EffectiveAppConfigResponse,
+        now_unix_ms: u64,
+    ) -> Result<AppRuntimeRoute> {
+        let compose = config
+            .compose
+            .as_ref()
+            .context("compose deployment requested without compose metadata")?;
+        let app_service = compose
+            .app_service
+            .clone()
+            .context("compose app service could not be detected")?;
+        let app_port = detect_app_service_port(compose, &app_service)
+            .context("compose app service does not expose any parseable port")?;
+        let project_name = compose_project_name(app_id);
+        let runtime_root = runtime_root_path();
+        let checkout_path = runtime_checkout_path(&runtime_root, app_id);
+        let compose_file_path = checkout_path.join(&compose.file);
+        let runtime_compose_path = checkout_path.join("rustploy.compose.runtime.yml");
+        let branch = config
+            .source
+            .branch
+            .as_deref()
+            .unwrap_or("main")
+            .to_string();
+        let clone_url = config.repository.clone_url.clone().unwrap_or_else(|| {
+            format!(
+                "https://github.com/{}/{}.git",
+                config.repository.owner, config.repository.name
+            )
+        });
+        let app_env_vars = self
+            .list_app_env_vars(app_id)?
+            .into_iter()
+            .map(|record| (record.key, record.value))
+            .collect::<HashMap<_, _>>();
+
+        self.append_deployment_log(
+            deployment_id,
+            &format!("runtime checkout: {}", checkout_path.display()),
+            now_unix_ms,
+        )?;
+        if !app_env_vars.is_empty() {
+            self.append_deployment_log(
+                deployment_id,
+                &format!(
+                    "injecting {} app environment variables into compose runtime",
+                    app_env_vars.len()
+                ),
+                now_unix_ms,
+            )?;
+        }
+        if checkout_path.exists() && compose_file_path.exists() {
+            if let Err(error) = write_runtime_compose_file(
+                &compose_file_path,
+                &runtime_compose_path,
+                &app_service,
+                app_port,
+                &app_env_vars,
+            ) {
+                self.append_deployment_log(
+                    deployment_id,
+                    &format!("warning: failed preparing compose runtime file for down: {error}"),
+                    now_unix_ms,
+                )?;
+            }
+            let down_file = if runtime_compose_path.exists() {
+                runtime_compose_path.as_path()
+            } else {
+                compose_file_path.as_path()
+            };
+            if let Err(error) = run_compose_command(
+                &checkout_path,
+                &project_name,
+                &[down_file],
+                &["down", "--remove-orphans"],
+            ) {
+                self.append_deployment_log(
+                    deployment_id,
+                    &format!("warning: compose down before deploy failed: {error}"),
+                    now_unix_ms,
+                )?;
+            }
+        }
+        if checkout_path.exists() {
+            fs::remove_dir_all(&checkout_path).with_context(|| {
+                format!(
+                    "failed clearing previous checkout {}",
+                    checkout_path.display()
+                )
+            })?;
+        }
+        fs::create_dir_all(&checkout_path)
+            .with_context(|| format!("failed creating checkout dir {}", checkout_path.display()))?;
+
+        clone_repository_for_deploy(&clone_url, &branch, &checkout_path)?;
+        self.append_deployment_log(
+            deployment_id,
+            &format!("cloned {}@{}", config.repository.name, branch),
+            now_unix_ms,
+        )?;
+        if let Some(commit) = resolved_commit.as_deref() {
+            checkout_commit_for_deploy(&checkout_path, commit)?;
+            self.append_deployment_log(
+                deployment_id,
+                &format!("checked out commit {commit}"),
+                now_unix_ms,
+            )?;
+        }
+        let created_env_files = ensure_compose_env_files(&checkout_path, &compose.file)?;
+        if !created_env_files.is_empty() {
+            let rendered = created_env_files
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.append_deployment_log(
+                deployment_id,
+                &format!("created missing env files for compose: {rendered}"),
+                now_unix_ms,
+            )?;
+        }
+
+        if !compose_file_path.exists() {
+            anyhow::bail!(
+                "compose file {} does not exist in checkout",
+                compose_file_path.display()
+            );
+        }
+        write_runtime_compose_file(
+            &compose_file_path,
+            &runtime_compose_path,
+            &app_service,
+            app_port,
+            &app_env_vars,
+        )?;
+
+        if force_rebuild {
+            run_compose_command(
+                &checkout_path,
+                &project_name,
+                &[runtime_compose_path.as_path()],
+                &["build", "--no-cache"],
+            )?;
+            run_compose_command(
+                &checkout_path,
+                &project_name,
+                &[runtime_compose_path.as_path()],
+                &["up", "-d", "--force-recreate", "--remove-orphans"],
+            )?;
+        } else {
+            run_compose_command(
+                &checkout_path,
+                &project_name,
+                &[runtime_compose_path.as_path()],
+                &["up", "-d", "--build", "--remove-orphans"],
+            )?;
+        }
+        let mapped_port = resolve_compose_service_port(
+            &checkout_path,
+            &project_name,
+            &[runtime_compose_path.as_path()],
+            &app_service,
+            app_port,
+        )?;
+        wait_for_compose_service_ready(
+            &checkout_path,
+            &project_name,
+            &[runtime_compose_path.as_path()],
+            &app_service,
+            deployment_id,
+            now_unix_ms,
+            self,
+        )?;
+
+        Ok(AppRuntimeRoute {
+            app_id,
+            deployment_id,
+            project_name,
+            service_name: app_service,
+            upstream_host: runtime_upstream_host(),
+            upstream_port: mapped_port,
+        })
     }
 
     fn retry_or_fail_deploy_job(
@@ -2304,6 +2744,10 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0006")?;
     conn.execute_batch(include_str!("../migrations/0007_compose_support.sql"))
         .context("failed running sqlite migration 0007")?;
+    conn.execute_batch(include_str!("../migrations/0008_runtime_routing.sql"))
+        .context("failed running sqlite migration 0008")?;
+    conn.execute_batch(include_str!("../migrations/0009_app_env_vars.sql"))
+        .context("failed running sqlite migration 0009")?;
     ensure_deployments_metadata_columns(conn)?;
     ensure_import_config_columns(conn)?;
 
@@ -2326,6 +2770,10 @@ fn ensure_import_config_columns(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "app_import_configs", "compose_json")? {
         conn.execute_batch("ALTER TABLE app_import_configs ADD COLUMN compose_json TEXT;")
             .context("failed adding app_import_configs.compose_json column")?;
+    }
+    if !column_exists(conn, "app_import_configs", "repo_clone_url")? {
+        conn.execute_batch("ALTER TABLE app_import_configs ADD COLUMN repo_clone_url TEXT;")
+            .context("failed adding app_import_configs.repo_clone_url column")?;
     }
     Ok(())
 }
@@ -2394,6 +2842,10 @@ fn to_u32(value: i64) -> Result<u32> {
     u32::try_from(value).context("value does not fit in u32")
 }
 
+fn to_u16(value: i64) -> Result<u16> {
+    u16::try_from(value).context("value does not fit in u16")
+}
+
 fn compute_backoff_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
     let shift = attempt.saturating_sub(1).min(16);
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
@@ -2420,6 +2872,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/apps", get(list_apps).post(create_app))
         .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
         .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
+        .route(
+            "/api/v1/apps/:app_id/env",
+            get(list_app_env_vars).put(upsert_app_env_var),
+        )
+        .route("/api/v1/apps/:app_id/env/:key", delete(delete_app_env_var))
         .route(
             "/api/v1/apps/:app_id/domains",
             get(list_domains).post(create_domain),
@@ -2542,6 +2999,17 @@ fn is_control_plane_host(host: &str) -> bool {
 
 fn normalize_domain(value: &str) -> String {
     value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_valid_env_var_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn is_reserved_control_plane_domain(domain: &str) -> bool {
@@ -2740,7 +3208,7 @@ fn render_app_frontdoor(
       <div class="cell"><strong>Profile</strong><code>{profile}</code></div>
       <div class="cell"><strong>Control Plane</strong><code><a href="https://localhost/">https://localhost</a></code></div>
     </div>
-    <p class="tip">Runtime container serving is not enabled yet. This endpoint confirms host routing and deployment ownership.</p>
+    <p class="tip">This frontdoor confirms host routing. Latest healthy compose deployments are served directly by runtime containers.</p>
   </main>
 </body>
 </html>"#,
@@ -3066,16 +3534,29 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       color: var(--danger);
     }
     .layout {
-      display: grid;
-      grid-template-columns: minmax(300px, 380px) minmax(420px, 1fr);
+      display: flex;
       gap: 14px;
+      align-items: flex-start;
+      min-width: 0;
     }
-    .stack { display: grid; gap: 14px; align-content: start; }
+    .layout > .stack:first-child {
+      flex: 0 0 clamp(300px, 32vw, 380px);
+    }
+    .layout > .stack:last-child {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .stack {
+      display: grid;
+      gap: 14px;
+      align-content: start;
+      min-width: 0;
+    }
     .card {
       background: var(--paper);
       border: 1px solid var(--line);
       border-radius: 12px;
-      box-shadow: var(--shadow);
+      box-shadow: 0 18px 28px -18px rgba(0, 0, 0, 0.8);
       padding: 14px;
       animation: rise .22s ease-out;
     }
@@ -3197,6 +3678,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       max-height: 360px;
       overflow: auto;
       white-space: pre-wrap;
+      overflow-wrap: anywhere;
       border-radius: 10px;
       background: #070d18;
       color: #d8f8ff;
@@ -3216,7 +3698,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       to { opacity: 1; transform: translateY(0); }
     }
     @media (max-width: 980px) {
-      .layout { grid-template-columns: 1fr; }
+      .layout { display: grid; grid-template-columns: 1fr; }
+      .layout > .stack:first-child,
+      .layout > .stack:last-child { flex: initial; }
       .triple { grid-template-columns: 1fr; }
     }
   </style>
@@ -3271,6 +3755,17 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           </div>
           <ul id="domains" class="list" style="margin-top:10px"></ul>
         </article>
+
+        <article class="card">
+          <h3>Environment</h3>
+          <div class="row">
+            <input id="env-key" placeholder="DATABASE_URL" />
+            <input id="env-value" placeholder="value" />
+            <button onclick="setEnvVar()">Set</button>
+          </div>
+          <ul id="env-vars" class="list" style="margin-top:10px"></ul>
+          <p class="hint">Applied to the app service during compose deployments.</p>
+        </article>
       </section>
 
       <section class="stack">
@@ -3284,7 +3779,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <h3>Routing & Runtime</h3>
           <ul id="routes" class="list"></ul>
           <p class="hint" id="runtime-note">
-            Deployments currently report pipeline state only. Runtime ports are not surfaced yet.
+            Latest healthy compose deployments are routed to live runtime containers.
           </p>
         </article>
 
@@ -3300,7 +3795,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let selectedAppName = null;
     let logsStream = null;
     let statusTimeout = null;
-    const selectedState = { domains: [], latestDeployment: null, config: null };
+    const selectedState = { domains: [], envVars: [], latestDeployment: null, config: null };
 
     function setStatus(message, level = 'ok') {
       const el = document.getElementById('status');
@@ -3350,7 +3845,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         empty.textContent = 'Select an app to inspect routing details.';
         routes.appendChild(empty);
         note.textContent =
-          'Deployments currently report pipeline state only. Runtime ports are not surfaced yet.';
+          'Latest healthy compose deployments are routed to live runtime containers.';
         return;
       }
 
@@ -3452,7 +3947,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
 
       note.textContent =
-        'Use the app localhost URL above to reach this app route. Runtime containers are not launched yet, so per-app listening ports are not available.';
+        'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
     }
 
     async function api(path, opts = {}) {
@@ -3478,6 +3973,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedApp = null;
         selectedAppName = null;
         selectedState.domains = [];
+        selectedState.envVars = [];
         selectedState.latestDeployment = null;
         selectedState.config = null;
         const empty = document.createElement('li');
@@ -3486,6 +3982,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         apps.appendChild(empty);
         setSelectedPill(null);
         renderRoutes();
+        document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
         return;
       }
 
@@ -3505,6 +4002,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <div class="item-actions">
             <button class="secondary" onclick="selectApp('${app.id}','${app.name}')">Open</button>
             <button onclick="deploy('${app.id}')">Deploy</button>
+            <button class="secondary" onclick="resyncRebuild('${app.id}')">Resync & Rebuild</button>
             <button class="secondary" onclick="rollback('${app.id}')">Rollback</button>
           </div>
         `;
@@ -3521,10 +4019,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedApp = null;
         selectedAppName = null;
         selectedState.domains = [];
+        selectedState.envVars = [];
         selectedState.latestDeployment = null;
         selectedState.config = null;
         setSelectedPill(null);
         renderRoutes();
+        document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
       }
     }
 
@@ -3576,12 +4076,14 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       selectedApp = appId;
       selectedAppName = appName || selectedAppName;
       selectedState.domains = [];
+      selectedState.envVars = [];
       selectedState.latestDeployment = null;
       selectedState.config = null;
       setSelectedPill(selectedAppName);
       renderRoutes();
       await refreshDeployments();
       await refreshDomains();
+      await refreshEnvVars();
       await refreshAppConfig();
       await refreshApps();
       startLogsStream();
@@ -3679,6 +4181,38 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
     }
 
+    async function refreshEnvVars() {
+      if (!selectedApp) return;
+      const res = await api(`/api/v1/apps/${selectedApp}/env`);
+      const data = await res.json();
+      selectedState.envVars = data.items;
+      const el = document.getElementById('env-vars');
+      el.innerHTML = '';
+
+      if (data.items.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No environment variables.';
+        el.appendChild(empty);
+        return;
+      }
+
+      for (const envVar of data.items) {
+        const li = document.createElement('li');
+        li.className = 'item-row';
+        li.innerHTML = `
+          <div class="item-main">
+            <strong>${envVar.key}</strong>
+            <code>${envVar.value}</code>
+          </div>
+          <div class="item-actions">
+            <button class="secondary" onclick="deleteEnvVar('${encodeURIComponent(envVar.key)}')">Delete</button>
+          </div>
+        `;
+        el.appendChild(li);
+      }
+    }
+
     async function refreshAppConfig() {
       if (!selectedApp) return;
       try {
@@ -3692,6 +4226,46 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }
       }
       renderRoutes();
+    }
+
+    async function setEnvVar() {
+      if (!selectedApp) {
+        setStatus('Select an app before editing environment variables.', 'warn');
+        return;
+      }
+      const key = document.getElementById('env-key').value.trim();
+      const value = document.getElementById('env-value').value;
+      if (!key) {
+        setStatus('Environment variable key is required.', 'warn');
+        return;
+      }
+      try {
+        await api(`/api/v1/apps/${selectedApp}/env`, {
+          method:'PUT',
+          headers:{'content-type':'application/json'},
+          body:JSON.stringify({ key, value })
+        });
+        document.getElementById('env-key').value = '';
+        document.getElementById('env-value').value = '';
+        setStatus(`Environment variable ${key} saved.`);
+        await refreshEnvVars();
+      } catch (error) {
+        setStatus(`Set env var failed: ${error.message}`, 'err');
+      }
+    }
+
+    async function deleteEnvVar(encodedKey) {
+      if (!selectedApp) return;
+      const key = decodeURIComponent(encodedKey);
+      try {
+        await api(`/api/v1/apps/${selectedApp}/env/${encodedKey}`, {
+          method:'DELETE'
+        });
+        setStatus(`Environment variable ${key} deleted.`);
+        await refreshEnvVars();
+      } catch (error) {
+        setStatus(`Delete env var failed: ${error.message}`, 'err');
+      }
     }
 
     async function addDomain() {
@@ -3732,6 +4306,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
     }
 
+    async function resyncRebuild(appId) {
+      try {
+        await api(`/api/v1/apps/${appId}/deployments`, {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body:JSON.stringify({ force_rebuild: true })
+        });
+        setStatus('Resync and rebuild queued.');
+        if (selectedApp === appId) refreshDeployments();
+      } catch (error) {
+        setStatus(`Resync/rebuild failed: ${error.message}`, 'err');
+      }
+    }
+
     async function rollback(appId) {
       try {
         await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
@@ -3756,9 +4344,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     });
 
     renderRoutes();
+    document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
     refreshApps().catch((error) => setStatus(`Initial load failed: ${error.message}`, 'err'));
     setInterval(() => refreshApps().catch(() => {}), 15000);
     setInterval(() => refreshDeployments().catch(() => {}), 4000);
+    setInterval(() => refreshEnvVars().catch(() => {}), 10000);
   </script>
 </body>
 </html>
@@ -4304,6 +4894,7 @@ async fn handle_github_webhook(
             image_ref: None,
             commit_sha: Some(payload.after.clone()),
             simulate_failures: Some(0),
+            force_rebuild: Some(false),
         };
         state
             .db
@@ -4373,6 +4964,111 @@ async fn get_app_effective_config(
     Ok(Json(config))
 }
 
+async fn list_app_env_vars(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AppEnvVarListResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/env",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let items = state
+        .db
+        .list_app_env_vars(app_id)
+        .map_err(internal_error)?
+        .into_iter()
+        .map(|item| AppEnvVarSummary {
+            app_id: item.app_id,
+            key: item.key,
+            value: item.value,
+            updated_at_unix_ms: item.updated_at_unix_ms,
+        })
+        .collect::<Vec<_>>();
+
+    Ok(Json(AppEnvVarListResponse { items }))
+}
+
+async fn upsert_app_env_var(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(payload): Json<UpsertAppEnvVarRequest>,
+) -> Result<(StatusCode, Json<AppEnvVarSummary>), StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Admin,
+        "PUT",
+        "/api/v1/apps/:app_id/env",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let key = payload.key.trim();
+    if !is_valid_env_var_key(key) || payload.value.len() > 16_384 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let record = state
+        .db
+        .upsert_app_env_var(app_id, key, &payload.value, now_unix_ms())
+        .map_err(internal_error)?;
+
+    Ok((
+        StatusCode::OK,
+        Json(AppEnvVarSummary {
+            app_id: record.app_id,
+            key: record.key,
+            value: record.value,
+            updated_at_unix_ms: record.updated_at_unix_ms,
+        }),
+    ))
+}
+
+async fn delete_app_env_var(
+    AxumPath((app_id, key)): AxumPath<(Uuid, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Admin,
+        "DELETE",
+        "/api/v1/apps/:app_id/env/:key",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let key = key.trim();
+    if !is_valid_env_var_key(key) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    if state
+        .db
+        .delete_app_env_var(app_id, key, now_unix_ms())
+        .map_err(internal_error)?
+    {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(StatusCode::NOT_FOUND)
+    }
+}
+
 async fn create_domain(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -4418,7 +5114,7 @@ async fn create_domain(
         .map_err(internal_error)?
         .ok_or(StatusCode::CONFLICT)?;
 
-    if let Err(error) = sync_caddyfile_from_domains(&state) {
+    if let Err(error) = sync_caddyfile_from_db(&state.db) {
         warn!(%error, "failed syncing caddyfile after domain change");
     }
 
@@ -4604,6 +5300,7 @@ async fn rollback_deployment(
                 image_ref: Some(format!("rustploy/{app_id}:rollback")),
                 commit_sha: None,
                 simulate_failures: Some(0),
+                force_rebuild: Some(false),
             },
             now_unix_ms(),
             state.job_max_attempts,
@@ -4786,8 +5483,14 @@ fn verify_github_signature(
         .map_err(|_| StatusCode::UNAUTHORIZED)
 }
 
-fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
-    let domains = state.db.list_all_domains()?;
+fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
+    let domains = db.list_all_domains()?;
+    let apps = db.list_apps()?;
+    let runtimes = db.list_app_runtimes()?;
+    let runtime_by_app: HashMap<Uuid, AppRuntimeRoute> = runtimes
+        .into_iter()
+        .map(|runtime| (runtime.app_id, runtime))
+        .collect();
     let path =
         std::env::var("RUSTPLOY_CADDYFILE_PATH").unwrap_or_else(|_| "data/Caddyfile".to_string());
     let upstream = std::env::var("RUSTPLOY_UPSTREAM_ADDR")
@@ -4808,9 +5511,22 @@ fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
     content.push_str(&format!(
         "{CONTROL_PLANE_ALT_HOST} {{\n  reverse_proxy {upstream}\n}}\n\n"
     ));
-    content.push_str(&format!(
-        "*.localhost {{\n  reverse_proxy {upstream}\n}}\n\n"
-    ));
+
+    for app in apps {
+        let Some(runtime) = runtime_by_app.get(&app.id) else {
+            continue;
+        };
+        let slug = localhost_slug(&app.name);
+        if slug.is_empty() {
+            continue;
+        }
+        content.push_str(&format!("{slug}.localhost {{\n"));
+        content.push_str(&format!(
+            "  reverse_proxy {}:{}\n",
+            runtime.upstream_host, runtime.upstream_port
+        ));
+        content.push_str("}\n\n");
+    }
 
     for domain in domains {
         let normalized = normalize_domain(&domain.domain);
@@ -4829,9 +5545,19 @@ fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
                 content.push_str(&format!("  tls {cert} {key}\n"));
             }
         }
-        content.push_str(&format!("  reverse_proxy {upstream}\n"));
+        if let Some(runtime) = runtime_by_app.get(&domain.app_id) {
+            content.push_str(&format!(
+                "  reverse_proxy {}:{}\n",
+                runtime.upstream_host, runtime.upstream_port
+            ));
+        } else {
+            content.push_str(&format!("  reverse_proxy {upstream}\n"));
+        }
         content.push_str("}\n\n");
     }
+    content.push_str(&format!(
+        "*.localhost {{\n  reverse_proxy {upstream}\n}}\n\n"
+    ));
 
     fs::write(&path, content).with_context(|| format!("failed writing caddyfile at {path}"))?;
     Ok(())
@@ -4990,6 +5716,405 @@ fn clone_repository(clone_url: &str, branch: &str, target_path: &Path) -> Result
     } else {
         Err(StatusCode::BAD_GATEWAY)
     }
+}
+
+fn clone_repository_for_deploy(clone_url: &str, branch: &str, target_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("clone")
+        .arg("--depth")
+        .arg("1")
+        .arg("--branch")
+        .arg(branch)
+        .arg(clone_url)
+        .arg(target_path)
+        .output()
+        .with_context(|| format!("failed running git clone for {clone_url}@{branch}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    anyhow::bail!(
+        "git clone failed for {clone_url}@{branch}: {} {}",
+        stdout,
+        stderr
+    );
+}
+
+fn checkout_commit_for_deploy(repo_path: &Path, commit_sha: &str) -> Result<()> {
+    let fetch = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("fetch")
+        .arg("--depth")
+        .arg("1")
+        .arg("origin")
+        .arg(commit_sha)
+        .output()
+        .with_context(|| format!("failed fetching commit {commit_sha}"))?;
+    if !fetch.status.success() {
+        let stderr = String::from_utf8_lossy(&fetch.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&fetch.stdout).trim().to_string();
+        anyhow::bail!(
+            "git fetch failed for commit {commit_sha}: {} {}",
+            stdout,
+            stderr
+        );
+    }
+
+    let checkout = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .arg("checkout")
+        .arg("--detach")
+        .arg(commit_sha)
+        .output()
+        .with_context(|| format!("failed checking out commit {commit_sha}"))?;
+    if checkout.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&checkout.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&checkout.stdout).trim().to_string();
+        anyhow::bail!(
+            "git checkout failed for commit {commit_sha}: {} {}",
+            stdout,
+            stderr
+        );
+    }
+}
+
+fn runtime_root_path() -> PathBuf {
+    let configured = std::env::var("RUSTPLOY_RUNTIME_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/runtime"));
+    if configured.is_absolute() {
+        configured
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(configured)
+    }
+}
+
+fn runtime_checkout_path(root: &Path, app_id: Uuid) -> PathBuf {
+    root.join("checkouts").join(app_id.to_string())
+}
+
+fn runtime_upstream_host() -> String {
+    std::env::var("RUSTPLOY_RUNTIME_UPSTREAM_HOST")
+        .unwrap_or_else(|_| "host.docker.internal".to_string())
+}
+
+fn compose_project_name(app_id: Uuid) -> String {
+    let simple = app_id.simple().to_string();
+    let short = &simple[..12];
+    format!("rustploy-{short}")
+}
+
+fn detect_app_service_port(compose: &ComposeSummary, app_service: &str) -> Option<u16> {
+    compose
+        .services
+        .iter()
+        .find(|service| service.name == app_service)
+        .and_then(|service| {
+            service
+                .ports
+                .iter()
+                .find_map(|port| parse_compose_container_port(port))
+        })
+}
+
+fn parse_compose_container_port(value: &str) -> Option<u16> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_protocol = trimmed.split('/').next().unwrap_or(trimmed);
+    let tail = without_protocol
+        .rsplit(':')
+        .next()
+        .unwrap_or(without_protocol);
+    if tail.contains('-') {
+        return None;
+    }
+    tail.trim().parse::<u16>().ok()
+}
+
+fn write_runtime_compose_file(
+    source_compose_path: &Path,
+    runtime_compose_path: &Path,
+    app_service: &str,
+    app_port: u16,
+    app_env: &HashMap<String, String>,
+) -> Result<()> {
+    let raw = fs::read_to_string(source_compose_path).with_context(|| {
+        format!(
+            "failed reading source compose file {}",
+            source_compose_path.display()
+        )
+    })?;
+    let mut parsed: serde_yaml::Value = serde_yaml::from_str(&raw)
+        .with_context(|| format!("invalid yaml in {}", source_compose_path.display()))?;
+    let services = parsed
+        .get_mut("services")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .context("compose file has no services mapping")?;
+
+    for (service_name, service_config) in services.iter_mut() {
+        let Some(service_name) = service_name.as_str() else {
+            continue;
+        };
+        let Some(service_map) = service_config.as_mapping_mut() else {
+            continue;
+        };
+        service_map.remove(&serde_yaml::Value::String("volumes".to_string()));
+        if service_name == app_service {
+            let mut port = serde_yaml::Mapping::new();
+            port.insert(
+                serde_yaml::Value::String("target".to_string()),
+                serde_yaml::Value::Number(serde_yaml::Number::from(i64::from(app_port))),
+            );
+            port.insert(
+                serde_yaml::Value::String("published".to_string()),
+                serde_yaml::Value::String("0".to_string()),
+            );
+            service_map.insert(
+                serde_yaml::Value::String("ports".to_string()),
+                serde_yaml::Value::Sequence(vec![serde_yaml::Value::Mapping(port)]),
+            );
+            merge_service_environment(service_map, app_env);
+        } else {
+            service_map.remove(&serde_yaml::Value::String("ports".to_string()));
+        }
+    }
+
+    let rendered = serde_yaml::to_string(&parsed)
+        .with_context(|| format!("failed serializing {}", source_compose_path.display()))?;
+    if let Some(parent) = runtime_compose_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed creating {}", parent.display()))?;
+        }
+    }
+    fs::write(runtime_compose_path, rendered).with_context(|| {
+        format!(
+            "failed writing runtime compose file {}",
+            runtime_compose_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn merge_service_environment(
+    service_map: &mut serde_yaml::Mapping,
+    app_env: &HashMap<String, String>,
+) {
+    if app_env.is_empty() {
+        return;
+    }
+
+    let env_key = serde_yaml::Value::String("environment".to_string());
+    let existing = service_map.remove(&env_key);
+    let mut merged = serde_yaml::Mapping::new();
+
+    if let Some(existing) = existing {
+        merge_existing_environment(&mut merged, existing);
+    }
+    for (key, value) in app_env {
+        merged.insert(
+            serde_yaml::Value::String(key.clone()),
+            serde_yaml::Value::String(value.clone()),
+        );
+    }
+
+    service_map.insert(env_key, serde_yaml::Value::Mapping(merged));
+}
+
+fn merge_existing_environment(target: &mut serde_yaml::Mapping, existing: serde_yaml::Value) {
+    match existing {
+        serde_yaml::Value::Mapping(map) => {
+            for (key, value) in map {
+                let Some(normalized_key) = yaml_scalar_to_string(&key) else {
+                    continue;
+                };
+                target.insert(serde_yaml::Value::String(normalized_key), value);
+            }
+        }
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                if let Some((key, value)) = parse_compose_env_entry(&item) {
+                    target.insert(key, value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn parse_compose_env_entry(
+    item: &serde_yaml::Value,
+) -> Option<(serde_yaml::Value, serde_yaml::Value)> {
+    let text = item.as_str()?;
+    if let Some((key, value)) = text.split_once('=') {
+        return Some((
+            serde_yaml::Value::String(key.trim().to_string()),
+            serde_yaml::Value::String(value.to_string()),
+        ));
+    }
+    Some((
+        serde_yaml::Value::String(text.trim().to_string()),
+        serde_yaml::Value::Null,
+    ))
+}
+
+fn compose_base_command() -> Result<Vec<String>> {
+    let docker_compose = Command::new("docker")
+        .arg("compose")
+        .arg("version")
+        .output();
+    if matches!(docker_compose, Ok(output) if output.status.success()) {
+        return Ok(vec!["docker".to_string(), "compose".to_string()]);
+    }
+
+    let docker_compose_bin = Command::new("docker-compose").arg("version").output();
+    if matches!(docker_compose_bin, Ok(output) if output.status.success()) {
+        return Ok(vec!["docker-compose".to_string()]);
+    }
+
+    anyhow::bail!(
+        "docker compose is not available; install docker compose and expose /var/run/docker.sock"
+    );
+}
+
+fn run_compose_command(
+    working_dir: &Path,
+    project_name: &str,
+    files: &[&Path],
+    args: &[&str],
+) -> Result<String> {
+    let base = compose_base_command()?;
+    let mut cmd = Command::new(&base[0]);
+    if base.len() > 1 {
+        cmd.arg(&base[1]);
+    }
+    cmd.current_dir(working_dir)
+        .arg("--project-name")
+        .arg(project_name);
+    for file in files {
+        cmd.arg("-f").arg(file);
+    }
+    for arg in args {
+        cmd.arg(arg);
+    }
+
+    let output = cmd.output().context("failed executing compose command")?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(
+            "compose command failed ({}): {} {}",
+            args.join(" "),
+            stdout,
+            stderr
+        );
+    }
+}
+
+fn resolve_compose_service_port(
+    working_dir: &Path,
+    project_name: &str,
+    files: &[&Path],
+    service_name: &str,
+    target_port: u16,
+) -> Result<u16> {
+    let target = target_port.to_string();
+    let output = run_compose_command(
+        working_dir,
+        project_name,
+        files,
+        &["port", service_name, &target],
+    )?;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(port) = parse_published_port(trimmed) {
+            return Ok(port);
+        }
+    }
+    anyhow::bail!(
+        "unable to resolve published port for compose service {}:{}",
+        service_name,
+        target_port
+    );
+}
+
+fn parse_published_port(value: &str) -> Option<u16> {
+    value.rsplit(':').next()?.trim().parse::<u16>().ok()
+}
+
+fn wait_for_compose_service_ready(
+    working_dir: &Path,
+    project_name: &str,
+    files: &[&Path],
+    service_name: &str,
+    deployment_id: Uuid,
+    now_unix_ms: u64,
+    db: &Database,
+) -> Result<()> {
+    let container_id = run_compose_command(
+        working_dir,
+        project_name,
+        files,
+        &["ps", "-q", service_name],
+    )?;
+    let container_id = container_id
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|value| value.trim().to_string())
+        .context("compose service did not return a container id")?;
+
+    let timeout_secs = read_env_u64("RUSTPLOY_DEPLOY_READY_TIMEOUT_SECS", 90)?;
+    for _ in 0..timeout_secs {
+        let output = Command::new("docker")
+            .arg("inspect")
+            .arg("--format")
+            .arg("{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}} {{.State.ExitCode}}")
+            .arg(&container_id)
+            .output()
+            .context("failed inspecting compose service container")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("docker inspect failed for service {service_name}: {stderr}");
+        }
+        let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let mut parts = state.split_whitespace();
+        let status = parts.next().unwrap_or_default();
+        let health = parts.next().unwrap_or_default();
+
+        if status == "running" && (health.is_empty() || health == "healthy") {
+            return Ok(());
+        }
+        if status == "exited" || status == "dead" || health == "unhealthy" {
+            anyhow::bail!(
+                "compose service {} is not healthy (status={}, health={})",
+                service_name,
+                status,
+                health
+            );
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+
+    db.append_deployment_log(
+        deployment_id,
+        "service readiness timed out; marking deployment as failed",
+        now_unix_ms,
+    )?;
+    anyhow::bail!("compose service readiness timed out for {}", service_name);
 }
 
 fn read_manifest(
@@ -5432,6 +6557,80 @@ fn parse_compose_ports(value: Option<&Vec<serde_yaml::Value>>) -> Vec<String> {
     }
 
     ports
+}
+
+fn parse_compose_env_files(value: Option<&serde_yaml::Value>) -> Vec<String> {
+    let mut files = Vec::new();
+    let Some(value) = value else {
+        return files;
+    };
+    match value {
+        serde_yaml::Value::String(single) => files.push(single.to_string()),
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                if let Some(text) = item.as_str() {
+                    files.push(text.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+    files
+}
+
+fn ensure_compose_env_files(repo_path: &Path, compose_filename: &str) -> Result<Vec<PathBuf>> {
+    let compose_path = repo_path.join(compose_filename);
+    let raw = fs::read_to_string(&compose_path)
+        .with_context(|| format!("unable to read {}", compose_path.display()))?;
+    let parsed: ComposeFileRaw = serde_yaml::from_str(&raw)
+        .with_context(|| format!("invalid yaml in {}", compose_path.display()))?;
+
+    let mut created = Vec::new();
+    for (_service_name, service) in parsed.services {
+        for env_file in parse_compose_env_files(service.env_file.as_ref()) {
+            let trimmed = env_file.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let relative_path = PathBuf::from(trimmed);
+            if relative_path.is_absolute() {
+                continue;
+            }
+            let env_path = repo_path.join(relative_path);
+            if env_path.exists() {
+                continue;
+            }
+            if let Some(parent) = env_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent).with_context(|| {
+                        format!("failed creating env_file directory {}", parent.display())
+                    })?;
+                }
+            }
+            let seed = env_example_contents(&env_path).unwrap_or_default();
+            fs::write(&env_path, seed)
+                .with_context(|| format!("failed creating env file {}", env_path.display()))?;
+            created.push(env_path);
+        }
+    }
+
+    Ok(created)
+}
+
+fn env_example_contents(env_path: &Path) -> Option<String> {
+    let parent = env_path.parent()?;
+    let filename = env_path.file_name()?.to_string_lossy();
+    let mut candidate = parent.join(format!("{filename}.example"));
+    if candidate.exists() {
+        return fs::read_to_string(candidate).ok();
+    }
+    if filename == ".env" {
+        candidate = parent.join(".env.example");
+        if candidate.exists() {
+            return fs::read_to_string(candidate).ok();
+        }
+    }
+    None
 }
 
 fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
@@ -6676,6 +7875,97 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["items"][0]["domain"], json!("example.test"));
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_env_vars_can_be_upserted_listed_and_deleted() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let app_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"env-app"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_body = to_bytes(app_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_json: Value = serde_json::from_slice(&app_body).unwrap();
+        let app_id = app_json["id"].as_str().unwrap();
+
+        let upsert = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/v1/apps/{app_id}/env"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"key":"DATABASE_URL","value":"postgres://covach:covach@db:5432/covach"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(upsert.status(), StatusCode::OK);
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/env"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed_body = to_bytes(listed.into_body(), usize::MAX).await.unwrap();
+        let listed_json: Value = serde_json::from_slice(&listed_body).unwrap();
+        assert_eq!(listed_json["items"][0]["key"], json!("DATABASE_URL"));
+        assert_eq!(
+            listed_json["items"][0]["value"],
+            json!("postgres://covach:covach@db:5432/covach")
+        );
+
+        let deleted = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/api/v1/apps/{app_id}/env/DATABASE_URL"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+
+        let listed_after_delete = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/env"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed_after_delete.status(), StatusCode::OK);
+        let listed_after_delete_body = to_bytes(listed_after_delete.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listed_after_delete_json: Value =
+            serde_json::from_slice(&listed_after_delete_body).unwrap();
+        assert_eq!(listed_after_delete_json["items"], json!([]));
 
         cleanup_db(&db_path);
     }

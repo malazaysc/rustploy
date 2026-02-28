@@ -2,36 +2,42 @@
 
 ## High-level components
 
-- `rustploy-server`: API, scheduler, state machine, and UI serving.
-- `rustploy-agent`: host-side runtime executor and telemetry bridge.
+- `rustploy-server`: API, reconciler, deployment executor, and embedded dashboard UI.
+- `rustploy-agent`: lightweight heartbeat/agent telemetry process.
 - `rustploy-tui`: terminal operator client consuming `/api/v1`.
-- `build subsystem`: repository detection and image build pipeline.
-- `sqlite` (default): desired/actual state and durable job queue.
-- `caddy` (default): ingress and TLS automation.
+- `sqlite` (default): durable state, queue, auth, routing, and deployment history.
+- `caddy` (default): ingress/router and TLS termination.
+- `docker compose` runtime: per-app compose projects started by `rustploy-server` via Docker socket.
 
-## Data model (initial)
+## Data model (current)
 
-- `apps`: metadata, owner, runtime config.
-- `deployments`: image/tag/SHA, status, timestamps.
-- `jobs`: durable command queue with retries/backoff.
-- `domains`: hostname and TLS state.
-- `github_integrations`: installation/repo mapping.
-- `api_tokens`: token hash, scope, expiry, revocation state.
-- `audit_events`: security and deployment event trail.
+- `apps`: app metadata.
+- `app_import_configs`: repo/source/build detection and compose summary.
+- `app_env_vars`: per-app runtime environment variables.
+- `deployments`: deployment requests and state.
+- `deployment_logs`: deployment event/log lines.
+- `jobs`: durable reconciler queue with retry/backoff.
+- `app_runtimes`: active runtime route target per app.
+- `domains`: domain and TLS mode mappings.
+- `managed_services`: generated credentials/endpoints for managed dependency placeholders.
+- `github_integrations`: owner/repo/branch mapping for webhook-triggered deploys.
+- `api_tokens` + `token_audit_events`: machine auth and API audit trail.
+- `users`, `sessions`, `password_reset_tokens`: dashboard auth/session lifecycle.
+- `agents`, `agent_heartbeats`: agent registration and liveness.
 
 ## Control flow
 
-1. API updates desired state.
-2. Reconciler compares desired vs actual state.
-3. Reconciler writes jobs to queue.
-4. Agent executes jobs via container runtime API.
-5. Agent reports status back to server.
+1. API request creates/updates desired state (for example import, env var update, deploy request).
+2. Deploy request inserts deployment row + queued job.
+3. Reconciler claims due jobs and executes deployment in-process.
+4. For compose deploys, server clones repo, prepares runtime compose, injects app env vars, and runs Docker Compose.
+5. Server records logs/status, updates app runtime route, and re-syncs Caddy routing.
 
-## Initial tech choices
+## Tech stack
 
-- Rust: `axum`, `tokio`, `serde`, `sqlx`, `tracing`.
-- Runtime API: Docker-compatible API first.
-- UI: server-rendered Rust web UI with selective hydration.
-- API contract: generated OpenAPI document for `/api/v1`.
-- TUI: `ratatui` + `crossterm` client for SSH-based operations.
-- Manifest: repository-level `rustploy.yaml` parser for deployment intent.
+- Rust: `axum`, `tokio`, `serde`, `rusqlite`, `tracing`.
+- Runtime integration: Docker CLI + Compose plugin (`docker compose`) through mounted Docker socket.
+- UI: server-rendered HTML/CSS/JS dashboard served by `rustploy-server`.
+- API contract: OpenAPI source in `openapi.yaml` (versioned HTTP API under `/api/v1`).
+- TUI: `ratatui` + `crossterm` for SSH-friendly operations.
+- Manifest: lightweight `rustploy.yaml` parser for import-time build/dependency hints.

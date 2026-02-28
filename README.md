@@ -78,6 +78,7 @@ This starts:
 - `caddy` on `http://localhost:8080` (front door for UI + API)
 - `server` and `agent` on the internal compose network
 - `agent` sending periodic heartbeats to `server`
+- `server` with Docker socket access so compose-based app deployments run real containers
 
 Useful checks:
 
@@ -91,6 +92,8 @@ curl -b /tmp/rustploy.cookies -X POST http://localhost:8080/api/v1/apps \
   -H 'content-type: application/json' \
   -d '{"name":"demo"}'
 ```
+
+Compose deployments are now real runtime deploys (not simulation): Rustploy clones the repo, generates a runtime compose file (ephemeral app port mapping + no host bind mounts), runs `docker compose up -d --build`, and routes `<app-slug>.localhost` to the deployed app service.
 
 To enforce shared-token auth between agent and server, set the same `RUSTPLOY_AGENT_TOKEN` value in both services inside `docker-compose.yml`.
 
@@ -124,6 +127,15 @@ curl -X POST http://localhost:8080/api/v1/apps/<app-id>/rollback \
   -H "Authorization: Bearer <deploy-or-admin-token>"
 ```
 
+- Manual resync + force rebuild (no build cache):
+
+```bash
+curl -X POST http://localhost:8080/api/v1/apps/<app-id>/deployments \
+  -H "Authorization: Bearer <deploy-or-admin-token>" \
+  -H 'content-type: application/json' \
+  -d '{"force_rebuild":true}'
+```
+
 - Add domain mapping:
 
 ```bash
@@ -131,6 +143,15 @@ curl -X POST http://localhost:8080/api/v1/apps/<app-id>/domains \
   -H "Authorization: Bearer <admin-token>" \
   -H 'content-type: application/json' \
   -d '{"domain":"app.example.com","tls_mode":"managed"}'
+```
+
+- Set app environment variable:
+
+```bash
+curl -X PUT http://localhost:8080/api/v1/apps/<app-id>/env \
+  -H "Authorization: Bearer <admin-token>" \
+  -H 'content-type: application/json' \
+  -d '{"key":"DATABASE_URL","value":"postgres://covach:covach@db:5432/covach"}'
 ```
 
 - GitHub webhook signature verification:

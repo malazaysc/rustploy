@@ -14,6 +14,7 @@ services:
     environment:
       RUSTPLOY_SERVER_ADDR: 0.0.0.0:8080
       RUSTPLOY_DB_PATH: /data/rustploy.db
+      RUSTPLOY_RUNTIME_ROOT: /data/runtime
       RUSTPLOY_CADDYFILE_PATH: /shared/Caddyfile
       RUSTPLOY_UPSTREAM_ADDR: server:8080
       RUSTPLOY_ADMIN_EMAIL: admin@localhost
@@ -23,6 +24,7 @@ services:
     volumes:
       - rustploy-data:/data
       - rustploy-shared:/shared
+      - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - sqlite
 
@@ -56,6 +58,8 @@ services:
       - rustploy-shared:/shared:ro
       - rustploy-caddy:/data
       - rustploy-caddy-config:/config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       - server
     restart: unless-stopped

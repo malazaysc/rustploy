@@ -4,6 +4,7 @@ This repository starts documentation-first. Use these docs as the product and de
 
 ## Core docs
 
+- [Current Status](./status.md)
 - [Vision](./vision.md)
 - [Product Requirements](./product-requirements.md)
 - [Architecture](./architecture.md)

@@ -31,3 +31,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Structured manifest validation errors for import requests.
 - Effective app config endpoint (`GET /api/v1/apps/:id/config`) and TUI config inspection command.
 - Deployment logs persistence and logs endpoint (`GET /api/v1/apps/:id/deployments/:deployment_id/logs`) with TUI `logs` command.
+- Compose runtime deployment execution against real Docker Compose projects (clone/build/up/health checks) with runtime routing persistence.
+- App environment variable management (`GET/PUT/DELETE /api/v1/apps/:id/env`) with dashboard controls and runtime injection into app service environment.
+- Manual deployment resync/rebuild support via `force_rebuild` deployment option and dashboard "Resync & Rebuild" action.
+- Documentation governance baseline: root `AGENTS.md`, `docs/status.md`, PR template checklist, and CI `docs-guard` enforcement.

@@ -9,10 +9,15 @@ COPY crates ./crates
 ARG APP_BIN=server
 RUN cargo build --release -p ${APP_BIN}
 
+FROM docker:27-cli AS dockercli
+
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates git \
     && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /usr/local/libexec/docker/cli-plugins
+COPY --from=dockercli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=dockercli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
 
 ARG APP_BIN=server
 COPY --from=builder /app/target/release/${APP_BIN} /usr/local/bin/rustploy

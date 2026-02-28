@@ -8,7 +8,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 
 ## API principles
 
-- Versioned HTTP API under `/api/v1`.
+- Versioned HTTP API under `/api/v1` (with `/metrics` exposed at root).
 - JSON request/response format.
 - Idempotent deployment operations where possible.
 - Auditability for token usage and deploy actions.
@@ -34,6 +34,9 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
 - `GET /api/v1/apps/{app_id}/config`
+- `GET /api/v1/apps/{app_id}/env`
+- `PUT /api/v1/apps/{app_id}/env`
+- `DELETE /api/v1/apps/{app_id}/env/{key}`
 - `POST /api/v1/apps/{app_id}/domains`
 - `GET /api/v1/apps/{app_id}/domains`
 - `POST /api/v1/apps/{app_id}/deployments`
@@ -60,6 +63,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Keep API compatibility stable across web and TUI client releases.
 - Return detected package manager and build profile in import responses.
 - Return structured validation errors for invalid `rustploy.yaml` manifests.
+- Support manual `force_rebuild` deploys (`POST /api/v1/apps/{app_id}/deployments`).
 
 ## Bootstrap behavior
 

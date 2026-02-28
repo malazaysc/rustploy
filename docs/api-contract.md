@@ -3,7 +3,7 @@
 This document summarizes the currently implemented wire contract.
 The canonical machine-readable source is [`../openapi.yaml`](../openapi.yaml).
 
-Base path: `/api/v1`
+Base path: `/api/v1` (metrics endpoint is additionally exposed at `/metrics`).
 
 ## Common conventions
 
@@ -21,14 +21,16 @@ Base path: `/api/v1`
 
 ## Implemented endpoint groups
 
-- Health/metrics: `GET /health`, `GET /metrics`
+- Health/metrics: `GET /health` (also exposed at `/api/v1/health`), `GET /metrics`
 - Auth: `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, password reset endpoints
 - Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
 - Effective config: `GET /apps/{app_id}/config`
+- Env vars: `GET/PUT /apps/{app_id}/env`, `DELETE /apps/{app_id}/env/{key}`
 - Domains: `GET/POST /apps/{app_id}/domains`
 - GitHub: `POST /apps/{app_id}/github`, `POST /integrations/github/webhook`
 - Deployments: `GET/POST /apps/{app_id}/deployments`, `GET /apps/{app_id}/deployments/{deployment_id}/logs`, `GET /apps/{app_id}/logs/stream`, `POST /apps/{app_id}/rollback`
+  - `POST /apps/{app_id}/deployments` supports optional `force_rebuild: true` for no-cache compose rebuilds.
 - Tokens: `GET/POST /tokens`, `DELETE /tokens/{token_id}`
 
 ## Example: create admin token

@@ -98,6 +98,7 @@ pub struct CreateDeploymentRequest {
     pub image_ref: Option<String>,
     pub commit_sha: Option<String>,
     pub simulate_failures: Option<u32>,
+    pub force_rebuild: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -353,6 +354,25 @@ pub struct CreateDomainRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DomainListResponse {
     pub items: Vec<DomainSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppEnvVarSummary {
+    pub app_id: Uuid,
+    pub key: String,
+    pub value: String,
+    pub updated_at_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppEnvVarListResponse {
+    pub items: Vec<AppEnvVarSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpsertAppEnvVarRequest {
+    pub key: String,
+    pub value: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

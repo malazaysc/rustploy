@@ -1,39 +1,28 @@
 # Deployment State Machine (v0.1)
 
-This defines deployment lifecycle states and allowed transitions.
+This defines the currently implemented deployment lifecycle states and transitions.
 
 ## States
 
 - `queued`: deployment accepted and waiting for worker.
-- `preparing`: repository checkout and build context setup.
-- `building`: container image build in progress.
-- `pushing`: image push to registry (if required).
-- `pulling`: runtime host pulling target image.
-- `starting`: container start/restart in progress.
+- `deploying`: deployment job running (clone/build/run/health checks).
+- `retrying`: previous deploy attempt failed but job will retry.
 - `healthy`: health check succeeded and deployment is active.
 - `failed`: deployment failed and did not become healthy.
-- `rolling_back`: rollback operation in progress.
-- `rolled_back`: previous healthy deployment restored.
 
 ## Allowed transitions
 
-- `queued -> preparing`
-- `preparing -> building | failed`
-- `building -> pushing | pulling | failed`
-- `pushing -> pulling | failed`
-- `pulling -> starting | failed`
-- `starting -> healthy | failed`
-- `failed -> rolling_back | terminal`
-- `rolling_back -> rolled_back | failed`
+- `queued -> deploying`
+- `deploying -> healthy | retrying | failed`
+- `retrying -> deploying | failed`
 
 ## Retry policy
 
-- Transient failures in `preparing/building/pushing/pulling` retry with bounded exponential backoff.
-- `starting` retries only for crash-loop threshold window.
-- Retries produce audit events and preserve prior logs.
+- Failed deploy attempts transition to `retrying` while attempts remain.
+- Retry delay uses bounded exponential backoff.
+- Each attempt appends deployment logs and preserves prior failure context.
 
 ## Terminal states
 
 - `healthy`
-- `failed` (when no rollback requested)
-- `rolled_back`
+- `failed`

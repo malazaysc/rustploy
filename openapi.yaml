@@ -64,6 +64,8 @@ components:
         simulate_failures:
           type: [integer, 'null']
           minimum: 0
+        force_rebuild:
+          type: [boolean, 'null']
     CreateDeploymentAccepted:
       type: object
       required: [deployment_id, status, queued_at_unix_ms]
@@ -182,6 +184,15 @@ components:
           type: [string, 'null']
         commit_sha:
           type: [string, 'null']
+    RuntimeConfig:
+      type: object
+      properties:
+        port:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 65535
+        healthcheck_path:
+          type: [string, 'null']
     DependencyProfile:
       type: object
       properties:
@@ -199,9 +210,11 @@ components:
           $ref: '#/components/schemas/SourceRef'
         build_mode:
           type: [string, 'null']
-          enum: [auto, dockerfile, null]
+          enum: [auto, dockerfile, compose, null]
         runtime:
           type: [object, 'null']
+          allOf:
+            - $ref: '#/components/schemas/RuntimeConfig'
         dependency_profile:
           $ref: '#/components/schemas/DependencyProfile'
     DetectionResult:
@@ -212,13 +225,46 @@ components:
           type: string
         package_manager:
           type: string
-          enum: [npm, pnpm, yarn]
         lockfile:
           type: [string, 'null']
         build_profile:
           type: string
         dockerfile_present:
           type: boolean
+    ComposeServiceSummary:
+      type: object
+      required: [name, build, depends_on, ports, profiles]
+      properties:
+        name:
+          type: string
+        image:
+          type: [string, 'null']
+        build:
+          type: boolean
+        depends_on:
+          type: array
+          items:
+            type: string
+        ports:
+          type: array
+          items:
+            type: string
+        profiles:
+          type: array
+          items:
+            type: string
+    ComposeSummary:
+      type: object
+      required: [file, services]
+      properties:
+        file:
+          type: string
+        app_service:
+          type: [string, 'null']
+        services:
+          type: array
+          items:
+            $ref: '#/components/schemas/ComposeServiceSummary'
     NextAction:
       type: object
       required: [action_type, deploy_endpoint]
@@ -235,6 +281,10 @@ components:
           $ref: '#/components/schemas/App'
         detection:
           $ref: '#/components/schemas/DetectionResult'
+        compose:
+          type: [object, 'null']
+          allOf:
+            - $ref: '#/components/schemas/ComposeSummary'
         next_action:
           $ref: '#/components/schemas/NextAction'
     EffectiveAppConfigResponse:
@@ -250,9 +300,13 @@ components:
           $ref: '#/components/schemas/SourceRef'
         build_mode:
           type: string
-          enum: [auto, dockerfile]
+          enum: [auto, dockerfile, compose]
         detection:
           $ref: '#/components/schemas/DetectionResult'
+        compose:
+          type: [object, 'null']
+          allOf:
+            - $ref: '#/components/schemas/ComposeSummary'
         dependency_profile:
           $ref: '#/components/schemas/DependencyProfile'
         manifest:
@@ -379,6 +433,36 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DomainSummary'
+    UpsertAppEnvVarRequest:
+      type: object
+      required: [key, value]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+    AppEnvVarSummary:
+      type: object
+      required: [app_id, key, value, updated_at_unix_ms]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        key:
+          type: string
+        value:
+          type: string
+        updated_at_unix_ms:
+          type: integer
+          format: int64
+    AppEnvVarListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppEnvVarSummary'
     CreateTokenRequest:
       type: object
       required: [name, scopes]
@@ -511,6 +595,8 @@ paths:
     get:
       summary: Prometheus metrics snapshot
       operationId: metrics
+      servers:
+        - url: /
       responses:
         '200':
           description: Metrics payload
@@ -768,6 +854,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/EffectiveAppConfigResponse'
+  /apps/{app_id}/env:
+    get:
+      summary: List app environment variables
+      operationId: listAppEnvVars
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: App environment variables
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppEnvVarListResponse'
+    put:
+      summary: Create or update app environment variable
+      operationId: upsertAppEnvVar
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertAppEnvVarRequest'
+      responses:
+        '200':
+          description: Environment variable upserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppEnvVarSummary'
+  /apps/{app_id}/env/{key}:
+    delete:
+      summary: Delete app environment variable
+      operationId: deleteAppEnvVar
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: key
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Environment variable deleted
   /apps/{app_id}/domains:
     get:
       summary: List domains for app

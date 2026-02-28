@@ -12,7 +12,7 @@ Rustploy can generate a Caddyfile from app domain mappings.
 
 ## Docker Compose
 
-The default `docker-compose.yml` includes a `caddy` service with persistent `caddy` and `caddy-config` volumes so certificate state survives restarts/upgrades.
+The default `docker-compose.yml` includes a `caddy` service with persistent `rustploy-caddy` and `rustploy-caddy-config` volumes so certificate state survives restarts/upgrades.
 
 ## API
 
