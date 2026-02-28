@@ -42,4 +42,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `3a5d20e`
+- Commit base: `ec50054`
+- Note: follow-up clippy cleanup in `crates/server/src/lib.rs` with no API/runtime behavior change.

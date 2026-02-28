@@ -6,6 +6,10 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 
 ## [Unreleased]
 
+### Changed
+
+- Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
+
 ### Added
 
 - Documentation-first project structure.
