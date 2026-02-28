@@ -43,5 +43,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `ec50054`
-- Note: follow-up clippy cleanup in `crates/server/src/lib.rs` with no API/runtime behavior change.
+- Commit base: `f8f75c1`
+- Note: live log streaming hardening now redacts failure-path command text and safely handles non-UTF8 process output.

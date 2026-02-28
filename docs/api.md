@@ -63,6 +63,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Keep API compatibility stable across web and TUI client releases.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes updated deployment log content whenever new lines arrive from compose/git runtime commands.
+- Streamed runtime command logs are UTF-8 tolerant (lossy decode) and apply redaction before surfaced failure text.
 - Return detected package manager and build profile in import responses.
 - Return structured validation errors for invalid `rustploy.yaml` manifests.
 - Support manual `force_rebuild` deploys (`POST /api/v1/apps/{app_id}/deployments`).
