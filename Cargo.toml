@@ -15,6 +15,7 @@ hex = "0.4.3"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
 sha2 = "0.10.8"
 tokio = { version = "1.38.1", features = ["full"] }
 tracing = "0.1.40"

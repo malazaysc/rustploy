@@ -234,6 +234,23 @@ pub struct DetectionResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeServiceSummary {
+    pub name: String,
+    pub image: Option<String>,
+    pub build: bool,
+    pub depends_on: Vec<String>,
+    pub ports: Vec<String>,
+    pub profiles: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ComposeSummary {
+    pub file: String,
+    pub app_service: Option<String>,
+    pub services: Vec<ComposeServiceSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextAction {
     pub action_type: String,
     pub deploy_endpoint: String,
@@ -243,6 +260,7 @@ pub struct NextAction {
 pub struct ImportAppResponse {
     pub app: AppSummary,
     pub detection: DetectionResult,
+    pub compose: Option<ComposeSummary>,
     pub next_action: NextAction,
 }
 
@@ -253,6 +271,7 @@ pub struct EffectiveAppConfigResponse {
     pub source: SourceRef,
     pub build_mode: String,
     pub detection: DetectionResult,
+    pub compose: Option<ComposeSummary>,
     pub dependency_profile: Option<DependencyProfile>,
     pub manifest: Option<serde_json::Value>,
 }

@@ -109,10 +109,13 @@ curl -X POST http://localhost:8080/api/v1/apps/import \
       "name": "next-app",
       "default_branch": "main"
     },
-    "source": { "branch": "main" },
-    "build_mode": "auto"
+    "source": { "branch": "main" }
   }'
 ```
+
+When omitted, `build_mode` is auto-detected:
+- `compose` when `docker-compose.yml`/`compose.yml` is present
+- `dockerfile`/`auto` for Dockerfile or Node/Next.js repos
 
 - Rollback last healthy source:
 

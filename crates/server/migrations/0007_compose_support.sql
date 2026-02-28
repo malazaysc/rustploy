@@ -1,0 +1,3 @@
+-- Intentionally left as a no-op.
+-- SQLite compatibility for this schema change is handled in Rust during startup
+-- via ensure_import_config_columns(), which conditionally adds compose_json.

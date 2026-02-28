@@ -46,7 +46,7 @@ services:
       [
         "sh",
         "-c",
-        "until [ -f /shared/Caddyfile ]; do sleep 1; done; exec caddy run --config /shared/Caddyfile --adapter caddyfile"
+        "until [ -f /shared/Caddyfile ]; do sleep 1; done; exec caddy run --watch --config /shared/Caddyfile --adapter caddyfile"
       ]
     ports:
       - "80:80"

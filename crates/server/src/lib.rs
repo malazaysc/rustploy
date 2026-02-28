@@ -24,10 +24,10 @@ use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered, AgentStatus,
     AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppListResponse, AppSummary,
-    AuthLoginRequest, AuthSessionResponse, CreateAppRequest, CreateDeploymentAccepted,
-    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
-    DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
-    DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
+    AuthLoginRequest, AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
+    CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
+    CreateTokenResponse, DependencyProfile, DeploymentListResponse, DeploymentLogsResponse,
+    DeploymentStatus, DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
     EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
     GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
     NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
@@ -51,12 +51,15 @@ const GITHUB_SIGNATURE_HEADER: &str = "x-hub-signature-256";
 const GITHUB_EVENT_HEADER: &str = "x-github-event";
 const AUTHORIZATION_HEADER: &str = "authorization";
 const COOKIE_HEADER: &str = "cookie";
+const HOST_HEADER: &str = "host";
 const SESSION_COOKIE_NAME: &str = "rustploy_session";
 const DEFAULT_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const DEFAULT_PASSWORD_RESET_TTL_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_ADMIN_EMAIL: &str = "admin@localhost";
 const DEFAULT_ADMIN_PASSWORD: &str = "admin";
 const DEFAULT_CADDY_UPSTREAM: &str = "127.0.0.1:8080";
+const CONTROL_PLANE_HOST: &str = "localhost";
+const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
 
 const SCOPE_READ: u8 = 1;
 const SCOPE_DEPLOY: u8 = 1 << 1;
@@ -146,6 +149,7 @@ struct ImportConfigRecord {
     source: SourceRef,
     build_mode: String,
     detection: DetectionResult,
+    compose: Option<ComposeSummary>,
     dependency_profile: Option<DependencyProfile>,
     manifest_json: Option<String>,
 }
@@ -203,6 +207,20 @@ struct ManifestDependencies {
 #[derive(Debug, Deserialize, Serialize)]
 struct ManifestDependencyToggle {
     enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeFileRaw {
+    services: HashMap<String, ComposeServiceRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ComposeServiceRaw {
+    image: Option<String>,
+    build: Option<serde_yaml::Value>,
+    depends_on: Option<serde_yaml::Value>,
+    ports: Option<Vec<serde_yaml::Value>>,
+    profiles: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,6 +614,75 @@ impl Database {
         Ok(items)
     }
 
+    fn find_app_by_name(&self, name: &str) -> Result<Option<AppSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id, name, created_at_unix_ms, updated_at_unix_ms
+                 FROM apps
+                 WHERE lower(name) = lower(?1)
+                 LIMIT 1",
+                params![name],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying app by name")?;
+
+        let Some((app_id_raw, app_name, created_raw, updated_raw)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(AppSummary {
+            id: Uuid::parse_str(&app_id_raw)
+                .with_context(|| format!("invalid app id in db: {app_id_raw}"))?,
+            name: app_name,
+            created_at_unix_ms: to_u64(created_raw)?,
+            updated_at_unix_ms: to_u64(updated_raw)?,
+        }))
+    }
+
+    fn find_app_by_domain(&self, domain: &str) -> Result<Option<AppSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT a.id, a.name, a.created_at_unix_ms, a.updated_at_unix_ms
+                 FROM domains d
+                 JOIN apps a ON a.id = d.app_id
+                 WHERE lower(d.domain) = lower(?1)
+                 LIMIT 1",
+                params![domain],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying app by domain")?;
+
+        let Some((app_id_raw, app_name, created_raw, updated_raw)) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(AppSummary {
+            id: Uuid::parse_str(&app_id_raw)
+                .with_context(|| format!("invalid app id in db: {app_id_raw}"))?,
+            name: app_name,
+            created_at_unix_ms: to_u64(created_raw)?,
+            updated_at_unix_ms: to_u64(updated_raw)?,
+        }))
+    }
+
     fn app_exists(&self, app_id: Uuid) -> Result<bool> {
         let conn = self.conn.lock().expect("database mutex poisoned");
 
@@ -629,6 +716,12 @@ impl Database {
             .map(serde_json::to_string)
             .transpose()
             .context("failed serializing dependency profile")?;
+        let compose_json = config
+            .compose
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("failed serializing compose summary")?;
 
         conn.execute(
             "INSERT INTO app_import_configs (
@@ -643,11 +736,12 @@ impl Database {
                 lockfile,
                 build_profile,
                 dockerfile_present,
+                compose_json,
                 dependency_profile_json,
                 manifest_json,
                 created_at_unix_ms,
                 updated_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?14)
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?15)
              ON CONFLICT(app_id) DO UPDATE SET
                 repo_provider = excluded.repo_provider,
                 repo_owner = excluded.repo_owner,
@@ -659,6 +753,7 @@ impl Database {
                 lockfile = excluded.lockfile,
                 build_profile = excluded.build_profile,
                 dockerfile_present = excluded.dockerfile_present,
+                compose_json = excluded.compose_json,
                 dependency_profile_json = excluded.dependency_profile_json,
                 manifest_json = excluded.manifest_json,
                 updated_at_unix_ms = excluded.updated_at_unix_ms",
@@ -678,6 +773,7 @@ impl Database {
                 } else {
                     0i64
                 },
+                compose_json,
                 dependency_profile_json,
                 config.manifest_json.as_deref(),
                 now,
@@ -704,6 +800,7 @@ impl Database {
                     lockfile,
                     build_profile,
                     dockerfile_present,
+                    compose_json,
                     dependency_profile_json,
                     manifest_json
                  FROM app_import_configs
@@ -724,6 +821,7 @@ impl Database {
                         row.get::<_, i64>(10)?,
                         row.get::<_, Option<String>>(11)?,
                         row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
                     ))
                 },
             )
@@ -742,6 +840,7 @@ impl Database {
             lockfile,
             build_profile,
             dockerfile_present,
+            compose_raw,
             dependency_profile_raw,
             manifest_raw,
         )) = row
@@ -749,6 +848,11 @@ impl Database {
             return Ok(None);
         };
 
+        let compose = compose_raw
+            .as_deref()
+            .map(serde_json::from_str::<ComposeSummary>)
+            .transpose()
+            .context("failed parsing compose summary json")?;
         let dependency_profile = dependency_profile_raw
             .as_deref()
             .map(serde_json::from_str::<DependencyProfile>)
@@ -782,6 +886,7 @@ impl Database {
                 build_profile,
                 dockerfile_present: dockerfile_present == 1,
             },
+            compose,
             dependency_profile,
             manifest,
         }))
@@ -1651,6 +1756,66 @@ impl Database {
         Ok(items)
     }
 
+    fn latest_deployment(&self, app_id: Uuid) -> Result<Option<DeploymentSummary>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT id, app_id, source_ref, image_ref, commit_sha, status, last_error, created_at_unix_ms, updated_at_unix_ms
+                 FROM deployments
+                 WHERE app_id = ?1
+                 ORDER BY created_at_unix_ms DESC
+                 LIMIT 1",
+                params![app_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying latest deployment")?;
+
+        let Some((
+            deployment_id_raw,
+            app_id_raw,
+            source_ref,
+            image_ref,
+            commit_sha,
+            status_raw,
+            last_error,
+            created_raw,
+            updated_raw,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        let status = DeploymentStatus::parse(&status_raw)
+            .with_context(|| format!("invalid deployment status in db: {status_raw}"))?;
+
+        Ok(Some(DeploymentSummary {
+            id: Uuid::parse_str(&deployment_id_raw)
+                .with_context(|| format!("invalid deployment id in db: {deployment_id_raw}"))?,
+            app_id: Uuid::parse_str(&app_id_raw)
+                .with_context(|| format!("invalid app id in db: {app_id_raw}"))?,
+            source_ref,
+            image_ref,
+            commit_sha,
+            status,
+            last_error,
+            created_at_unix_ms: to_u64(created_raw)?,
+            updated_at_unix_ms: to_u64(updated_raw)?,
+        }))
+    }
+
     fn latest_deployment_id_for_app(&self, app_id: Uuid) -> Result<Option<Uuid>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
         let row = conn
@@ -1741,44 +1906,77 @@ impl Database {
                 ),
                 now_unix_ms,
             )?;
+            if let Some(compose) = config.compose.as_ref() {
+                let app_service = compose.app_service.as_deref().unwrap_or("unknown");
+                self.append_deployment_log(
+                    payload.deployment_id,
+                    &format!(
+                        "compose file={} app_service={} services={}",
+                        compose.file,
+                        app_service,
+                        compose.services.len()
+                    ),
+                    now_unix_ms,
+                )?;
+            }
             if let Some(profile) = config.dependency_profile {
                 if profile.postgres == Some(true) {
-                    let postgres =
-                        self.ensure_managed_service(payload.app_id, "postgres", now_unix_ms)?;
-                    if !postgres.healthy {
-                        anyhow::bail!("postgres managed service is unhealthy");
+                    if let Some(image) =
+                        compose_image_for_dependency(config.compose.as_ref(), "postgres")
+                    {
+                        self.append_deployment_log(
+                            payload.deployment_id,
+                            &format!("compose dependency for postgres uses image {image}"),
+                            now_unix_ms,
+                        )?;
+                    } else {
+                        let postgres =
+                            self.ensure_managed_service(payload.app_id, "postgres", now_unix_ms)?;
+                        if !postgres.healthy {
+                            anyhow::bail!("postgres managed service is unhealthy");
+                        }
+                        let _database_url = format!(
+                            "postgres://{}:{}@{}:{}/app",
+                            postgres.username, postgres.password, postgres.host, postgres.port
+                        );
+                        self.append_deployment_log(
+                            payload.deployment_id,
+                            &format!(
+                                "managed dependency ready: postgres at {}:{}",
+                                postgres.host, postgres.port
+                            ),
+                            now_unix_ms,
+                        )?;
                     }
-                    let _database_url = format!(
-                        "postgres://{}:{}@{}:{}/app",
-                        postgres.username, postgres.password, postgres.host, postgres.port
-                    );
-                    self.append_deployment_log(
-                        payload.deployment_id,
-                        &format!(
-                            "managed dependency ready: postgres at {}:{}",
-                            postgres.host, postgres.port
-                        ),
-                        now_unix_ms,
-                    )?;
                 }
                 if profile.redis == Some(true) {
-                    let redis =
-                        self.ensure_managed_service(payload.app_id, "redis", now_unix_ms)?;
-                    if !redis.healthy {
-                        anyhow::bail!("redis managed service is unhealthy");
+                    if let Some(image) =
+                        compose_image_for_dependency(config.compose.as_ref(), "redis")
+                    {
+                        self.append_deployment_log(
+                            payload.deployment_id,
+                            &format!("compose dependency for redis uses image {image}"),
+                            now_unix_ms,
+                        )?;
+                    } else {
+                        let redis =
+                            self.ensure_managed_service(payload.app_id, "redis", now_unix_ms)?;
+                        if !redis.healthy {
+                            anyhow::bail!("redis managed service is unhealthy");
+                        }
+                        let _redis_url = format!(
+                            "redis://{}:{}@{}:{}",
+                            redis.username, redis.password, redis.host, redis.port
+                        );
+                        self.append_deployment_log(
+                            payload.deployment_id,
+                            &format!(
+                                "managed dependency ready: redis at {}:{}",
+                                redis.host, redis.port
+                            ),
+                            now_unix_ms,
+                        )?;
                     }
-                    let _redis_url = format!(
-                        "redis://{}:{}@{}:{}",
-                        redis.username, redis.password, redis.host, redis.port
-                    );
-                    self.append_deployment_log(
-                        payload.deployment_id,
-                        &format!(
-                            "managed dependency ready: redis at {}:{}",
-                            redis.host, redis.port
-                        ),
-                        now_unix_ms,
-                    )?;
                 }
             }
             if config.build_mode == "dockerfile" && !config.detection.dockerfile_present {
@@ -1788,6 +1986,14 @@ impl Database {
                     now_unix_ms,
                 )?;
                 anyhow::bail!("dockerfile mode requires Dockerfile in repository");
+            }
+            if config.build_mode == "compose" && config.compose.is_none() {
+                self.append_deployment_log(
+                    payload.deployment_id,
+                    "compose mode selected but docker compose file was not detected",
+                    now_unix_ms,
+                )?;
+                anyhow::bail!("compose mode requires docker-compose.yml/compose.yml in repository");
             }
             self.append_deployment_log(
                 payload.deployment_id,
@@ -2096,7 +2302,10 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         .context("failed running sqlite migration 0005")?;
     conn.execute_batch(include_str!("../migrations/0006_auth_domains_services.sql"))
         .context("failed running sqlite migration 0006")?;
+    conn.execute_batch(include_str!("../migrations/0007_compose_support.sql"))
+        .context("failed running sqlite migration 0007")?;
     ensure_deployments_metadata_columns(conn)?;
+    ensure_import_config_columns(conn)?;
 
     Ok(())
 }
@@ -2109,6 +2318,14 @@ fn ensure_deployments_metadata_columns(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "deployments", "commit_sha")? {
         conn.execute_batch("ALTER TABLE deployments ADD COLUMN commit_sha TEXT;")
             .context("failed adding deployments.commit_sha column")?;
+    }
+    Ok(())
+}
+
+fn ensure_import_config_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "app_import_configs", "compose_json")? {
+        conn.execute_batch("ALTER TABLE app_import_configs ADD COLUMN compose_json TEXT;")
+            .context("failed adding app_import_configs.compose_json column")?;
     }
     Ok(())
 }
@@ -2263,13 +2480,287 @@ async fn metrics_prometheus(
     ))
 }
 
-async fn dashboard_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<&'static str> {
+async fn dashboard_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+    if let Some(host) = request_host(&headers) {
+        match resolve_app_for_host(&state, &host) {
+            Ok(Some(app)) => {
+                let latest_deployment = state.db.latest_deployment(app.id).ok().flatten();
+                let config = state.db.get_import_config(app.id).ok().flatten();
+                return Html(render_app_frontdoor(
+                    &host,
+                    &app,
+                    latest_deployment.as_ref(),
+                    config.as_ref(),
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                warn!(%error, host, "failed resolving host app route");
+            }
+        }
+    }
+
     let session = authorize_session_request(&state, &headers).ok().flatten();
     if session.is_some() {
-        Html(DASHBOARD_HTML)
+        Html(DASHBOARD_HTML.to_string())
     } else {
-        Html(LOGIN_HTML)
+        Html(LOGIN_HTML.to_string())
     }
+}
+
+fn request_host(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(HOST_HEADER)?.to_str().ok()?;
+    let first = value.split(',').next()?.trim();
+    if first.is_empty() {
+        return None;
+    }
+
+    let stripped = if first.starts_with('[') {
+        first
+            .strip_prefix('[')
+            .and_then(|value| value.split(']').next())
+            .unwrap_or(first)
+    } else if let Some((host, port)) = first.rsplit_once(':') {
+        if port.chars().all(|ch| ch.is_ascii_digit()) {
+            host
+        } else {
+            first
+        }
+    } else {
+        first
+    };
+
+    Some(stripped.trim().to_ascii_lowercase())
+}
+
+fn is_control_plane_host(host: &str) -> bool {
+    host == CONTROL_PLANE_HOST
+        || host == CONTROL_PLANE_ALT_HOST
+        || host == "127.0.0.1"
+        || host == "::1"
+}
+
+fn normalize_domain(value: &str) -> String {
+    value.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+fn is_reserved_control_plane_domain(domain: &str) -> bool {
+    let normalized = normalize_domain(domain);
+    normalized == CONTROL_PLANE_HOST
+        || normalized == CONTROL_PLANE_ALT_HOST
+        || normalized == "127.0.0.1"
+        || normalized == "::1"
+}
+
+fn resolve_app_for_host(state: &AppState, host: &str) -> Result<Option<AppSummary>> {
+    if is_control_plane_host(host) {
+        return Ok(None);
+    }
+
+    if let Some(mapped) = state.db.find_app_by_domain(host)? {
+        return Ok(Some(mapped));
+    }
+
+    if let Some(app_name) = host.strip_suffix(".localhost") {
+        if !app_name.is_empty() && !app_name.contains('.') {
+            if let Some(app) = state.db.find_app_by_name(app_name)? {
+                return Ok(Some(app));
+            }
+            for app in state.db.list_apps()? {
+                if localhost_slug(&app.name) == app_name {
+                    return Ok(Some(app));
+                }
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+fn localhost_slug(value: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        let mapped = if ch.is_ascii_alphanumeric() {
+            Some(ch.to_ascii_lowercase())
+        } else {
+            None
+        };
+        match mapped {
+            Some(valid) => {
+                out.push(valid);
+                last_dash = false;
+            }
+            None => {
+                if !last_dash {
+                    out.push('-');
+                    last_dash = true;
+                }
+            }
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+fn render_app_frontdoor(
+    host: &str,
+    app: &AppSummary,
+    deployment: Option<&DeploymentSummary>,
+    config: Option<&EffectiveAppConfigResponse>,
+) -> String {
+    let app_name = escape_html(&app.name);
+    let host = escape_html(host);
+    let app_id = app.id;
+
+    let (status, source_ref, badge_class) = if let Some(deployment) = deployment {
+        (
+            deployment.status.as_str().to_string(),
+            deployment
+                .source_ref
+                .as_deref()
+                .unwrap_or("manual")
+                .to_string(),
+            if deployment.status == DeploymentStatus::Healthy {
+                "ok"
+            } else if deployment.status == DeploymentStatus::Failed {
+                "err"
+            } else {
+                "warn"
+            },
+        )
+    } else {
+        ("none".to_string(), "n/a".to_string(), "warn")
+    };
+
+    let profile = config
+        .map(|value| {
+            format!(
+                "{} / {}",
+                value.detection.framework, value.detection.package_manager
+            )
+        })
+        .unwrap_or_else(|| "not imported".to_string());
+
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{app_name}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;700&family=JetBrains+Mono:wght@500&display=swap');
+    :root {{
+      --bg: #060b14;
+      --grid: rgba(0, 245, 212, 0.06);
+      --panel: #111c33;
+      --line: #1f3655;
+      --ink: #dffaff;
+      --muted: #81a7ba;
+      --ok: #7affea;
+      --warn: #ffbe5c;
+      --err: #ff6b7d;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: 'Chakra Petch', sans-serif;
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(var(--grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+      background-size: 44px 44px;
+      display: grid;
+      place-items: center;
+      padding: 18px;
+    }}
+    .panel {{
+      width: min(860px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(13, 22, 40, 0.92);
+      padding: 18px;
+      box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
+    }}
+    h1 {{ margin: 0 0 8px; font-size: 1.9rem; }}
+    p {{ margin: 0 0 12px; color: var(--muted); }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 10px;
+      margin: 12px 0 14px;
+    }}
+    .cell {{
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 10px;
+      background: #0b1323;
+      display: grid;
+      gap: 4px;
+    }}
+    .cell strong {{ font-size: 0.78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }}
+    .cell code {{ font-family: 'JetBrains Mono', monospace; font-size: 12px; }}
+    .badge {{
+      display: inline-flex;
+      width: fit-content;
+      border-radius: 999px;
+      padding: 5px 9px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      border: 1px solid #285763;
+      color: var(--ok);
+      background: rgba(0, 245, 212, 0.11);
+    }}
+    .badge.warn {{ color: var(--warn); border-color: #78552a; background: rgba(255, 190, 92, 0.12); }}
+    .badge.err {{ color: var(--err); border-color: #8d3346; background: rgba(255, 107, 125, 0.12); }}
+    .tip {{
+      margin-top: 12px;
+      font-size: 0.9rem;
+      color: var(--muted);
+    }}
+    a {{
+      color: #7affea;
+      text-decoration: none;
+      border-bottom: 1px dashed rgba(122, 255, 234, 0.4);
+    }}
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>{app_name}</h1>
+    <p>App edge endpoint for <code>{host}</code>.</p>
+    <span class="badge {badge_class}">{status}</span>
+    <div class="grid">
+      <div class="cell"><strong>App ID</strong><code>{app_id}</code></div>
+      <div class="cell"><strong>Source</strong><code>{source_ref}</code></div>
+      <div class="cell"><strong>Profile</strong><code>{profile}</code></div>
+      <div class="cell"><strong>Control Plane</strong><code><a href="https://localhost/">https://localhost</a></code></div>
+    </div>
+    <p class="tip">Runtime container serving is not enabled yet. This endpoint confirms host routing and deployment ownership.</p>
+  </main>
+</body>
+</html>"#,
+        app_name = app_name,
+        host = host,
+        badge_class = badge_class,
+        status = escape_html(&status),
+        app_id = app_id,
+        source_ref = escape_html(&source_ref),
+        profile = escape_html(&profile),
+    )
+}
+
+fn escape_html(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 type ApiJsonError = (StatusCode, Json<ApiErrorResponse>);
@@ -2281,30 +2772,183 @@ const LOGIN_HTML: &str = r#"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rustploy Login</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap');
-    :root { --bg:#0b1220; --card:#14213d; --ink:#e5e7eb; --accent:#fca311; --muted:#9ca3af; }
-    * { box-sizing:border-box; font-family:'Space Grotesk',sans-serif; }
-    body { margin:0; min-height:100vh; display:grid; place-items:center; background:radial-gradient(circle at 15% 20%,#1f2937,#0b1220 55%); color:var(--ink);}
-    .card { width:min(420px,92vw); background:linear-gradient(160deg,#14213d,#1d3557); border:1px solid rgba(255,255,255,.12); border-radius:18px; padding:24px; }
-    h1 { margin:0 0 8px; font-size:1.9rem; }
-    p { color:var(--muted); margin:0 0 16px; }
-    input,button { width:100%; padding:12px 14px; border-radius:12px; border:1px solid rgba(255,255,255,.16); background:#0f172a; color:var(--ink); margin-top:10px; }
-    button { background:var(--accent); color:#111827; font-weight:700; border:none; cursor:pointer; }
-    .err { margin-top:10px; color:#fca5a5; min-height:1em; }
+    @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;700&family=JetBrains+Mono:wght@500&display=swap');
+    :root {
+      --bg: #060b14;
+      --bg-grid: rgba(0, 245, 212, 0.07);
+      --panel: #0d1628;
+      --panel-2: #101c33;
+      --ink: #dcf9ff;
+      --muted: #83a5b7;
+      --line: #1f3655;
+      --neon: #00f5d4;
+      --neon-ink: #032a27;
+      --danger: #ff6b7d;
+      --soft-shadow: 0 22px 60px rgba(0, 0, 0, 0.45);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: 'Chakra Petch', sans-serif;
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(var(--bg-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+      background-size: 44px 44px;
+      display: grid;
+      place-items: center;
+      padding: 28px 16px;
+    }
+    .layout {
+      width: min(980px, 100%);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      background: rgba(8, 13, 23, 0.88);
+      box-shadow: var(--soft-shadow);
+      overflow: hidden;
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      animation: panel-in 220ms ease-out;
+    }
+    .hero {
+      padding: 34px;
+      border-right: 1px solid var(--line);
+      background: var(--panel);
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #1f8e82;
+      background: rgba(0, 245, 212, 0.12);
+      color: #8cfcee;
+      font-size: 12px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+    .hero h1 {
+      margin: 16px 0 10px;
+      font-size: clamp(1.9rem, 3vw, 2.7rem);
+      line-height: 1.05;
+      text-wrap: balance;
+    }
+    .hero p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+      max-width: 42ch;
+    }
+    .mono {
+      margin-top: 28px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: #9fc6d6;
+      border: 1px solid #1f3655;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: rgba(16, 28, 51, 0.7);
+    }
+    .card {
+      padding: 30px 24px;
+      background: var(--panel-2);
+    }
+    .card h2 {
+      margin: 0 0 8px;
+      font-size: 1.3rem;
+      letter-spacing: 0.01em;
+    }
+    .card p {
+      margin: 0 0 14px;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+    label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      margin: 12px 0 6px;
+      color: #c3e7f7;
+    }
+    input, button {
+      width: 100%;
+      border-radius: 10px;
+      padding: 11px 12px;
+      font: inherit;
+    }
+    input {
+      border: 1px solid var(--line);
+      background: #0a1221;
+      color: var(--ink);
+    }
+    input::placeholder { color: #6389a0; }
+    input:focus {
+      outline: none;
+      border-color: #36d7c2;
+      box-shadow: 0 0 0 3px rgba(0, 245, 212, 0.17);
+    }
+    button {
+      margin-top: 14px;
+      border: 0;
+      font-weight: 700;
+      color: var(--neon-ink);
+      background: var(--neon);
+      cursor: pointer;
+      transition: transform .08s ease, filter .2s ease;
+      box-shadow: 0 0 24px rgba(0, 245, 212, 0.3);
+    }
+    button:hover { filter: brightness(1.03); }
+    button:active { transform: translateY(1px); }
+    .err {
+      min-height: 1.1em;
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--danger);
+    }
+    @keyframes panel-in {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 860px) {
+      .layout { grid-template-columns: 1fr; }
+      .hero { border-right: 0; border-bottom: 1px solid var(--line); }
+    }
   </style>
 </head>
 <body>
-  <form class="card" id="login-form">
-    <h1>Rustploy</h1>
-    <p>Sign in with your owner account.</p>
-    <input id="email" type="email" placeholder="admin@localhost" required />
-    <input id="password" type="password" placeholder="password" required />
-    <button type="submit">Sign In</button>
-    <div class="err" id="err"></div>
-  </form>
+  <main class="layout">
+    <section class="hero">
+      <div class="badge">Rustploy Control Plane</div>
+      <h1>Low-overhead deployment ops for self-hosted teams.</h1>
+      <p>
+        Sign in with your owner account to import repositories, trigger deployments,
+        inspect logs, and manage domains from one panel.
+      </p>
+      <div class="mono">Tip: default local login is admin@localhost / admin</div>
+    </section>
+    <form class="card" id="login-form">
+      <h2>Sign in</h2>
+      <p>Authenticate with your local owner account.</p>
+      <label for="email">Email</label>
+      <input id="email" type="email" placeholder="admin@localhost" required />
+      <label for="password">Password</label>
+      <input id="password" type="password" placeholder="password" required />
+      <button id="submit" type="submit">Enter Dashboard</button>
+      <div class="err" id="err"></div>
+    </form>
+  </main>
   <script>
     document.getElementById('login-form').addEventListener('submit', async (e) => {
       e.preventDefault();
+      const submit = document.getElementById('submit');
+      const err = document.getElementById('err');
+      err.textContent = '';
+      submit.disabled = true;
+      submit.textContent = 'Signing in...';
       const email = document.getElementById('email').value;
       const password = document.getElementById('password').value;
       const res = await fetch('/api/v1/auth/login', {
@@ -2316,7 +2960,9 @@ const LOGIN_HTML: &str = r#"<!doctype html>
       if (res.ok) {
         window.location.href = '/';
       } else {
-        document.getElementById('err').textContent = 'Invalid credentials';
+        err.textContent = 'Invalid credentials';
+        submit.disabled = false;
+        submit.textContent = 'Enter Dashboard';
       }
     });
   </script>
@@ -2331,105 +2977,616 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rustploy Dashboard</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700&display=swap');
-    :root { --bg:#f5f7fa; --ink:#101827; --accent:#0f766e; --card:#ffffff; --line:#d1d5db; }
-    * { box-sizing:border-box; font-family:'Outfit',sans-serif; }
-    body { margin:0; color:var(--ink); background:
-      radial-gradient(circle at 20% 0%, #a7f3d0 0%, transparent 35%),
-      radial-gradient(circle at 80% 100%, #bfdbfe 0%, transparent 40%),
-      var(--bg); }
-    .wrap { max-width:1050px; margin:0 auto; padding:24px; }
-    h1 { margin:0 0 14px; font-size:2rem; }
-    .grid { display:grid; gap:14px; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); }
-    .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; box-shadow:0 8px 24px rgba(16,24,39,.08); }
-    input,button,select { padding:10px 12px; border:1px solid var(--line); border-radius:10px; }
-    button { background:var(--accent); color:#fff; border:none; font-weight:700; cursor:pointer; }
-    ul { padding-left:18px; }
-    pre { white-space:pre-wrap; background:#111827; color:#e5e7eb; border-radius:10px; padding:10px; max-height:220px; overflow:auto; }
+    @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;700&family=JetBrains+Mono:wght@500&display=swap');
+    :root {
+      --bg: #060b14;
+      --bg-grid: rgba(0, 245, 212, 0.06);
+      --ink: #dffaff;
+      --muted: #81a7ba;
+      --line: #1f3655;
+      --panel: #0d1628;
+      --paper: #111c33;
+      --accent: #00f5d4;
+      --accent-ink: #042822;
+      --warning: #ffbe5c;
+      --danger: #ff6b7d;
+      --ok: #7affea;
+      --shadow: 0 14px 40px rgba(0, 0, 0, 0.46);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: 'Chakra Petch', sans-serif;
+      color: var(--ink);
+      min-height: 100vh;
+      background-color: var(--bg);
+      background-image:
+        linear-gradient(var(--bg-grid) 1px, transparent 1px),
+        linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
+      background-size: 44px 44px;
+    }
+    .wrap {
+      width: min(1240px, 100%);
+      margin: 0 auto;
+      padding: 18px;
+    }
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: rgba(13, 22, 40, 0.92);
+      box-shadow: var(--shadow);
+      margin-bottom: 14px;
+      animation: rise .22s ease-out;
+    }
+    .brand h1 { margin: 0; font-size: 1.45rem; letter-spacing: 0.03em; }
+    .brand p { margin: 3px 0 0; font-size: .88rem; color: var(--muted); }
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .pill {
+      border: 1px solid #1f8e82;
+      color: #8cfcee;
+      background: rgba(0, 245, 212, 0.13);
+      border-radius: 999px;
+      font-size: 12px;
+      padding: 6px 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .status {
+      min-height: 34px;
+      border-radius: 10px;
+      border: 1px solid #14544f;
+      background: rgba(0, 245, 212, 0.12);
+      color: var(--ok);
+      padding: 8px 11px;
+      font-size: .88rem;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+    }
+    .status.warn {
+      border-color: #8a642a;
+      background: rgba(255, 190, 92, 0.13);
+      color: var(--warning);
+    }
+    .status.err {
+      border-color: #883144;
+      background: rgba(255, 107, 125, 0.13);
+      color: var(--danger);
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(300px, 380px) minmax(420px, 1fr);
+      gap: 14px;
+    }
+    .stack { display: grid; gap: 14px; align-content: start; }
+    .card {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      padding: 14px;
+      animation: rise .22s ease-out;
+    }
+    .card h3 {
+      margin: 0 0 10px;
+      font-size: 1.05rem;
+      letter-spacing: .03em;
+      text-transform: uppercase;
+    }
+    .row {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr;
+    }
+    .triple {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+    input {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: #0a1221;
+      color: var(--ink);
+      font: inherit;
+      font-size: .94rem;
+    }
+    input::placeholder { color: #608aa3; }
+    input:focus {
+      outline: none;
+      border-color: #36d7c2;
+      box-shadow: 0 0 0 3px rgba(0, 245, 212, 0.17);
+    }
+    button {
+      border: 0;
+      border-radius: 9px;
+      padding: 9px 11px;
+      font: inherit;
+      font-weight: 700;
+      color: var(--accent-ink);
+      background: var(--accent);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: transform .08s ease, filter .15s ease;
+      box-shadow: 0 0 20px rgba(0, 245, 212, 0.3);
+    }
+    button:hover { filter: brightness(1.03); }
+    button:active { transform: translateY(1px); }
+    button.secondary {
+      background: #0b1322;
+      color: #b0d2e3;
+      border: 1px solid var(--line);
+      font-weight: 600;
+      box-shadow: none;
+    }
+    .list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 7px;
+    }
+    .item-row {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #0b1323;
+      padding: 9px;
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: center;
+    }
+    .item-row.selected {
+      border-color: #36d7c2;
+      background: rgba(0, 245, 212, 0.09);
+    }
+    .item-main {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+    .item-main strong {
+      font-size: .92rem;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .item-main code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .item-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: end;
+    }
+    .item-actions button {
+      padding: 6px 8px;
+      font-size: .81rem;
+    }
+    .pill-status {
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      padding: 4px 8px;
+      border: 1px solid #26706f;
+      background: rgba(0, 245, 212, 0.12);
+      color: #8cfcee;
+    }
+    pre {
+      margin: 0;
+      min-height: 220px;
+      max-height: 360px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border-radius: 10px;
+      background: #070d18;
+      color: #d8f8ff;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      border: 1px solid #1f3655;
+      padding: 10px;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: .86rem;
+      margin-top: 8px;
+    }
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(6px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    @media (max-width: 980px) {
+      .layout { grid-template-columns: 1fr; }
+      .triple { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Rustploy Dashboard</h1>
-    <div class="grid">
-      <section class="card">
-        <h3>Create App</h3>
-        <input id="app-name" placeholder="my-app" />
-        <button onclick="createApp()">Create</button>
+    <header class="topbar">
+      <div class="brand">
+        <h1>Rustploy Dashboard</h1>
+        <p>Git-driven deploy control plane, optimized for small nodes.</p>
+      </div>
+      <div class="actions">
+        <span class="pill" id="active-app-pill">No app selected</span>
+        <button class="secondary" onclick="logout()">Logout</button>
+      </div>
+    </header>
+
+    <div id="status" class="status">Ready.</div>
+
+    <div class="layout">
+      <section class="stack">
+        <article class="card">
+          <h3>Create App</h3>
+          <div class="row">
+            <input id="app-name" placeholder="my-app" />
+            <button onclick="createApp()">Create App</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <h3>Import GitHub Repo</h3>
+          <div class="triple">
+            <input id="owner" placeholder="owner" />
+            <input id="repo" placeholder="repo" />
+            <input id="branch" placeholder="main" value="main" />
+          </div>
+          <div class="row" style="margin-top:8px">
+            <button onclick="importApp()">Import Repository</button>
+          </div>
+        </article>
+
+        <article class="card">
+          <h3>Apps</h3>
+          <ul id="apps" class="list"></ul>
+        </article>
+
+        <article class="card">
+          <h3>Domains</h3>
+          <div class="row">
+            <input id="domain" placeholder="app.example.com" />
+            <button onclick="addDomain()">Add Domain</button>
+          </div>
+          <ul id="domains" class="list" style="margin-top:10px"></ul>
+        </article>
       </section>
-      <section class="card">
-        <h3>Import GitHub Repo</h3>
-        <input id="owner" placeholder="owner" />
-        <input id="repo" placeholder="repo" />
-        <input id="branch" placeholder="main" value="main" />
-        <button onclick="importApp()">Import</button>
-      </section>
-      <section class="card">
-        <h3>Apps</h3>
-        <ul id="apps"></ul>
-      </section>
-      <section class="card">
-        <h3>Deployments</h3>
-        <ul id="deployments"></ul>
-        <pre id="logs"></pre>
-      </section>
-      <section class="card">
-        <h3>Domains</h3>
-        <input id="domain" placeholder="app.example.com" />
-        <button onclick="addDomain()">Add Domain</button>
-        <ul id="domains"></ul>
-      </section>
-      <section class="card">
-        <h3>Session</h3>
-        <button onclick="logout()">Logout</button>
+
+      <section class="stack">
+        <article class="card">
+          <h3>Deployments</h3>
+          <ul id="deployments" class="list"></ul>
+          <p class="hint">Stream updates enabled for selected app.</p>
+        </article>
+
+        <article class="card">
+          <h3>Routing & Runtime</h3>
+          <ul id="routes" class="list"></ul>
+          <p class="hint" id="runtime-note">
+            Deployments currently report pipeline state only. Runtime ports are not surfaced yet.
+          </p>
+        </article>
+
+        <article class="card">
+          <h3>Live Logs</h3>
+          <pre id="logs">(no logs yet)</pre>
+        </article>
       </section>
     </div>
   </div>
   <script>
     let selectedApp = null;
+    let selectedAppName = null;
     let logsStream = null;
+    let statusTimeout = null;
+    const selectedState = { domains: [], latestDeployment: null, config: null };
+
+    function setStatus(message, level = 'ok') {
+      const el = document.getElementById('status');
+      el.textContent = message;
+      el.className = 'status';
+      if (level === 'warn') el.classList.add('warn');
+      if (level === 'err') el.classList.add('err');
+      if (statusTimeout) clearTimeout(statusTimeout);
+      statusTimeout = setTimeout(() => {
+        el.textContent = 'Ready.';
+        el.className = 'status';
+      }, 4500);
+    }
+
+    function setSelectedPill(appName) {
+      document.getElementById('active-app-pill').textContent = appName
+        ? `Active: ${appName}`
+        : 'No app selected';
+    }
+
+    function appLocalhostHost(appName) {
+      if (!appName) return null;
+      const slug = appName
+        .toLowerCase()
+        .replace(/[^a-z0-9-]/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+      return slug ? `${slug}.localhost` : null;
+    }
+
+    function isControlPlaneDomain(domain) {
+      const normalized = (domain || '').trim().toLowerCase().replace(/\.$/, '');
+      return normalized === 'localhost'
+        || normalized === 'rustploy.localhost'
+        || normalized === '127.0.0.1'
+        || normalized === '::1';
+    }
+
+    function renderRoutes() {
+      const routes = document.getElementById('routes');
+      const note = document.getElementById('runtime-note');
+      routes.innerHTML = '';
+
+      if (!selectedApp) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'Select an app to inspect routing details.';
+        routes.appendChild(empty);
+        note.textContent =
+          'Deployments currently report pipeline state only. Runtime ports are not surfaced yet.';
+        return;
+      }
+
+      const appRow = document.createElement('li');
+      appRow.className = 'item-row';
+      appRow.innerHTML = `
+        <div class="item-main">
+          <strong>${selectedAppName || 'Selected app'}</strong>
+          <code>${selectedApp}</code>
+        </div>
+      `;
+      routes.appendChild(appRow);
+
+      const appHost = appLocalhostHost(selectedAppName);
+      if (appHost) {
+        const hostRow = document.createElement('li');
+        hostRow.className = 'item-row';
+        hostRow.innerHTML = `
+          <div class="item-main">
+            <strong>Default Dev URL</strong>
+            <code>https://${appHost}</code>
+          </div>
+        `;
+        routes.appendChild(hostRow);
+      }
+
+      const deploymentRow = document.createElement('li');
+      deploymentRow.className = 'item-row';
+      if (selectedState.latestDeployment) {
+        const sourceRef = selectedState.latestDeployment.source_ref || 'manual';
+        deploymentRow.innerHTML = `
+          <div class="item-main">
+            <strong><span class="pill-status">${selectedState.latestDeployment.status}</span></strong>
+            <code>${sourceRef}</code>
+          </div>
+        `;
+      } else {
+        deploymentRow.innerHTML = `
+          <div class="item-main">
+            <strong>Deployment status</strong>
+            <code>none</code>
+          </div>
+        `;
+      }
+      routes.appendChild(deploymentRow);
+
+      const routedDomains = selectedState.domains.filter((domain) =>
+        !isControlPlaneDomain(domain.domain)
+      );
+
+      if (routedDomains.length === 0) {
+        const emptyDomain = document.createElement('li');
+        emptyDomain.className = 'item-row';
+        emptyDomain.innerHTML = `
+          <div class="item-main">
+            <strong>Public URL</strong>
+            <code>no domain mapped</code>
+          </div>
+        `;
+        routes.appendChild(emptyDomain);
+      } else {
+        for (const domain of routedDomains) {
+          const domainRow = document.createElement('li');
+          domainRow.className = 'item-row';
+          domainRow.innerHTML = `
+            <div class="item-main">
+              <strong>https://${domain.domain}</strong>
+              <code>tls=${domain.tls_mode}</code>
+            </div>
+          `;
+          routes.appendChild(domainRow);
+        }
+      }
+
+      if (selectedState.config) {
+        const cfg = selectedState.config;
+        const cfgRow = document.createElement('li');
+        cfgRow.className = 'item-row';
+        cfgRow.innerHTML = `
+          <div class="item-main">
+            <strong>${cfg.detection.framework} (${cfg.detection.package_manager})</strong>
+            <code>${cfg.detection.build_profile}</code>
+          </div>
+        `;
+        routes.appendChild(cfgRow);
+
+        if (cfg.compose) {
+          const composeRow = document.createElement('li');
+          const appService = cfg.compose.app_service || 'unknown';
+          composeRow.className = 'item-row';
+          composeRow.innerHTML = `
+            <div class="item-main">
+              <strong>compose: ${appService}</strong>
+              <code>${cfg.compose.file} (${cfg.compose.services.length} services)</code>
+            </div>
+          `;
+          routes.appendChild(composeRow);
+        }
+      }
+
+      note.textContent =
+        'Use the app localhost URL above to reach this app route. Runtime containers are not launched yet, so per-app listening ports are not available.';
+    }
+
     async function api(path, opts = {}) {
       const res = await fetch(path, { credentials: 'include', ...opts });
-      if (res.status === 401) { window.location.reload(); throw new Error('unauthorized'); }
+      if (res.status === 401) {
+        window.location.reload();
+        throw new Error('unauthorized');
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `request failed: ${res.status}`);
+      }
       return res;
     }
+
     async function refreshApps() {
       const res = await api('/api/v1/apps');
       const data = await res.json();
       const apps = document.getElementById('apps');
       apps.innerHTML = '';
+
+      if (data.items.length === 0) {
+        selectedApp = null;
+        selectedAppName = null;
+        selectedState.domains = [];
+        selectedState.latestDeployment = null;
+        selectedState.config = null;
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No apps yet.';
+        apps.appendChild(empty);
+        setSelectedPill(null);
+        renderRoutes();
+        return;
+      }
+
+      let selectedStillExists = false;
       for (const app of data.items) {
+        if (selectedApp === app.id) {
+          selectedStillExists = true;
+          selectedAppName = app.name;
+        }
         const li = document.createElement('li');
-        li.innerHTML = `<strong>${app.name}</strong> <button onclick="selectApp('${app.id}')">Open</button> <button onclick="deploy('${app.id}')">Deploy</button> <button onclick="rollback('${app.id}')">Rollback</button>`;
+        li.className = `item-row ${selectedApp === app.id ? 'selected' : ''}`.trim();
+        li.innerHTML = `
+          <div class="item-main">
+            <strong>${app.name}</strong>
+            <code>${app.id}</code>
+          </div>
+          <div class="item-actions">
+            <button class="secondary" onclick="selectApp('${app.id}','${app.name}')">Open</button>
+            <button onclick="deploy('${app.id}')">Deploy</button>
+            <button class="secondary" onclick="rollback('${app.id}')">Rollback</button>
+          </div>
+        `;
         apps.appendChild(li);
       }
+
+      if (selectedStillExists) {
+        setSelectedPill(selectedAppName);
+      }
+
       if (!selectedApp && data.items.length > 0) {
-        await selectApp(data.items[0].id);
+        await selectApp(data.items[0].id, data.items[0].name);
+      } else if (!selectedStillExists) {
+        selectedApp = null;
+        selectedAppName = null;
+        selectedState.domains = [];
+        selectedState.latestDeployment = null;
+        selectedState.config = null;
+        setSelectedPill(null);
+        renderRoutes();
       }
     }
+
     async function createApp() {
       const name = document.getElementById('app-name').value.trim();
-      if (!name) return;
-      await api('/api/v1/apps', { method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify({name}) });
-      refreshApps();
+      if (!name) {
+        setStatus('App name is required.', 'warn');
+        return;
+      }
+      try {
+        await api('/api/v1/apps', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({name})
+        });
+        document.getElementById('app-name').value = '';
+        setStatus(`Created app "${name}".`);
+        await refreshApps();
+      } catch (error) {
+        setStatus(`Create app failed: ${error.message}`, 'err');
+      }
     }
+
     async function importApp() {
       const owner = document.getElementById('owner').value.trim();
       const repo = document.getElementById('repo').value.trim();
       const branch = document.getElementById('branch').value.trim() || 'main';
-      await api('/api/v1/apps/import', {
-        method:'POST',
-        headers:{'content-type':'application/json'},
-        body:JSON.stringify({ repository:{ provider:'github', owner, name:repo, default_branch:branch }, source:{ branch }, build_mode:'auto' })
-      });
-      refreshApps();
+      if (!owner || !repo) {
+        setStatus('Owner and repo are required for import.', 'warn');
+        return;
+      }
+      try {
+        await api('/api/v1/apps/import', {
+          method: 'POST',
+          headers: {'content-type': 'application/json'},
+          body: JSON.stringify({
+            repository: { provider:'github', owner, name:repo, default_branch:branch },
+            source: { branch }
+          })
+        });
+        setStatus(`Imported ${owner}/${repo}@${branch}.`);
+        await refreshApps();
+      } catch (error) {
+        setStatus(`Import failed: ${error.message}`, 'err');
+      }
     }
-    async function selectApp(appId) {
+
+    async function selectApp(appId, appName = null) {
       selectedApp = appId;
+      selectedAppName = appName || selectedAppName;
+      selectedState.domains = [];
+      selectedState.latestDeployment = null;
+      selectedState.config = null;
+      setSelectedPill(selectedAppName);
+      renderRoutes();
       await refreshDeployments();
       await refreshDomains();
+      await refreshAppConfig();
+      await refreshApps();
       startLogsStream();
     }
+
     function startLogsStream() {
       if (logsStream) {
         logsStream.close();
@@ -2438,72 +3595,174 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (!selectedApp) return;
       logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
       logsStream.addEventListener('logs', (event) => {
-        document.getElementById('logs').textContent = (event.data || '').replaceAll('\\n', '\n') || '(no logs)';
+        document.getElementById('logs').textContent = (event.data || '')
+          .replaceAll('\\n', '\n') || '(no logs)';
       });
       logsStream.onerror = () => {};
     }
+
     async function refreshDeployments() {
       if (!selectedApp) return;
       const res = await api(`/api/v1/apps/${selectedApp}/deployments`);
       const data = await res.json();
+      selectedState.latestDeployment = data.items[0] || null;
+      renderRoutes();
       const el = document.getElementById('deployments');
       el.innerHTML = '';
+
+      if (data.items.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No deployments yet.';
+        el.appendChild(empty);
+        return;
+      }
+
       for (const d of data.items) {
         const li = document.createElement('li');
-        li.innerHTML = `${d.status} ${d.source_ref || ''} <button onclick="showLogs('${selectedApp}','${d.id}')">Logs</button>`;
+        const sourceRef = d.source_ref || 'manual';
+        li.className = 'item-row';
+        li.innerHTML = `
+          <div class="item-main">
+            <strong><span class="pill-status">${d.status}</span></strong>
+            <code>${sourceRef}</code>
+          </div>
+          <div class="item-actions">
+            <button class="secondary" onclick="showLogs('${selectedApp}','${d.id}')">Logs</button>
+          </div>
+        `;
         el.appendChild(li);
       }
     }
+
     async function showLogs(appId, deploymentId) {
-      const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
-      const data = await res.json();
-      document.getElementById('logs').textContent = data.logs || '(no logs)';
+      try {
+        const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
+        const data = await res.json();
+        document.getElementById('logs').textContent = data.logs || '(no logs)';
+      } catch (error) {
+        setStatus(`Unable to load logs: ${error.message}`, 'err');
+      }
     }
+
     async function refreshDomains() {
       if (!selectedApp) return;
       const res = await api(`/api/v1/apps/${selectedApp}/domains`);
       const data = await res.json();
+      selectedState.domains = data.items;
+      renderRoutes();
       const el = document.getElementById('domains');
       el.innerHTML = '';
-      for (const d of data.items) {
+
+      const routedDomains = data.items.filter((domain) =>
+        !isControlPlaneDomain(domain.domain)
+      );
+
+      if (routedDomains.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No domain mappings.';
+        el.appendChild(empty);
+        return;
+      }
+
+      for (const d of routedDomains) {
         const li = document.createElement('li');
-        li.textContent = `${d.domain} (${d.tls_mode})`;
+        li.className = 'item-row';
+        li.innerHTML = `
+          <div class="item-main">
+            <strong>${d.domain}</strong>
+            <code>${d.tls_mode}</code>
+          </div>
+        `;
         el.appendChild(li);
       }
     }
-    async function addDomain() {
+
+    async function refreshAppConfig() {
       if (!selectedApp) return;
+      try {
+        const res = await api(`/api/v1/apps/${selectedApp}/config`);
+        selectedState.config = await res.json();
+      } catch (error) {
+        if ((error.message || '').includes('404')) {
+          selectedState.config = null;
+        } else {
+          setStatus(`Unable to load app config: ${error.message}`, 'warn');
+        }
+      }
+      renderRoutes();
+    }
+
+    async function addDomain() {
+      if (!selectedApp) {
+        setStatus('Select an app before adding domains.', 'warn');
+        return;
+      }
       const domain = document.getElementById('domain').value.trim();
-      if (!domain) return;
-      await api(`/api/v1/apps/${selectedApp}/domains`, {
-        method:'POST',
-        headers:{'content-type':'application/json'},
-        body:JSON.stringify({ domain, tls_mode:'managed' })
-      });
-      refreshDomains();
+      if (!domain) {
+        setStatus('Domain is required.', 'warn');
+        return;
+      }
+      try {
+        await api(`/api/v1/apps/${selectedApp}/domains`, {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body:JSON.stringify({ domain, tls_mode:'managed' })
+        });
+        document.getElementById('domain').value = '';
+        setStatus(`Domain ${domain} added.`);
+        await refreshDomains();
+      } catch (error) {
+        setStatus(`Add domain failed: ${error.message}`, 'err');
+      }
     }
+
     async function deploy(appId) {
-      await api(`/api/v1/apps/${appId}/deployments`, { method:'POST', headers:{'content-type':'application/json'}, body:'{}' });
-      if (selectedApp === appId) refreshDeployments();
+      try {
+        await api(`/api/v1/apps/${appId}/deployments`, {
+          method:'POST',
+          headers:{'content-type':'application/json'},
+          body:'{}'
+        });
+        setStatus('Deployment queued.');
+        if (selectedApp === appId) refreshDeployments();
+      } catch (error) {
+        setStatus(`Deploy failed: ${error.message}`, 'err');
+      }
     }
+
     async function rollback(appId) {
-      await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
-      if (selectedApp === appId) refreshDeployments();
+      try {
+        await api(`/api/v1/apps/${appId}/rollback`, { method:'POST' });
+        setStatus('Rollback queued.');
+        if (selectedApp === appId) refreshDeployments();
+      } catch (error) {
+        setStatus(`Rollback failed: ${error.message}`, 'err');
+      }
     }
+
     async function logout() {
-      if (logsStream) { logsStream.close(); logsStream = null; }
+      if (logsStream) {
+        logsStream.close();
+        logsStream = null;
+      }
       await api('/api/v1/auth/logout', { method:'POST' });
       window.location.reload();
     }
-    window.addEventListener('beforeunload', () => { if (logsStream) logsStream.close(); });
-    refreshApps();
-    setInterval(refreshApps, 15000);
-    setInterval(refreshDeployments, 4000);
+
+    window.addEventListener('beforeunload', () => {
+      if (logsStream) logsStream.close();
+    });
+
+    renderRoutes();
+    refreshApps().catch((error) => setStatus(`Initial load failed: ${error.message}`, 'err'));
+    setInterval(() => refreshApps().catch(() => {}), 15000);
+    setInterval(() => refreshDeployments().catch(() => {}), 4000);
   </script>
 </body>
 </html>
 "#;
-
 async fn auth_login(
     State(state): State<AppState>,
     Json(payload): Json<AuthLoginRequest>,
@@ -2776,14 +4035,27 @@ async fn import_app(
                     Vec::new(),
                 )
             })?;
-        let detection = detect_build_profile(&temp_path).map_err(|_| {
+        let compose = read_compose_summary(&temp_path).map_err(|error| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_compose",
+                "failed to parse docker compose file",
+                vec![ApiErrorDetail {
+                    field: "docker-compose.yml".to_string(),
+                    message: error.to_string(),
+                }],
+            )
+        })?;
+        let detection = detect_build_profile(&temp_path, compose.as_ref()).map_err(|_| {
             api_error(
                 StatusCode::BAD_REQUEST,
                 "build_detection_failed",
-                "failed to detect project build profile",
+                "failed to detect project build profile (package.json, Dockerfile, or docker-compose required)",
                 vec![ApiErrorDetail {
-                    field: "package.json".to_string(),
-                    message: "missing or invalid package.json".to_string(),
+                    field: "project".to_string(),
+                    message:
+                        "missing or invalid package.json; expected Dockerfile or docker-compose as fallback"
+                            .to_string(),
                 }],
             )
         })?;
@@ -2795,15 +4067,21 @@ async fn import_app(
                     .as_ref()
                     .and_then(|value| value.build.as_ref()?.mode.clone())
             })
-            .unwrap_or_else(|| "auto".to_string());
-        if build_mode != "auto" && build_mode != "dockerfile" {
+            .unwrap_or_else(|| {
+                if compose.is_some() {
+                    "compose".to_string()
+                } else {
+                    "auto".to_string()
+                }
+            });
+        if build_mode != "auto" && build_mode != "dockerfile" && build_mode != "compose" {
             return Err(api_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "build_mode must be auto or dockerfile",
+                "build_mode must be auto, dockerfile, or compose",
                 vec![ApiErrorDetail {
                     field: "build_mode".to_string(),
-                    message: "supported values are auto and dockerfile".to_string(),
+                    message: "supported values are auto, dockerfile, and compose".to_string(),
                 }],
             ));
         }
@@ -2814,24 +4092,34 @@ async fn import_app(
             .unwrap_or_else(|| repo.clone());
 
         let now = now_unix_ms();
-        let app = state
+        let app = match state
             .db
             .create_app(&app_name, now)
             .map_err(|error| status_to_api_error(internal_error(error)))?
-            .ok_or_else(|| {
-                api_error(
-                    StatusCode::CONFLICT,
-                    "conflict",
-                    "app name already exists",
-                    vec![ApiErrorDetail {
-                        field: "app.name".to_string(),
-                        message: app_name.clone(),
-                    }],
-                )
-            })?;
+        {
+            Some(created) => created,
+            None => state
+                .db
+                .find_app_by_name(&app_name)
+                .map_err(|error| status_to_api_error(internal_error(error)))?
+                .ok_or_else(|| {
+                    api_error(
+                        StatusCode::CONFLICT,
+                        "conflict",
+                        "app name already exists",
+                        vec![ApiErrorDetail {
+                            field: "app.name".to_string(),
+                            message: app_name.clone(),
+                        }],
+                    )
+                })?,
+        };
 
-        let dependency_profile =
-            merge_dependency_profile(payload.dependency_profile.clone(), manifest.as_ref());
+        let dependency_profile = merge_dependency_profile(
+            payload.dependency_profile.clone(),
+            manifest.as_ref(),
+            compose.as_ref(),
+        );
 
         state
             .db
@@ -2867,6 +4155,7 @@ async fn import_app(
                     },
                     build_mode,
                     detection: detection.clone(),
+                    compose: compose.clone(),
                     dependency_profile,
                     manifest_json,
                 },
@@ -2877,6 +4166,7 @@ async fn import_app(
         Ok(ImportAppResponse {
             app: app.clone(),
             detection,
+            compose,
             next_action: NextAction {
                 action_type: "create_deployment".to_string(),
                 deploy_endpoint: format!("/api/v1/apps/{}/deployments", app.id),
@@ -3108,13 +4398,17 @@ async fn create_domain(
     if tls_mode == "custom" && (payload.cert_path.is_none() || payload.key_path.is_none()) {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let domain = normalize_domain(&payload.domain);
+    if domain.is_empty() || is_reserved_control_plane_domain(&domain) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let summary = state
         .db
         .create_domain(
             app_id,
             &CreateDomainRequest {
-                domain: payload.domain.trim().to_string(),
+                domain,
                 tls_mode: Some(tls_mode),
                 cert_path: payload.cert_path.clone(),
                 key_path: payload.key_path.clone(),
@@ -3508,21 +4802,35 @@ fn sync_caddyfile_from_domains(state: &AppState) -> Result<()> {
     let mut content = String::new();
     content.push_str(&format!(":8080 {{\n  reverse_proxy {upstream}\n}}\n\n"));
     content.push_str(&format!(":80 {{\n  reverse_proxy {upstream}\n}}\n\n"));
-    if domains.is_empty() {
-        content.push_str(&format!("localhost {{\n  reverse_proxy {upstream}\n}}\n"));
-    } else {
-        for domain in domains {
-            content.push_str(&format!("{} {{\n", domain.domain));
-            if domain.tls_mode == "custom" {
-                if let (Some(cert), Some(key)) =
-                    (domain.cert_path.as_deref(), domain.key_path.as_deref())
-                {
-                    content.push_str(&format!("  tls {cert} {key}\n"));
-                }
-            }
-            content.push_str(&format!("  reverse_proxy {upstream}\n"));
-            content.push_str("}\n\n");
+    content.push_str(&format!(
+        "{CONTROL_PLANE_HOST} {{\n  reverse_proxy {upstream}\n}}\n\n"
+    ));
+    content.push_str(&format!(
+        "{CONTROL_PLANE_ALT_HOST} {{\n  reverse_proxy {upstream}\n}}\n\n"
+    ));
+    content.push_str(&format!(
+        "*.localhost {{\n  reverse_proxy {upstream}\n}}\n\n"
+    ));
+
+    for domain in domains {
+        let normalized = normalize_domain(&domain.domain);
+        if normalized.is_empty()
+            || normalized == CONTROL_PLANE_HOST
+            || normalized == CONTROL_PLANE_ALT_HOST
+            || normalized.ends_with(".localhost")
+        {
+            continue;
         }
+        content.push_str(&format!("{} {{\n", normalized));
+        if domain.tls_mode == "custom" {
+            if let (Some(cert), Some(key)) =
+                (domain.cert_path.as_deref(), domain.key_path.as_deref())
+            {
+                content.push_str(&format!("  tls {cert} {key}\n"));
+            }
+        }
+        content.push_str(&format!("  reverse_proxy {upstream}\n"));
+        content.push_str("}\n\n");
     }
 
     fs::write(&path, content).with_context(|| format!("failed writing caddyfile at {path}"))?;
@@ -3761,11 +5069,11 @@ fn parse_manifest_yaml(
                     }
                 } else if section == "build" {
                     if let Some(value) = parse_yaml_value(trimmed, "mode") {
-                        if value != "auto" && value != "dockerfile" {
+                        if value != "auto" && value != "dockerfile" && value != "compose" {
                             errors.push(ManifestValidationError {
                                 field: "build.mode".to_string(),
                                 message: format!(
-                                    "invalid mode '{value}', expected auto or dockerfile"
+                                    "invalid mode '{value}', expected auto, dockerfile, or compose"
                                 ),
                             });
                         }
@@ -3858,6 +5166,7 @@ fn parse_yaml_bool(value: &str) -> Result<bool> {
 fn merge_dependency_profile(
     requested: Option<DependencyProfile>,
     manifest: Option<&RustployManifest>,
+    compose: Option<&ComposeSummary>,
 ) -> Option<DependencyProfile> {
     let manifest_postgres = manifest
         .and_then(|value| value.dependencies.as_ref())
@@ -3867,15 +5176,18 @@ fn merge_dependency_profile(
         .and_then(|value| value.dependencies.as_ref())
         .and_then(|value| value.redis.as_ref())
         .and_then(|value| value.enabled);
+    let compose_profile = infer_dependency_profile_from_compose(compose);
 
     let postgres = requested
         .as_ref()
         .and_then(|value| value.postgres)
-        .or(manifest_postgres);
+        .or(manifest_postgres)
+        .or(compose_profile.postgres);
     let redis = requested
         .as_ref()
         .and_then(|value| value.redis)
-        .or(manifest_redis);
+        .or(manifest_redis)
+        .or(compose_profile.redis);
 
     if postgres.is_none() && redis.is_none() {
         None
@@ -3884,8 +5196,82 @@ fn merge_dependency_profile(
     }
 }
 
-fn detect_build_profile(repo_path: &Path) -> Result<DetectionResult, StatusCode> {
+fn infer_dependency_profile_from_compose(compose: Option<&ComposeSummary>) -> DependencyProfile {
+    let mut postgres = None;
+    let mut redis = None;
+
+    if let Some(compose) = compose {
+        for service in &compose.services {
+            let image = service
+                .image
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if image.contains("postgis") || image.contains("postgres") {
+                postgres = Some(true);
+            }
+            if image.contains("redis") {
+                redis = Some(true);
+            }
+        }
+    }
+
+    DependencyProfile { postgres, redis }
+}
+
+fn compose_image_for_dependency(
+    compose: Option<&ComposeSummary>,
+    service_type: &str,
+) -> Option<String> {
+    let compose = compose?;
+    for service in &compose.services {
+        let image = service.image.as_deref()?;
+        let normalized = image.to_ascii_lowercase();
+        match service_type {
+            "postgres" => {
+                if normalized.contains("postgres") || normalized.contains("postgis") {
+                    return Some(image.to_string());
+                }
+            }
+            "redis" => {
+                if normalized.contains("redis") {
+                    return Some(image.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn detect_build_profile(
+    repo_path: &Path,
+    compose: Option<&ComposeSummary>,
+) -> Result<DetectionResult, StatusCode> {
+    let dockerfile_present = repo_path.join("Dockerfile").exists();
     let package_json_path = repo_path.join("package.json");
+    if !package_json_path.exists() {
+        if compose.is_some() {
+            return Ok(DetectionResult {
+                framework: "compose".to_string(),
+                package_manager: "none".to_string(),
+                lockfile: None,
+                build_profile: "compose-generic-v1".to_string(),
+                dockerfile_present,
+            });
+        }
+        if dockerfile_present {
+            return Ok(DetectionResult {
+                framework: "docker".to_string(),
+                package_manager: "none".to_string(),
+                lockfile: None,
+                build_profile: "dockerfile-generic-v1".to_string(),
+                dockerfile_present,
+            });
+        }
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let package_json_raw =
         fs::read_to_string(package_json_path).map_err(|_| StatusCode::BAD_REQUEST)?;
     let package_json: serde_json::Value =
@@ -3927,7 +5313,6 @@ fn detect_build_profile(repo_path: &Path) -> Result<DetectionResult, StatusCode>
         ("npm".to_string(), None)
     };
 
-    let dockerfile_present = repo_path.join("Dockerfile").exists();
     let (framework, build_profile) = if next_present && has_build_script && has_start_script {
         ("nextjs".to_string(), "nextjs-standalone-v1".to_string())
     } else {
@@ -3941,6 +5326,142 @@ fn detect_build_profile(repo_path: &Path) -> Result<DetectionResult, StatusCode>
         build_profile,
         dockerfile_present,
     })
+}
+
+fn read_compose_summary(repo_path: &Path) -> Result<Option<ComposeSummary>> {
+    for filename in [
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "compose.yml",
+        "compose.yaml",
+    ] {
+        let compose_path = repo_path.join(filename);
+        if !compose_path.exists() {
+            continue;
+        }
+
+        let raw = fs::read_to_string(&compose_path)
+            .with_context(|| format!("unable to read {}", compose_path.display()))?;
+        let parsed: ComposeFileRaw = serde_yaml::from_str(&raw)
+            .with_context(|| format!("invalid yaml in {}", compose_path.display()))?;
+        if parsed.services.is_empty() {
+            anyhow::bail!("compose file has no services");
+        }
+
+        let mut services = Vec::new();
+        for (service_name, service) in parsed.services {
+            services.push(ComposeServiceSummary {
+                name: service_name,
+                image: service.image,
+                build: service.build.is_some(),
+                depends_on: parse_compose_depends_on(service.depends_on.as_ref()),
+                ports: parse_compose_ports(service.ports.as_ref()),
+                profiles: service.profiles.unwrap_or_default(),
+            });
+        }
+        services.sort_by(|left, right| left.name.cmp(&right.name));
+        let app_service = detect_compose_app_service(&services);
+
+        return Ok(Some(ComposeSummary {
+            file: filename.to_string(),
+            app_service,
+            services,
+        }));
+    }
+
+    Ok(None)
+}
+
+fn parse_compose_depends_on(value: Option<&serde_yaml::Value>) -> Vec<String> {
+    let mut depends_on = Vec::new();
+    let Some(value) = value else {
+        return depends_on;
+    };
+
+    match value {
+        serde_yaml::Value::Sequence(items) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    depends_on.push(name.to_string());
+                }
+            }
+        }
+        serde_yaml::Value::Mapping(map) => {
+            for (name, _settings) in map {
+                if let Some(name) = name.as_str() {
+                    depends_on.push(name.to_string());
+                }
+            }
+        }
+        _ => {}
+    }
+
+    depends_on.sort();
+    depends_on.dedup();
+    depends_on
+}
+
+fn parse_compose_ports(value: Option<&Vec<serde_yaml::Value>>) -> Vec<String> {
+    let mut ports = Vec::new();
+    let Some(value) = value else {
+        return ports;
+    };
+
+    for item in value {
+        match item {
+            serde_yaml::Value::String(raw) => ports.push(raw.to_string()),
+            serde_yaml::Value::Number(number) => ports.push(number.to_string()),
+            serde_yaml::Value::Mapping(map) => {
+                let published = map
+                    .get(&serde_yaml::Value::String("published".to_string()))
+                    .and_then(yaml_scalar_to_string);
+                let target = map
+                    .get(&serde_yaml::Value::String("target".to_string()))
+                    .and_then(yaml_scalar_to_string);
+
+                if let Some(target_value) = target.as_deref() {
+                    if let Some(published_value) = published.as_deref() {
+                        ports.push(format!("{published_value}:{target_value}"));
+                    } else {
+                        ports.push(target_value.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ports
+}
+
+fn yaml_scalar_to_string(value: &serde_yaml::Value) -> Option<String> {
+    match value {
+        serde_yaml::Value::String(text) => Some(text.to_string()),
+        serde_yaml::Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn detect_compose_app_service(services: &[ComposeServiceSummary]) -> Option<String> {
+    if let Some(service) = services.iter().find(|service| service.name == "web") {
+        return Some(service.name.clone());
+    }
+    if let Some(service) = services.iter().find(|service| service.name == "app") {
+        return Some(service.name.clone());
+    }
+    if let Some(service) = services
+        .iter()
+        .find(|service| service.build && !service.ports.is_empty())
+    {
+        return Some(service.name.clone());
+    }
+    if let Some(service) = services.iter().find(|service| service.build) {
+        return Some(service.name.clone());
+    }
+    if let Some(service) = services.iter().find(|service| !service.ports.is_empty()) {
+        return Some(service.name.clone());
+    }
+    services.first().map(|service| service.name.clone())
 }
 
 fn authorize_agent_request(
@@ -4853,6 +6374,166 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compose_import_detects_services_and_postgis_dependency() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(
+            repo_path.join("docker-compose.yml"),
+            r#"services:
+  db:
+    image: imresamu/postgis:16-3.4
+    ports:
+      - "5432:5432"
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+"#,
+        )
+        .unwrap();
+        std::fs::write(repo_path.join("Dockerfile"), "FROM python:3.12-slim\n").unwrap();
+
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "covachapp",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": { "branch": "main" }
+        });
+        let import_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(import_response.status(), StatusCode::CREATED);
+        let import_body = to_bytes(import_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let import_json: Value = serde_json::from_slice(&import_body).unwrap();
+        assert_eq!(import_json["detection"]["framework"], json!("compose"));
+        assert_eq!(import_json["compose"]["app_service"], json!("web"));
+
+        let app_id = import_json["app"]["id"].as_str().unwrap();
+        let config_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{app_id}/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(config_response.status(), StatusCode::OK);
+        let config_body = to_bytes(config_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let config_json: Value = serde_json::from_slice(&config_body).unwrap();
+        assert_eq!(config_json["build_mode"], json!("compose"));
+        assert_eq!(config_json["dependency_profile"]["postgres"], json!(true));
+        assert_eq!(config_json["compose"]["file"], json!("docker-compose.yml"));
+        assert_eq!(config_json["compose"]["services"][0]["name"], json!("db"));
+        assert_eq!(
+            config_json["compose"]["services"][0]["image"],
+            json!("imresamu/postgis:16-3.4")
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn import_is_idempotent_for_existing_app_name() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let repo_path = std::env::temp_dir().join(format!("rustploy-repo-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&repo_path).unwrap();
+        std::fs::write(repo_path.join("Dockerfile"), "FROM python:3.12-slim\n").unwrap();
+        std::fs::write(
+            repo_path.join("docker-compose.yml"),
+            "services:\n  web:\n    build: .\n    ports:\n      - \"8000:8000\"\n",
+        )
+        .unwrap();
+        run_git(&repo_path, &["init", "-b", "main"]);
+        run_git(&repo_path, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_path, &["config", "user.name", "Test User"]);
+        run_git(&repo_path, &["add", "."]);
+        run_git(&repo_path, &["commit", "-m", "init"]);
+
+        let import_payload = json!({
+            "repository": {
+                "provider": "github",
+                "owner": "acme",
+                "name": "covachapp",
+                "clone_url": repo_path.to_string_lossy(),
+                "default_branch": "main"
+            },
+            "source": { "branch": "main" }
+        });
+
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_body = to_bytes(first.into_body(), usize::MAX).await.unwrap();
+        let first_json: Value = serde_json::from_slice(&first_body).unwrap();
+        let first_app_id = first_json["app"]["id"].as_str().unwrap().to_string();
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps/import")
+                    .header("content-type", "application/json")
+                    .body(Body::from(import_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_body = to_bytes(second.into_body(), usize::MAX).await.unwrap();
+        let second_json: Value = serde_json::from_slice(&second_body).unwrap();
+        let second_app_id = second_json["app"]["id"].as_str().unwrap().to_string();
+        assert_eq!(first_app_id, second_app_id);
+
+        let _ = std::fs::remove_dir_all(&repo_path);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
     async fn effective_config_endpoint_returns_imported_values() {
         let db_path = test_db_path();
         let app = create_router(AppState::for_tests(&db_path, None));
@@ -4995,6 +6676,83 @@ mod tests {
             .unwrap();
         let json: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["items"][0]["domain"], json!("example.test"));
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn localhost_domain_is_rejected_for_apps() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let app_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"reject-localhost"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_body = to_bytes(app_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_json: Value = serde_json::from_slice(&app_body).unwrap();
+        let app_id = app_json["id"].as_str().unwrap();
+
+        let create_domain = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_id}/domains"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"domain":"localhost","tls_mode":"managed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_domain.status(), StatusCode::BAD_REQUEST);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_localhost_host_serves_app_frontdoor() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let create_app = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"smoke-next"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(create_app.status(), StatusCode::CREATED);
+
+        let frontdoor = app
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(HOST_HEADER, "smoke-next.localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(frontdoor.status(), StatusCode::OK);
+        let body = to_bytes(frontdoor.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert!(html.contains("smoke-next"));
+        assert!(html.contains("App edge endpoint"));
 
         cleanup_db(&db_path);
     }
