@@ -5867,7 +5867,7 @@ fn write_runtime_compose_file(
         let Some(service_map) = service_config.as_mapping_mut() else {
             continue;
         };
-        service_map.remove(&serde_yaml::Value::String("volumes".to_string()));
+        service_map.remove(serde_yaml::Value::String("volumes".to_string()));
         if service_name == app_service {
             let mut port = serde_yaml::Mapping::new();
             port.insert(
@@ -5884,7 +5884,7 @@ fn write_runtime_compose_file(
             );
             merge_service_environment(service_map, app_env);
         } else {
-            service_map.remove(&serde_yaml::Value::String("ports".to_string()));
+            service_map.remove(serde_yaml::Value::String("ports".to_string()));
         }
     }
 
@@ -6538,10 +6538,10 @@ fn parse_compose_ports(value: Option<&Vec<serde_yaml::Value>>) -> Vec<String> {
             serde_yaml::Value::Number(number) => ports.push(number.to_string()),
             serde_yaml::Value::Mapping(map) => {
                 let published = map
-                    .get(&serde_yaml::Value::String("published".to_string()))
+                    .get(serde_yaml::Value::String("published".to_string()))
                     .and_then(yaml_scalar_to_string);
                 let target = map
-                    .get(&serde_yaml::Value::String("target".to_string()))
+                    .get(serde_yaml::Value::String("target".to_string()))
                     .and_then(yaml_scalar_to_string);
 
                 if let Some(target_value) = target.as_deref() {
