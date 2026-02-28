@@ -4336,6 +4336,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       try {
         const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
         const data = await res.json();
+        selectedLogsDeploymentId = deploymentId;
         document.getElementById('logs').textContent = data.logs || '(no logs)';
       } catch (error) {
         setStatus(`Unable to load logs: ${error.message}`, 'err');
@@ -5431,7 +5432,24 @@ async fn stream_app_logs(
             };
 
             if rows.is_empty() {
-                return None;
+                if sent_empty {
+                    return None;
+                }
+                sent_empty = true;
+                let payload = match encode_stream_logs_event_payload(Some(deployment_id), "", true)
+                {
+                    Ok(encoded) => encoded,
+                    Err(error) => {
+                        warn!(
+                            %error,
+                            %app_id,
+                            %deployment_id,
+                            "failed encoding empty deployment logs payload"
+                        );
+                        return None;
+                    }
+                };
+                return Some(Ok(Event::default().event("logs").data(payload)));
             }
 
             sent_empty = false;

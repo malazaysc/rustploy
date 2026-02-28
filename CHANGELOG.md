@@ -17,6 +17,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 ### Fixed
 
 - SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
+- Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
+- Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
 
 ### Added
 

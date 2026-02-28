@@ -43,5 +43,5 @@
 ## Last Verified
 
 - Date: 2026-02-28
-- Commit base: `54e8b51`
-- Note: dashboard now reflects `queued/building` deployment state immediately; SSE log stream now emits structured JSON payloads and escapes carriage returns to avoid stream panics.
+- Commit base: `d326974`
+- Note: dashboard reflects `queued/building` deployment state immediately; SSE log stream emits structured JSON payloads, escapes carriage returns, and clears stale output on deployment switches.
