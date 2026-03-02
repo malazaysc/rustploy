@@ -123,6 +123,7 @@ struct AppStateConfig {
 #[derive(Clone, Debug)]
 struct Database {
     conn: Arc<Mutex<Connection>>,
+    caddy_access_log_path: Arc<Mutex<String>>,
 }
 
 #[derive(Debug)]
@@ -447,6 +448,7 @@ impl AppState {
     fn from_config(config: AppStateConfig) -> Result<Self> {
         let db = Database::open(&config.db_path)
             .with_context(|| format!("failed to open db at {}", config.db_path))?;
+        db.set_caddy_access_log_path(&config.caddy_access_log_path);
 
         if let (Some(email), Some(password)) = (
             config.bootstrap_admin_email.as_deref(),
@@ -820,21 +822,32 @@ fn normalize_host_value(raw: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
-    let without_port = if value.starts_with('[') {
-        value
-            .strip_prefix('[')
-            .and_then(|candidate| candidate.split(']').next())
-            .unwrap_or(value)
-    } else if let Some((host, port)) = value.rsplit_once(':') {
-        if port.chars().all(|ch| ch.is_ascii_digit()) {
-            host
+
+    let without_port = if let Some(stripped) = value.strip_prefix('[') {
+        match stripped.split_once(']') {
+            Some((host, _rest)) => host,
+            None => value,
+        }
+    } else if value.matches(':').count() == 1 {
+        if let Some((host, port)) = value.rsplit_once(':') {
+            if !host.is_empty() && port.chars().all(|ch| ch.is_ascii_digit()) {
+                host
+            } else {
+                value
+            }
         } else {
             value
         }
     } else {
         value
     };
-    Some(normalize_domain(without_port))
+
+    let normalized = normalize_domain(without_port);
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 impl Database {
@@ -853,7 +866,23 @@ impl Database {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            caddy_access_log_path: Arc::new(Mutex::new(DEFAULT_CADDY_ACCESS_LOG_PATH.to_string())),
         })
+    }
+
+    fn set_caddy_access_log_path(&self, path: &str) {
+        let mut slot = self
+            .caddy_access_log_path
+            .lock()
+            .expect("caddy access log path mutex poisoned");
+        *slot = path.to_string();
+    }
+
+    fn caddy_access_log_path(&self) -> String {
+        self.caddy_access_log_path
+            .lock()
+            .expect("caddy access log path mutex poisoned")
+            .clone()
     }
 
     fn register_agent(&self, request: &AgentRegisterRequest, now_unix_ms: u64) -> Result<bool> {
@@ -5901,7 +5930,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       await refreshDomains();
       await refreshEnvVars();
       await refreshAppConfig();
-      await refreshDashboardMetrics();
+      try {
+        await refreshDashboardMetrics();
+      } catch (error) {
+        renderDashboardMetricsError(error.message);
+      }
       await refreshApps();
       startLogsStream();
     }
@@ -8495,8 +8528,7 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         std::env::var("RUSTPLOY_CADDYFILE_PATH").unwrap_or_else(|_| "data/Caddyfile".to_string());
     let upstream = std::env::var("RUSTPLOY_UPSTREAM_ADDR")
         .unwrap_or_else(|_| DEFAULT_CADDY_UPSTREAM.to_string());
-    let caddy_access_log_path = std::env::var("RUSTPLOY_CADDY_ACCESS_LOG_PATH")
-        .unwrap_or_else(|_| DEFAULT_CADDY_ACCESS_LOG_PATH.to_string());
+    let caddy_access_log_path = db.caddy_access_log_path();
     if let Some(parent) = Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -10377,6 +10409,24 @@ mod tests {
         assert_eq!(app_two_4xx, 1);
 
         cleanup_db(&db_path);
+    }
+
+    #[test]
+    fn normalize_host_value_handles_ipv6_and_empty_hosts() {
+        assert_eq!(
+            normalize_host_value("[2001:db8::1]:443"),
+            Some("2001:db8::1".to_string())
+        );
+        assert_eq!(
+            normalize_host_value("2001:db8::1"),
+            Some("2001:db8::1".to_string())
+        );
+        assert_eq!(
+            normalize_host_value("dash-one.example.com:8080"),
+            Some("dash-one.example.com".to_string())
+        );
+        assert_eq!(normalize_host_value("[]:443"), None);
+        assert_eq!(normalize_host_value("   "), None);
     }
 
     #[tokio::test]

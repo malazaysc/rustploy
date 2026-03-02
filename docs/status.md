@@ -10,6 +10,7 @@
 - Dashboard stat cards now load real values (applications, healthy managed services, domains, and 30d uptime proxy) from backend metrics instead of hardcoded placeholders.
 - Access-log ingestion now runs behind `RUSTPLOY_CADDY_ACCESS_LOG_ENABLED`, performs blocking file reads off the async runtime, and caches host lookups to reduce steady DB pressure.
 - Agent resource sample timestamps are now clamped to server receive time (bounded future skew) before persistence.
+- Caddy host parsing for telemetry now handles IPv6 literals and drops empty host values to avoid malformed bucket attribution.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
