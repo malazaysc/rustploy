@@ -29,6 +29,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `GET /api/v1/auth/me`
 - `POST /api/v1/auth/password-reset/request`
 - `POST /api/v1/auth/password-reset/confirm`
+- `GET /api/v1/dashboard/metrics`
 - `POST /api/v1/apps/import`
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
@@ -66,6 +67,8 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Logs explorer query UI applies a latest-request guard so stale out-of-order responses are dropped instead of overwriting newer query results.
 - Dashboard domain and env list rendering now uses text-safe DOM node assembly, preserving endpoint contracts while preventing stored script injection from user-controlled fields.
 - Dashboard live-log client now tears down app-level SSE streams when app selection is cleared, preventing stale background requests against `/api/v1/apps/{app_id}/logs/stream`.
+- Dashboard metrics endpoint (`GET /api/v1/dashboard/metrics`) returns live summary cards plus request traffic/resource time series for configurable windows (`1h|24h|7d`) and buckets (`1m|5m|1h`), optionally filtered by `app_id` for request traffic.
+- Agent heartbeat payloads can include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes); older heartbeats without `resource` remain accepted.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.

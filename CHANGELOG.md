@@ -16,6 +16,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Added a dedicated SQLite index for incremental deployment log stream queries to reduce polling overhead at scale.
 - Dashboard deployment UX now shows optimistic `queued/building` status immediately after deploy actions and keeps status pills updated during rollout.
 - Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
+- Dashboard metric cards and telemetry widgets now render live backend data (global/per-app request traffic + host resource samples) instead of placeholder values.
+- Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
 
 ### Fixed
 
@@ -64,3 +66,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Manual deployment resync/rebuild support via `force_rebuild` deployment option and dashboard "Resync & Rebuild" action.
 - Documentation governance baseline: root `AGENTS.md`, `docs/status.md`, PR template checklist, and CI `docs-guard` enforcement.
 - Live deployment log piping for compose/git commands, persisted line-by-line and visible through `/api/v1/apps/:id/logs/stream`.
+- New dashboard telemetry endpoint: `GET /api/v1/dashboard/metrics` with window/bucket/app-scope query support.
+- SQLite telemetry persistence for dashboard widgets (`agent_resource_samples`, `request_traffic_buckets`) with retention pruning.
+- Caddy JSON access-log emission/ingestion path for request traffic aggregation (`RUSTPLOY_CADDY_ACCESS_LOG_PATH`).

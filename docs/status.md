@@ -6,7 +6,8 @@
 - Web dashboard with auth, app import/create, deploy/rollback, domain mapping, logs, and env var management.
 - Visual refresh for the dashboard is aligned with the new v0 mock (sidebar-first layout, modern dark styling, and card-based information hierarchy) without changing API-backed workflows.
 - Improved scrolling polish now anchors root background/overscroll handling so fast scroll bounce no longer reveals blank top/bottom gaps.
-- Graph placeholders now cover traffic and server resource chart areas so every graph panel is represented before live metrics data is wired in.
+- Dashboard graph widgets now use live telemetry: request traffic series (global/per-app) from Caddy access logs and host resource series from agent heartbeat snapshots.
+- Dashboard stat cards now load real values (applications, healthy managed services, domains, and 30d uptime proxy) from backend metrics instead of hardcoded placeholders.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
@@ -53,6 +54,6 @@
 
 ## Last Verified
 
-- Date: 2026-03-01
+- Date: 2026-03-02
 - Commit base: `935ac11`
-- Note: dashboard now uses a v0-inspired visual shell (sidebar, stats cards, graph placeholders, and updated panel styling), includes overscroll gap fixes for fast scroll behavior, supports collapsible deployment history with selected-deployment summaries, and pairs with a new `/logs` page for query/filter-based log investigation while preserving structured SSE streaming in the main dashboard.
+- Note: dashboard telemetry now includes a new `/api/v1/dashboard/metrics` endpoint plus access-log and heartbeat ingestion so request/resource widgets render live global/per-app data in the main dashboard shell.

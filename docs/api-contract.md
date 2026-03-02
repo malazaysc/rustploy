@@ -24,6 +24,7 @@ Base path: `/api/v1` (metrics endpoint is additionally exposed at `/metrics`).
 - Health/metrics: `GET /health` (also exposed at `/api/v1/health`), `GET /metrics`
 - Auth: `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`, password reset endpoints
 - Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
+- Dashboard telemetry: `GET /dashboard/metrics`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
 - Effective config: `GET /apps/{app_id}/config`
 - Env vars: `GET/PUT /apps/{app_id}/env`, `DELETE /apps/{app_id}/env/{key}`
@@ -102,3 +103,29 @@ If `rustploy.yaml` is invalid, response is `400` with structured fields under:
 - `logs` contains only newly appended lines for the active deployment (first event after connection/deployment change can include accumulated lines).
 - `reset` is `true` when clients should replace displayed content (initial snapshot/reconnect/deployment switch).
 - When a deployment switch has no log lines yet, the stream emits a single `reset: true` event with empty `logs` so clients can clear stale output.
+
+## Agent heartbeat resource payload
+
+`POST /agents/heartbeat` accepts an optional `resource` object:
+
+- `cpu_percent`
+- `memory_used_bytes`, `memory_total_bytes`
+- `disk_used_bytes`, `disk_total_bytes`
+- `network_rx_bytes`, `network_tx_bytes`
+
+When omitted, heartbeat behavior remains unchanged.
+
+## Dashboard metrics endpoint
+
+`GET /dashboard/metrics` supports query parameters:
+
+- `window`: `1h` | `24h` | `7d` (default `24h`)
+- `bucket`: `1m` | `5m` | `1h` (default depends on window)
+- `app_id`: optional UUID for app-scoped request traffic
+
+Response includes:
+
+- `summary` (applications, healthy managed services, domains, uptime proxy)
+- `scope` (effective window/bucket/app scope and unix-ms range)
+- `request_traffic[]` (bucketed totals + 4xx/5xx)
+- `server_resources[]` (bucketed host resource averages + sample counts)

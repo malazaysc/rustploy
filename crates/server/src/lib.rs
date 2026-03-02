@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     convert::Infallible,
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{mpsc, Arc, Mutex},
@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     body::Bytes,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{header, HeaderMap, StatusCode},
     response::{sse::Event, sse::KeepAlive, Html, IntoResponse, Sse},
     routing::{delete, get, post},
@@ -24,18 +24,19 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared::{
-    AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered, AgentStatus,
-    AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse, AppEnvVarListResponse,
-    AppEnvVarSummary, AppListResponse, AppSummary, AuthLoginRequest, AuthSessionResponse,
-    ComposeServiceSummary, ComposeSummary, CreateAppRequest, CreateDeploymentAccepted,
-    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
+    AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered,
+    AgentResourceSnapshot, AgentStatus, AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse,
+    AppEnvVarListResponse, AppEnvVarSummary, AppListResponse, AppSummary, AuthLoginRequest,
+    AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
+    CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
+    CreateTokenResponse, DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary,
     DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
     DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
     EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
     GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
     NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
-    PasswordResetRequestedResponse, RepositoryRef, SourceRef, TokenListResponse, TokenSummary,
-    UpsertAppEnvVarRequest,
+    PasswordResetRequestedResponse, RepositoryRef, RequestTrafficPoint, ServerResourcePoint,
+    SourceRef, TokenListResponse, TokenSummary, UpsertAppEnvVarRequest,
 };
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tracing::{error, info, warn};
@@ -62,8 +63,13 @@ const DEFAULT_PASSWORD_RESET_TTL_MS: u64 = 15 * 60 * 1000;
 const DEFAULT_ADMIN_EMAIL: &str = "admin@localhost";
 const DEFAULT_ADMIN_PASSWORD: &str = "admin";
 const DEFAULT_CADDY_UPSTREAM: &str = "127.0.0.1:8080";
+const DEFAULT_CADDY_ACCESS_LOG_PATH: &str = "/shared/caddy-access.log";
+const DEFAULT_TELEMETRY_RETENTION_DAYS: u64 = 30;
+const DEFAULT_CADDY_ACCESS_LOG_POLL_INTERVAL_MS: u64 = 2_000;
+const DEFAULT_TELEMETRY_RETENTION_SWEEP_MS: u64 = 60 * 60 * 1000;
 const CONTROL_PLANE_HOST: &str = "localhost";
 const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
+const GLOBAL_TRAFFIC_SCOPE: &str = "__global__";
 
 const SCOPE_READ: u8 = 1;
 const SCOPE_DEPLOY: u8 = 1 << 1;
@@ -84,6 +90,8 @@ pub struct AppState {
     job_max_attempts: u32,
     api_rate_limit_per_minute: u32,
     webhook_rate_limit_per_minute: u32,
+    telemetry_retention_days: u64,
+    caddy_access_log_path: String,
     rate_limit_state: Arc<Mutex<HashMap<String, (u64, u32)>>>,
 }
 
@@ -104,6 +112,8 @@ struct AppStateConfig {
     job_max_attempts: u32,
     api_rate_limit_per_minute: u32,
     webhook_rate_limit_per_minute: u32,
+    telemetry_retention_days: u64,
+    caddy_access_log_path: String,
 }
 
 #[derive(Clone, Debug)]
@@ -206,6 +216,76 @@ struct MetricsSnapshot {
     deployments_queued: u64,
     domains_total: u64,
     tokens_total: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RequestTrafficBucketDelta {
+    bucket_start_unix_ms: u64,
+    app_scope: String,
+    total_requests: u64,
+    errors_4xx: u64,
+    errors_5xx: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DashboardWindow {
+    OneHour,
+    OneDay,
+    SevenDays,
+}
+
+impl DashboardWindow {
+    fn parse(value: Option<&str>) -> Result<Self, &'static str> {
+        match value.unwrap_or("24h") {
+            "1h" => Ok(Self::OneHour),
+            "24h" => Ok(Self::OneDay),
+            "7d" => Ok(Self::SevenDays),
+            _ => Err("window must be one of: 1h, 24h, 7d"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OneHour => "1h",
+            Self::OneDay => "24h",
+            Self::SevenDays => "7d",
+        }
+    }
+
+    fn duration_ms(self) -> u64 {
+        match self {
+            Self::OneHour => 60 * 60 * 1000,
+            Self::OneDay => 24 * 60 * 60 * 1000,
+            Self::SevenDays => 7 * 24 * 60 * 60 * 1000,
+        }
+    }
+
+    fn default_bucket_ms(self) -> u64 {
+        match self {
+            Self::OneHour => 60 * 1000,
+            Self::OneDay => 5 * 60 * 1000,
+            Self::SevenDays => 60 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DashboardMetricsQuery {
+    window: Option<String>,
+    bucket: Option<String>,
+    app_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaddyAccessLogRecord {
+    ts: Option<f64>,
+    request: Option<CaddyAccessLogRequest>,
+    status: Option<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CaddyAccessLogRequest {
+    host: Option<String>,
 }
 
 #[derive(Debug)]
@@ -326,6 +406,12 @@ impl AppState {
                 "RUSTPLOY_WEBHOOK_RATE_LIMIT_PER_MINUTE",
                 DEFAULT_WEBHOOK_RATE_LIMIT_PER_MINUTE,
             )?,
+            telemetry_retention_days: read_env_u64(
+                "RUSTPLOY_TELEMETRY_RETENTION_DAYS",
+                DEFAULT_TELEMETRY_RETENTION_DAYS,
+            )?,
+            caddy_access_log_path: std::env::var("RUSTPLOY_CADDY_ACCESS_LOG_PATH")
+                .unwrap_or_else(|_| DEFAULT_CADDY_ACCESS_LOG_PATH.to_string()),
         })
     }
 
@@ -354,6 +440,8 @@ impl AppState {
             job_max_attempts: config.job_max_attempts,
             api_rate_limit_per_minute: config.api_rate_limit_per_minute,
             webhook_rate_limit_per_minute: config.webhook_rate_limit_per_minute,
+            telemetry_retention_days: config.telemetry_retention_days,
+            caddy_access_log_path: config.caddy_access_log_path,
             rate_limit_state: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -370,6 +458,15 @@ impl AppState {
 
     pub fn reconciler_interval(&self) -> Duration {
         Duration::from_millis(self.reconciler_interval_ms)
+    }
+
+    pub fn caddy_access_log_path(&self) -> &str {
+        &self.caddy_access_log_path
+    }
+
+    pub fn telemetry_retention_ms(&self) -> u64 {
+        self.telemetry_retention_days
+            .saturating_mul(24 * 60 * 60 * 1000)
     }
 
     pub fn run_reconciler_once(&self) -> Result<bool> {
@@ -419,6 +516,8 @@ impl AppState {
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
             api_rate_limit_per_minute: 10_000,
             webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
         })
         .expect("test state should initialize")
     }
@@ -440,6 +539,230 @@ pub async fn run_reconciler_loop(state: AppState) {
             Err(error) => warn!(%error, "reconciler tick failed"),
         }
     }
+}
+
+pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
+    let poll_interval = Duration::from_millis(DEFAULT_CADDY_ACCESS_LOG_POLL_INTERVAL_MS);
+    let retention_sweep_ms = DEFAULT_TELEMETRY_RETENTION_SWEEP_MS;
+    let mut offset: u64 = 0;
+    let mut pending_partial = String::new();
+    let mut initialized = false;
+    let mut last_retention_sweep_unix_ms = 0u64;
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let now = now_unix_ms();
+        if now.saturating_sub(last_retention_sweep_unix_ms) >= retention_sweep_ms {
+            let cutoff = now.saturating_sub(state.telemetry_retention_ms());
+            if let Err(error) = state.db.prune_dashboard_telemetry(cutoff) {
+                warn!(%error, "failed pruning dashboard telemetry");
+            }
+            last_retention_sweep_unix_ms = now;
+        }
+
+        let lines = match read_caddy_access_log_lines(
+            state.caddy_access_log_path(),
+            &mut offset,
+            &mut pending_partial,
+            &mut initialized,
+        ) {
+            Ok(lines) => lines,
+            Err(error) => {
+                warn!(%error, path = state.caddy_access_log_path(), "failed reading caddy access log");
+                continue;
+            }
+        };
+
+        if lines.is_empty() {
+            continue;
+        }
+
+        if let Err(error) = ingest_caddy_access_lines(&state, &lines, now) {
+            warn!(%error, "failed ingesting caddy access log lines");
+        }
+    }
+}
+
+fn read_caddy_access_log_lines(
+    path: &str,
+    offset: &mut u64,
+    pending_partial: &mut String,
+    initialized: &mut bool,
+) -> Result<Vec<String>> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed reading metadata for {path}"))
+        }
+    };
+    let file_len = metadata.len();
+    if !*initialized {
+        *offset = file_len;
+        *initialized = true;
+        return Ok(Vec::new());
+    }
+    if file_len < *offset {
+        *offset = 0;
+        pending_partial.clear();
+    }
+    if file_len == *offset {
+        return Ok(Vec::new());
+    }
+
+    let mut file = fs::File::open(path).with_context(|| format!("failed opening {path}"))?;
+    file.seek(SeekFrom::Start(*offset))
+        .with_context(|| format!("failed seeking {path}"))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed reading appended bytes from {path}"))?;
+    *offset = (*offset).saturating_add(bytes.len() as u64);
+
+    let mut buffer = String::new();
+    if !pending_partial.is_empty() {
+        buffer.push_str(pending_partial);
+        pending_partial.clear();
+    }
+    buffer.push_str(&String::from_utf8_lossy(&bytes));
+
+    let mut lines = Vec::new();
+    let mut parts = buffer.split('\n').peekable();
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() && !buffer.ends_with('\n') {
+            pending_partial.push_str(part);
+            break;
+        }
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+    }
+    Ok(lines)
+}
+
+fn ingest_caddy_access_lines(state: &AppState, lines: &[String], now_unix_ms: u64) -> Result<()> {
+    let host_lookup = build_host_lookup(state)?;
+    let mut deltas: HashMap<(u64, String), RequestTrafficBucketDelta> = HashMap::new();
+
+    for line in lines {
+        let Some((bucket_start_unix_ms, host, status_code)) = parse_caddy_access_line(line) else {
+            continue;
+        };
+        if is_control_plane_host(&host) {
+            continue;
+        }
+        increment_traffic_delta(
+            &mut deltas,
+            bucket_start_unix_ms,
+            GLOBAL_TRAFFIC_SCOPE.to_string(),
+            status_code,
+        );
+        if let Some(app_id) = host_lookup.get(&host) {
+            increment_traffic_delta(
+                &mut deltas,
+                bucket_start_unix_ms,
+                app_id.to_string(),
+                status_code,
+            );
+        }
+    }
+
+    let mut flattened = deltas.into_values().collect::<Vec<_>>();
+    flattened.sort_by(|left, right| {
+        left.bucket_start_unix_ms
+            .cmp(&right.bucket_start_unix_ms)
+            .then_with(|| left.app_scope.cmp(&right.app_scope))
+    });
+    state
+        .db
+        .upsert_request_traffic_buckets(&flattened, now_unix_ms)
+}
+
+fn build_host_lookup(state: &AppState) -> Result<HashMap<String, Uuid>> {
+    let mut by_host = HashMap::new();
+    for domain in state.db.list_all_domains()? {
+        let normalized = normalize_domain(&domain.domain);
+        if normalized.is_empty() || is_control_plane_host(&normalized) {
+            continue;
+        }
+        by_host.insert(normalized, domain.app_id);
+    }
+
+    for app in state.db.list_apps()? {
+        let slug = localhost_slug(&app.name);
+        if slug.is_empty() {
+            continue;
+        }
+        by_host.insert(format!("{slug}.localhost"), app.id);
+    }
+    Ok(by_host)
+}
+
+fn parse_caddy_access_line(line: &str) -> Option<(u64, String, u16)> {
+    let parsed: CaddyAccessLogRecord = serde_json::from_str(line).ok()?;
+    let host = parsed.request?.host?;
+    let host = normalize_host_value(&host)?;
+    let status = parsed.status?;
+    let ts_unix_ms = parsed
+        .ts
+        .map(|seconds| {
+            if seconds.is_sign_negative() {
+                0
+            } else {
+                (seconds * 1000.0).round() as u64
+            }
+        })
+        .unwrap_or_else(now_unix_ms);
+    let bucket_start_unix_ms = align_timestamp(ts_unix_ms, 60 * 1000);
+    Some((bucket_start_unix_ms, host, status))
+}
+
+fn increment_traffic_delta(
+    deltas: &mut HashMap<(u64, String), RequestTrafficBucketDelta>,
+    bucket_start_unix_ms: u64,
+    app_scope: String,
+    status_code: u16,
+) {
+    let key = (bucket_start_unix_ms, app_scope.clone());
+    let entry = deltas
+        .entry(key)
+        .or_insert_with(|| RequestTrafficBucketDelta {
+            bucket_start_unix_ms,
+            app_scope,
+            total_requests: 0,
+            errors_4xx: 0,
+            errors_5xx: 0,
+        });
+    entry.total_requests = entry.total_requests.saturating_add(1);
+    if (400..500).contains(&status_code) {
+        entry.errors_4xx = entry.errors_4xx.saturating_add(1);
+    } else if status_code >= 500 {
+        entry.errors_5xx = entry.errors_5xx.saturating_add(1);
+    }
+}
+
+fn normalize_host_value(raw: &str) -> Option<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let without_port = if value.starts_with('[') {
+        value
+            .strip_prefix('[')
+            .and_then(|candidate| candidate.split(']').next())
+            .unwrap_or(value)
+    } else if let Some((host, port)) = value.rsplit_once(':') {
+        if port.chars().all(|ch| ch.is_ascii_digit()) {
+            host
+        } else {
+            value
+        }
+    } else {
+        value
+    };
+    Some(normalize_domain(without_port))
 }
 
 impl Database {
@@ -1493,6 +1816,300 @@ impl Database {
             domains_total: count("SELECT COUNT(*) FROM domains")?,
             tokens_total: count("SELECT COUNT(*) FROM api_tokens WHERE revoked_at_unix_ms IS NULL")?,
         })
+    }
+
+    fn healthy_managed_services_total(&self) -> Result<u64> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let value: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM managed_services WHERE healthy = 1",
+                [],
+                |row| row.get(0),
+            )
+            .context("failed counting healthy managed services")?;
+        to_u64(value)
+    }
+
+    fn uptime_30d_percent(&self, now_unix_ms: u64) -> Result<Option<f64>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let thirty_days_ms = 30 * 24 * 60 * 60 * 1000u64;
+        let from_unix_ms = now_unix_ms.saturating_sub(thirty_days_ms);
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(total_requests), 0) FROM request_traffic_buckets
+                 WHERE app_id = ?1 AND bucket_start_unix_ms >= ?2",
+                params![GLOBAL_TRAFFIC_SCOPE, to_i64(from_unix_ms)?],
+                |row| row.get(0),
+            )
+            .context("failed summing 30d request totals")?;
+        if total <= 0 {
+            return Ok(None);
+        }
+        let errors_5xx: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(errors_5xx), 0) FROM request_traffic_buckets
+                 WHERE app_id = ?1 AND bucket_start_unix_ms >= ?2",
+                params![GLOBAL_TRAFFIC_SCOPE, to_i64(from_unix_ms)?],
+                |row| row.get(0),
+            )
+            .context("failed summing 30d 5xx totals")?;
+        let healthy = ((total - errors_5xx.max(0)) as f64 / total as f64) * 100.0;
+        Ok(Some((healthy * 100.0).round() / 100.0))
+    }
+
+    fn insert_agent_resource_sample(
+        &self,
+        agent_id: Uuid,
+        snapshot: &AgentResourceSnapshot,
+        captured_at_unix_ms: u64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        conn.execute(
+            "INSERT INTO agent_resource_samples (
+                agent_id,
+                captured_at_unix_ms,
+                cpu_percent,
+                memory_used_bytes,
+                memory_total_bytes,
+                disk_used_bytes,
+                disk_total_bytes,
+                network_rx_bytes,
+                network_tx_bytes
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                agent_id.to_string(),
+                to_i64(captured_at_unix_ms)?,
+                snapshot.cpu_percent,
+                to_i64(snapshot.memory_used_bytes)?,
+                to_i64(snapshot.memory_total_bytes)?,
+                to_i64(snapshot.disk_used_bytes)?,
+                to_i64(snapshot.disk_total_bytes)?,
+                to_i64(snapshot.network_rx_bytes)?,
+                to_i64(snapshot.network_tx_bytes)?,
+            ],
+        )
+        .context("failed writing agent resource sample")?;
+        Ok(())
+    }
+
+    fn upsert_request_traffic_buckets(
+        &self,
+        entries: &[RequestTrafficBucketDelta],
+        updated_at_unix_ms: u64,
+    ) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let tx = conn
+            .unchecked_transaction()
+            .context("failed opening request traffic transaction")?;
+        for entry in entries {
+            tx.execute(
+                "INSERT INTO request_traffic_buckets (
+                    bucket_start_unix_ms,
+                    app_id,
+                    total_requests,
+                    errors_4xx,
+                    errors_5xx,
+                    updated_at_unix_ms
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(bucket_start_unix_ms, app_id) DO UPDATE SET
+                    total_requests = request_traffic_buckets.total_requests + excluded.total_requests,
+                    errors_4xx = request_traffic_buckets.errors_4xx + excluded.errors_4xx,
+                    errors_5xx = request_traffic_buckets.errors_5xx + excluded.errors_5xx,
+                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                params![
+                    to_i64(entry.bucket_start_unix_ms)?,
+                    entry.app_scope,
+                    to_i64(entry.total_requests)?,
+                    to_i64(entry.errors_4xx)?,
+                    to_i64(entry.errors_5xx)?,
+                    to_i64(updated_at_unix_ms)?,
+                ],
+            )
+            .context("failed upserting request traffic bucket")?;
+        }
+        tx.commit()
+            .context("failed committing request traffic transaction")
+    }
+
+    fn request_traffic_series(
+        &self,
+        from_unix_ms: u64,
+        to_unix_ms: u64,
+        bucket_ms: u64,
+        app_scope: &str,
+    ) -> Result<Vec<RequestTrafficPoint>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT ((bucket_start_unix_ms / ?1) * ?1) AS bucket,
+                        SUM(total_requests) AS total_requests,
+                        SUM(errors_4xx) AS errors_4xx,
+                        SUM(errors_5xx) AS errors_5xx
+                 FROM request_traffic_buckets
+                 WHERE app_id = ?2
+                   AND bucket_start_unix_ms >= ?3
+                   AND bucket_start_unix_ms <= ?4
+                 GROUP BY bucket
+                 ORDER BY bucket ASC",
+            )
+            .context("failed preparing request traffic series query")?;
+        let mut rows = stmt
+            .query(params![
+                to_i64(bucket_ms)?,
+                app_scope,
+                to_i64(from_unix_ms)?,
+                to_i64(to_unix_ms)?,
+            ])
+            .context("failed querying request traffic series")?;
+        let mut by_bucket = BTreeMap::new();
+        while let Some(row) = rows
+            .next()
+            .context("failed iterating request traffic rows")?
+        {
+            let bucket_raw: i64 = row.get(0).context("failed reading traffic bucket")?;
+            let total_raw: i64 = row.get(1).context("failed reading traffic total")?;
+            let error_4xx_raw: i64 = row.get(2).context("failed reading traffic 4xx")?;
+            let error_5xx_raw: i64 = row.get(3).context("failed reading traffic 5xx")?;
+            by_bucket.insert(
+                to_u64(bucket_raw)?,
+                RequestTrafficPoint {
+                    bucket_start_unix_ms: to_u64(bucket_raw)?,
+                    total_requests: to_u64(total_raw)?,
+                    errors_4xx: to_u64(error_4xx_raw)?,
+                    errors_5xx: to_u64(error_5xx_raw)?,
+                },
+            );
+        }
+
+        let mut series = Vec::new();
+        let mut cursor = align_timestamp(from_unix_ms, bucket_ms);
+        while cursor <= to_unix_ms {
+            if let Some(value) = by_bucket.get(&cursor) {
+                series.push(value.clone());
+            } else {
+                series.push(RequestTrafficPoint {
+                    bucket_start_unix_ms: cursor,
+                    total_requests: 0,
+                    errors_4xx: 0,
+                    errors_5xx: 0,
+                });
+            }
+            cursor = cursor.saturating_add(bucket_ms);
+            if bucket_ms == 0 {
+                break;
+            }
+        }
+        Ok(series)
+    }
+
+    fn server_resource_series(
+        &self,
+        from_unix_ms: u64,
+        to_unix_ms: u64,
+        bucket_ms: u64,
+    ) -> Result<Vec<ServerResourcePoint>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT ((captured_at_unix_ms / ?1) * ?1) AS bucket,
+                        AVG(cpu_percent) AS cpu_percent_avg,
+                        AVG(memory_used_bytes) AS memory_used_bytes_avg,
+                        AVG(memory_total_bytes) AS memory_total_bytes_avg,
+                        AVG(disk_used_bytes) AS disk_used_bytes_avg,
+                        AVG(disk_total_bytes) AS disk_total_bytes_avg,
+                        AVG(network_rx_bytes) AS network_rx_bytes_avg,
+                        AVG(network_tx_bytes) AS network_tx_bytes_avg,
+                        COUNT(*) AS samples
+                 FROM agent_resource_samples
+                 WHERE captured_at_unix_ms >= ?2
+                   AND captured_at_unix_ms <= ?3
+                 GROUP BY bucket
+                 ORDER BY bucket ASC",
+            )
+            .context("failed preparing server resource series query")?;
+        let mut rows = stmt
+            .query(params![
+                to_i64(bucket_ms)?,
+                to_i64(from_unix_ms)?,
+                to_i64(to_unix_ms)?,
+            ])
+            .context("failed querying server resource series")?;
+        let mut by_bucket = BTreeMap::new();
+        while let Some(row) = rows
+            .next()
+            .context("failed iterating server resource rows")?
+        {
+            let bucket_raw: i64 = row.get(0).context("failed reading resource bucket")?;
+            let cpu_percent_avg: f64 = row.get(1).context("failed reading cpu average")?;
+            let memory_used_bytes_avg: f64 =
+                row.get(2).context("failed reading memory used avg")?;
+            let memory_total_bytes_avg: f64 =
+                row.get(3).context("failed reading memory total avg")?;
+            let disk_used_bytes_avg: f64 = row.get(4).context("failed reading disk used avg")?;
+            let disk_total_bytes_avg: f64 = row.get(5).context("failed reading disk total avg")?;
+            let network_rx_bytes_avg: f64 = row.get(6).context("failed reading rx avg")?;
+            let network_tx_bytes_avg: f64 = row.get(7).context("failed reading tx avg")?;
+            let samples_raw: i64 = row.get(8).context("failed reading sample count")?;
+            let bucket = to_u64(bucket_raw)?;
+            by_bucket.insert(
+                bucket,
+                ServerResourcePoint {
+                    bucket_start_unix_ms: bucket,
+                    cpu_percent_avg,
+                    memory_used_bytes_avg: memory_used_bytes_avg.max(0.0).round() as u64,
+                    memory_total_bytes_avg: memory_total_bytes_avg.max(0.0).round() as u64,
+                    disk_used_bytes_avg: disk_used_bytes_avg.max(0.0).round() as u64,
+                    disk_total_bytes_avg: disk_total_bytes_avg.max(0.0).round() as u64,
+                    network_rx_bytes_avg: network_rx_bytes_avg.max(0.0).round() as u64,
+                    network_tx_bytes_avg: network_tx_bytes_avg.max(0.0).round() as u64,
+                    samples: to_u64(samples_raw)?,
+                },
+            );
+        }
+
+        let mut series = Vec::new();
+        let mut cursor = align_timestamp(from_unix_ms, bucket_ms);
+        while cursor <= to_unix_ms {
+            if let Some(value) = by_bucket.get(&cursor) {
+                series.push(value.clone());
+            } else {
+                series.push(ServerResourcePoint {
+                    bucket_start_unix_ms: cursor,
+                    cpu_percent_avg: 0.0,
+                    memory_used_bytes_avg: 0,
+                    memory_total_bytes_avg: 0,
+                    disk_used_bytes_avg: 0,
+                    disk_total_bytes_avg: 0,
+                    network_rx_bytes_avg: 0,
+                    network_tx_bytes_avg: 0,
+                    samples: 0,
+                });
+            }
+            cursor = cursor.saturating_add(bucket_ms);
+            if bucket_ms == 0 {
+                break;
+            }
+        }
+        Ok(series)
+    }
+
+    fn prune_dashboard_telemetry(&self, cutoff_unix_ms: u64) -> Result<()> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let cutoff = to_i64(cutoff_unix_ms)?;
+        conn.execute(
+            "DELETE FROM agent_resource_samples WHERE captured_at_unix_ms < ?1",
+            params![cutoff],
+        )
+        .context("failed pruning agent resource samples")?;
+        conn.execute(
+            "DELETE FROM request_traffic_buckets WHERE bucket_start_unix_ms < ?1",
+            params![cutoff],
+        )
+        .context("failed pruning request traffic buckets")?;
+        Ok(())
     }
 
     fn ensure_managed_service(
@@ -2833,6 +3450,8 @@ fn initialize_connection(conn: &Connection) -> Result<()> {
         "../migrations/0010_deployment_logs_cursor_index.sql"
     ))
     .context("failed running sqlite migration 0010")?;
+    conn.execute_batch(include_str!("../migrations/0011_dashboard_telemetry.sql"))
+        .context("failed running sqlite migration 0011")?;
     ensure_deployments_metadata_columns(conn)?;
     ensure_import_config_columns(conn)?;
 
@@ -2936,6 +3555,33 @@ fn compute_backoff_ms(attempt: u32, base_ms: u64, max_ms: u64) -> u64 {
     base_ms.saturating_mul(1u64 << shift).min(max_ms)
 }
 
+fn align_timestamp(value_unix_ms: u64, bucket_ms: u64) -> u64 {
+    if bucket_ms == 0 {
+        value_unix_ms
+    } else {
+        (value_unix_ms / bucket_ms) * bucket_ms
+    }
+}
+
+fn parse_bucket_ms(value: Option<&str>, default_bucket_ms: u64) -> Result<u64, &'static str> {
+    match value {
+        None => Ok(default_bucket_ms),
+        Some("1m") => Ok(60 * 1000),
+        Some("5m") => Ok(5 * 60 * 1000),
+        Some("1h") => Ok(60 * 60 * 1000),
+        Some(_) => Err("bucket must be one of: 1m, 5m, 1h"),
+    }
+}
+
+fn format_bucket_label(bucket_ms: u64) -> &'static str {
+    match bucket_ms {
+        60_000 => "1m",
+        300_000 => "5m",
+        3_600_000 => "1h",
+        _ => "custom",
+    }
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -2987,6 +3633,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/register", post(register_agent))
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
+        .route("/api/v1/dashboard/metrics", get(dashboard_metrics))
         .with_state(state)
 }
 
@@ -3892,8 +4539,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       padding: 12px 14px;
       min-width: 0;
     }
-    .traffic-placeholder {
-      position: relative;
+    .traffic-chart-shell {
       height: 210px;
       border: 1px solid var(--line);
       border-radius: 10px;
@@ -3903,42 +4549,51 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         linear-gradient(90deg, color-mix(in oklab, var(--line) 40%, transparent) 1px, transparent 1px),
         color-mix(in oklab, var(--sidebar) 65%, black 35%);
       background-size: 100% 36px, 40px 100%, auto;
+      display: grid;
+      place-items: stretch;
     }
-    .traffic-wave {
-      position: absolute;
-      inset: auto 0 0;
-      height: 65%;
-      background:
-        radial-gradient(140% 85% at 8% 100%, color-mix(in oklab, var(--primary) 34%, transparent) 0 30%, transparent 32%),
-        radial-gradient(130% 90% at 32% 100%, color-mix(in oklab, var(--chart-2) 26%, transparent) 0 30%, transparent 32%),
-        radial-gradient(130% 85% at 52% 100%, color-mix(in oklab, var(--primary) 30%, transparent) 0 28%, transparent 31%),
-        radial-gradient(110% 95% at 74% 100%, color-mix(in oklab, var(--chart-2) 22%, transparent) 0 29%, transparent 33%),
-        radial-gradient(120% 100% at 94% 100%, color-mix(in oklab, var(--primary) 26%, transparent) 0 27%, transparent 31%);
-      opacity: .95;
+    .traffic-chart {
+      width: 100%;
+      height: 100%;
+      display: block;
     }
-    .traffic-line {
-      position: absolute;
-      left: 14px;
-      right: 14px;
-      bottom: 18px;
-      height: 120px;
-      border-radius: 8px;
-      border: 1px dashed color-mix(in oklab, var(--primary) 46%, transparent);
-      background:
-        linear-gradient(120deg,
-          transparent 0% 8%,
-          color-mix(in oklab, var(--primary) 72%, transparent) 8% 10%,
-          transparent 10% 21%,
-          color-mix(in oklab, var(--primary) 72%, transparent) 21% 23%,
-          transparent 23% 38%,
-          color-mix(in oklab, var(--primary) 72%, transparent) 38% 40%,
-          transparent 40% 58%,
-          color-mix(in oklab, var(--primary) 72%, transparent) 58% 60%,
-          transparent 60% 78%,
-          color-mix(in oklab, var(--primary) 72%, transparent) 78% 80%,
-          transparent 80% 100%);
-      opacity: .52;
+    .traffic-line-total {
+      fill: none;
+      stroke: color-mix(in oklab, var(--primary) 88%, white 12%);
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
     }
+    .traffic-line-error {
+      fill: none;
+      stroke: color-mix(in oklab, var(--danger) 82%, white 18%);
+      stroke-width: 2;
+      vector-effect: non-scaling-stroke;
+      stroke-dasharray: 3 3;
+    }
+    .traffic-empty {
+      font-size: 12px;
+      fill: color-mix(in oklab, var(--muted) 85%, white 15%);
+    }
+    .traffic-legend {
+      margin-top: 8px;
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .traffic-legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 2px;
+      margin-right: 6px;
+      vertical-align: middle;
+      border-radius: 999px;
+      background: currentColor;
+    }
+    .traffic-legend .total { color: color-mix(in oklab, var(--primary) 88%, white 12%); }
+    .traffic-legend .errors { color: color-mix(in oklab, var(--danger) 82%, white 18%); }
     .graph-note {
       margin-top: 9px;
       font-size: 11px;
@@ -3963,11 +4618,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       width: 52px;
       height: 52px;
       border-radius: 999px;
-      background:
-        conic-gradient(
-          color-mix(in oklab, var(--primary) 80%, white 20%) 0 230deg,
-          color-mix(in oklab, var(--line) 85%, black 15%) 230deg 360deg
-        );
+      --gauge-angle: 0deg;
+      --gauge-color: color-mix(in oklab, var(--primary) 80%, white 20%);
+      background: conic-gradient(
+        var(--gauge-color) 0 var(--gauge-angle),
+        color-mix(in oklab, var(--line) 85%, black 15%) var(--gauge-angle) 360deg
+      );
       position: relative;
     }
     .gauge-ring::after {
@@ -3977,15 +4633,6 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       border-radius: inherit;
       background: color-mix(in oklab, var(--sidebar) 75%, black 25%);
       border: 1px solid var(--line);
-    }
-    .gauge:nth-child(2) .gauge-ring {
-      background: conic-gradient(color-mix(in oklab, var(--chart-2) 80%, white 20%) 0 260deg, color-mix(in oklab, var(--line) 85%, black 15%) 260deg 360deg);
-    }
-    .gauge:nth-child(3) .gauge-ring {
-      background: conic-gradient(color-mix(in oklab, var(--chart-3) 80%, white 20%) 0 190deg, color-mix(in oklab, var(--line) 85%, black 15%) 190deg 360deg);
-    }
-    .gauge:nth-child(4) .gauge-ring {
-      background: conic-gradient(color-mix(in oklab, var(--warning) 85%, white 15%) 0 160deg, color-mix(in oklab, var(--line) 85%, black 15%) 160deg 360deg);
     }
     .gauge strong {
       display: block;
@@ -4290,22 +4937,22 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       <section class="stats">
         <article class="stat-card">
           <div class="stat-kicker"><span>Applications</span><span>Live</span></div>
-          <div class="stat-value">12</div>
+          <div class="stat-value" id="stat-applications">0</div>
           <div class="stat-note">Deployments managed from one panel</div>
         </article>
         <article class="stat-card">
           <div class="stat-kicker"><span>Databases</span><span>Healthy</span></div>
-          <div class="stat-value">4</div>
+          <div class="stat-value" id="stat-databases">0</div>
           <div class="stat-note">Managed backing services online</div>
         </article>
         <article class="stat-card">
           <div class="stat-kicker"><span>Domains</span><span>SSL</span></div>
-          <div class="stat-value">18</div>
+          <div class="stat-value" id="stat-domains">0</div>
           <div class="stat-note">Routed endpoints with managed TLS</div>
         </article>
         <article class="stat-card">
           <div class="stat-kicker"><span>Uptime</span><span>30d</span></div>
-          <div class="stat-value">99.97%</div>
+          <div class="stat-value" id="stat-uptime">n/a</div>
           <div class="stat-note">Runtime availability trend</div>
         </article>
       </section>
@@ -4314,42 +4961,45 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <article class="graph-shell">
           <div class="graph-head">
             <h3>Request Traffic</h3>
-            <span class="graph-tag">Placeholder</span>
+            <span class="graph-tag" id="traffic-scope-tag">24h · 5m</span>
           </div>
           <div class="graph-body">
-            <div class="traffic-placeholder">
-              <div class="traffic-wave"></div>
-              <div class="traffic-line"></div>
+            <div class="traffic-chart-shell">
+              <svg class="traffic-chart" id="traffic-chart" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
             </div>
-            <p class="graph-note">Chart placeholder for request/error timeseries.</p>
+            <div class="traffic-legend">
+              <span class="total">Requests</span>
+              <span class="errors">Errors (4xx + 5xx)</span>
+            </div>
+            <p class="graph-note" id="traffic-note">Waiting for live traffic telemetry.</p>
           </div>
         </article>
 
         <article class="graph-shell">
           <div class="graph-head">
             <h3>Server Resources</h3>
-            <span class="graph-tag">Placeholder</span>
+            <span class="graph-tag" id="resource-scope-tag">Latest sample</span>
           </div>
           <div class="graph-body">
             <div class="gauge-grid">
               <div class="gauge">
-                <div class="gauge-ring"></div>
-                <div><strong>CPU</strong><span>graph placeholder</span></div>
+                <div class="gauge-ring" id="gauge-cpu-ring"></div>
+                <div><strong>CPU</strong><span id="gauge-cpu-text">n/a</span></div>
               </div>
               <div class="gauge">
-                <div class="gauge-ring"></div>
-                <div><strong>Memory</strong><span>graph placeholder</span></div>
+                <div class="gauge-ring" id="gauge-memory-ring" style="--gauge-color: color-mix(in oklab, var(--chart-2) 80%, white 20%);"></div>
+                <div><strong>Memory</strong><span id="gauge-memory-text">n/a</span></div>
               </div>
               <div class="gauge">
-                <div class="gauge-ring"></div>
-                <div><strong>Disk</strong><span>graph placeholder</span></div>
+                <div class="gauge-ring" id="gauge-disk-ring" style="--gauge-color: color-mix(in oklab, var(--chart-3) 80%, white 20%);"></div>
+                <div><strong>Disk</strong><span id="gauge-disk-text">n/a</span></div>
               </div>
               <div class="gauge">
-                <div class="gauge-ring"></div>
-                <div><strong>Network</strong><span>graph placeholder</span></div>
+                <div class="gauge-ring" id="gauge-network-ring" style="--gauge-color: color-mix(in oklab, var(--warning) 85%, white 15%);"></div>
+                <div><strong>Network</strong><span id="gauge-network-text">n/a</span></div>
               </div>
             </div>
-            <p class="graph-note">Resource gauges are placeholders until live metrics wiring lands.</p>
+            <p class="graph-note" id="resource-note">Waiting for host resource telemetry.</p>
           </div>
         </article>
       </section>
@@ -4493,6 +5143,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
     const formatUnixMs = window.rustployUi.formatUnixMs;
     let deploymentsCollapsed = false;
+    let latestDashboardMetrics = null;
+    let latestNetworkCounters = null;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -4703,6 +5355,180 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         : 'No app selected';
     }
 
+    function formatBytes(value) {
+      const safe = Number(value || 0);
+      if (!Number.isFinite(safe) || safe <= 0) return '0 B';
+      const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+      let size = safe;
+      let index = 0;
+      while (size >= 1024 && index < units.length - 1) {
+        size /= 1024;
+        index += 1;
+      }
+      const precision = size >= 100 || index === 0 ? 0 : 1;
+      return `${size.toFixed(precision)} ${units[index]}`;
+    }
+
+    function clampPercent(value) {
+      const safe = Number(value || 0);
+      if (!Number.isFinite(safe)) return 0;
+      return Math.max(0, Math.min(100, safe));
+    }
+
+    function setGauge(ringId, textId, percent, label) {
+      const ring = document.getElementById(ringId);
+      const text = document.getElementById(textId);
+      if (ring) {
+        const angle = `${(clampPercent(percent) / 100) * 360}deg`;
+        ring.style.setProperty('--gauge-angle', angle);
+      }
+      if (text) {
+        text.textContent = label;
+      }
+    }
+
+    function renderTrafficChart(series) {
+      const svg = document.getElementById('traffic-chart');
+      const note = document.getElementById('traffic-note');
+      if (!svg || !note) return;
+
+      const points = Array.isArray(series) ? series : [];
+      const hasData = points.some((point) => (point.total_requests || 0) > 0 || (point.errors_4xx || 0) > 0 || (point.errors_5xx || 0) > 0);
+      if (!hasData || points.length === 0) {
+        svg.innerHTML = '<text class="traffic-empty" x="50" y="52" text-anchor="middle">No traffic data in selected window.</text>';
+        note.textContent = 'No request telemetry observed for this scope/window yet.';
+        return;
+      }
+
+      const maxY = Math.max(
+        1,
+        ...points.map((point) => Math.max(
+          Number(point.total_requests || 0),
+          Number((point.errors_4xx || 0) + (point.errors_5xx || 0))
+        ))
+      );
+      const makeLine = (valueFn) => points
+        .map((point, index) => {
+          const x = points.length === 1 ? 0 : (index / (points.length - 1)) * 100;
+          const y = 100 - (Math.max(0, valueFn(point)) / maxY) * 100;
+          return `${x.toFixed(2)},${y.toFixed(2)}`;
+        })
+        .join(' ');
+      const totalLine = makeLine((point) => Number(point.total_requests || 0));
+      const errorLine = makeLine((point) => Number((point.errors_4xx || 0) + (point.errors_5xx || 0)));
+      svg.innerHTML = `
+        <polyline class="traffic-line-total" points="${totalLine}" />
+        <polyline class="traffic-line-error" points="${errorLine}" />
+      `;
+
+      const totalRequests = points.reduce((sum, point) => sum + Number(point.total_requests || 0), 0);
+      const totalErrors = points.reduce((sum, point) => sum + Number((point.errors_4xx || 0) + (point.errors_5xx || 0)), 0);
+      note.textContent = `${totalRequests} request(s), ${totalErrors} error(s) in selected window.`;
+    }
+
+    function renderResourceGauges(series) {
+      const points = Array.isArray(series) ? series : [];
+      const latest = [...points].reverse().find((point) => Number(point.samples || 0) > 0) || null;
+      const note = document.getElementById('resource-note');
+      if (!latest) {
+        latestNetworkCounters = null;
+        setGauge('gauge-cpu-ring', 'gauge-cpu-text', 0, 'n/a');
+        setGauge('gauge-memory-ring', 'gauge-memory-text', 0, 'n/a');
+        setGauge('gauge-disk-ring', 'gauge-disk-text', 0, 'n/a');
+        setGauge('gauge-network-ring', 'gauge-network-text', 0, 'n/a');
+        if (note) note.textContent = 'No host resource telemetry observed for this window yet.';
+        return;
+      }
+
+      const cpuPercent = clampPercent(latest.cpu_percent_avg || 0);
+      const memoryPercent = latest.memory_total_bytes_avg > 0
+        ? clampPercent((latest.memory_used_bytes_avg / latest.memory_total_bytes_avg) * 100)
+        : 0;
+      const diskPercent = latest.disk_total_bytes_avg > 0
+        ? clampPercent((latest.disk_used_bytes_avg / latest.disk_total_bytes_avg) * 100)
+        : 0;
+
+      const previous = [...points]
+        .reverse()
+        .find((point) =>
+          point.bucket_start_unix_ms < latest.bucket_start_unix_ms && Number(point.samples || 0) > 0
+        ) || null;
+      let networkRateBytes = 0;
+      if (previous) {
+        const timeDeltaSeconds = (latest.bucket_start_unix_ms - previous.bucket_start_unix_ms) / 1000;
+        const rxDelta = Math.max(0, Number(latest.network_rx_bytes_avg || 0) - Number(previous.network_rx_bytes_avg || 0));
+        const txDelta = Math.max(0, Number(latest.network_tx_bytes_avg || 0) - Number(previous.network_tx_bytes_avg || 0));
+        if (timeDeltaSeconds > 0) {
+          networkRateBytes = (rxDelta + txDelta) / timeDeltaSeconds;
+        }
+      }
+      const networkPercent = clampPercent((networkRateBytes / (50 * 1024 * 1024)) * 100);
+
+      setGauge('gauge-cpu-ring', 'gauge-cpu-text', cpuPercent, `${cpuPercent.toFixed(1)}%`);
+      setGauge(
+        'gauge-memory-ring',
+        'gauge-memory-text',
+        memoryPercent,
+        `${memoryPercent.toFixed(1)}% (${formatBytes(latest.memory_used_bytes_avg)} / ${formatBytes(latest.memory_total_bytes_avg)})`
+      );
+      setGauge(
+        'gauge-disk-ring',
+        'gauge-disk-text',
+        diskPercent,
+        `${diskPercent.toFixed(1)}% (${formatBytes(latest.disk_used_bytes_avg)} / ${formatBytes(latest.disk_total_bytes_avg)})`
+      );
+      setGauge(
+        'gauge-network-ring',
+        'gauge-network-text',
+        networkPercent,
+        networkRateBytes > 0 ? `${formatBytes(networkRateBytes)}/s` : `${formatBytes(latest.network_rx_bytes_avg)} rx / ${formatBytes(latest.network_tx_bytes_avg)} tx`
+      );
+
+      if (note) {
+        note.textContent = `Last sample: ${formatUnixMs(latest.bucket_start_unix_ms)} (${latest.samples} sample${latest.samples === 1 ? '' : 's'} in bucket).`;
+      }
+      latestNetworkCounters = {
+        bucket_start_unix_ms: latest.bucket_start_unix_ms,
+        network_rx_bytes_avg: latest.network_rx_bytes_avg,
+        network_tx_bytes_avg: latest.network_tx_bytes_avg
+      };
+    }
+
+    function renderDashboardMetrics(data) {
+      latestDashboardMetrics = data;
+      const summary = data && data.summary ? data.summary : {};
+      const scope = data && data.scope ? data.scope : {};
+      document.getElementById('stat-applications').textContent = Number(summary.applications_total || 0);
+      document.getElementById('stat-databases').textContent = Number(summary.managed_services_healthy || 0);
+      document.getElementById('stat-domains').textContent = Number(summary.domains_total || 0);
+      const uptime = summary.uptime_30d_percent;
+      document.getElementById('stat-uptime').textContent =
+        typeof uptime === 'number' && Number.isFinite(uptime) ? `${uptime.toFixed(2)}%` : 'n/a';
+
+      document.getElementById('traffic-scope-tag').textContent =
+        `${scope.window || '24h'} · ${scope.bucket || '5m'}${selectedAppName ? ` · ${selectedAppName}` : ' · global'}`;
+      document.getElementById('resource-scope-tag').textContent = `Host · ${scope.window || '24h'}`;
+
+      renderTrafficChart(data ? data.request_traffic : []);
+      renderResourceGauges(data ? data.server_resources : []);
+    }
+
+    function renderDashboardMetricsError(message) {
+      document.getElementById('traffic-note').textContent = `Unable to load traffic metrics: ${message}`;
+      document.getElementById('resource-note').textContent = `Unable to load resource metrics: ${message}`;
+    }
+
+    async function refreshDashboardMetrics() {
+      const params = new URLSearchParams();
+      params.set('window', '24h');
+      if (selectedApp) {
+        params.set('app_id', selectedApp);
+      }
+      const res = await api(`/api/v1/dashboard/metrics?${params.toString()}`);
+      const data = await res.json();
+      renderDashboardMetrics(data);
+    }
+
     function appLocalhostHost(appName) {
       if (!appName) return null;
       const slug = appName
@@ -4883,6 +5709,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         renderSelectedDeployment();
         stopLogsStream();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
+        try {
+          await refreshDashboardMetrics();
+        } catch (error) {
+          renderDashboardMetricsError(error.message);
+        }
         return;
       }
 
@@ -4929,6 +5760,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         renderSelectedDeployment();
         stopLogsStream();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
+        try {
+          await refreshDashboardMetrics();
+        } catch (error) {
+          renderDashboardMetricsError(error.message);
+        }
       }
     }
 
@@ -4993,6 +5829,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       await refreshDomains();
       await refreshEnvVars();
       await refreshAppConfig();
+      await refreshDashboardMetrics();
       await refreshApps();
       startLogsStream();
     }
@@ -5292,10 +6129,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     renderSelectedDeployment();
     applyDeploymentsCollapsed();
     document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
-    refreshApps().catch((error) => setStatus(`Initial load failed: ${error.message}`, 'err'));
+    refreshApps()
+      .then(() => refreshDashboardMetrics())
+      .catch((error) => {
+        setStatus(`Initial load failed: ${error.message}`, 'err');
+        renderDashboardMetricsError(error.message);
+      });
     setInterval(() => refreshApps().catch(() => {}), 15000);
     setInterval(() => refreshDeployments().catch(() => {}), 4000);
     setInterval(() => refreshEnvVars().catch(() => {}), 10000);
+    setInterval(() => refreshDashboardMetrics().catch((error) => renderDashboardMetricsError(error.message)), 10000);
   </script>
 </body>
 </html>
@@ -7418,8 +8261,118 @@ async fn agent_heartbeat(
         .db
         .record_heartbeat(&payload, now_unix_ms())
         .map_err(internal_error)?;
+    if let Some(snapshot) = payload.resource.as_ref() {
+        state
+            .db
+            .insert_agent_resource_sample(payload.agent_id, snapshot, payload.timestamp_unix_ms)
+            .map_err(internal_error)?;
+    }
 
     Ok((StatusCode::ACCEPTED, Json(HeartbeatAccepted::yes())))
+}
+
+async fn dashboard_metrics(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DashboardMetricsQuery>,
+) -> Result<Json<DashboardMetricsResponse>, ApiJsonError> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/dashboard/metrics",
+    )
+    .map_err(status_to_api_error)?;
+
+    let window = DashboardWindow::parse(query.window.as_deref()).map_err(|message| {
+        api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            message,
+            Vec::new(),
+        )
+    })?;
+    let bucket_ms = parse_bucket_ms(query.bucket.as_deref(), window.default_bucket_ms()).map_err(
+        |message| {
+            api_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                message,
+                Vec::new(),
+            )
+        },
+    )?;
+    if bucket_ms > window.duration_ms() {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "bucket duration cannot be larger than window",
+            Vec::new(),
+        ));
+    }
+
+    if let Some(app_id) = query.app_id {
+        let exists = state
+            .db
+            .app_exists(app_id)
+            .map_err(|error| status_to_api_error(internal_error(error)))?;
+        if !exists {
+            return Err(status_to_api_error(StatusCode::NOT_FOUND));
+        }
+    }
+
+    let now = now_unix_ms();
+    let end_unix_ms = align_timestamp(now, bucket_ms)
+        .saturating_add(bucket_ms)
+        .saturating_sub(1);
+    let start_unix_ms = align_timestamp(
+        end_unix_ms.saturating_sub(window.duration_ms().saturating_sub(1)),
+        bucket_ms,
+    );
+    let app_scope = query
+        .app_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| GLOBAL_TRAFFIC_SCOPE.to_string());
+
+    let metrics = state
+        .db
+        .metrics_snapshot()
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+    let managed_services_healthy = state
+        .db
+        .healthy_managed_services_total()
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+    let uptime_30d_percent = state
+        .db
+        .uptime_30d_percent(now)
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+    let request_traffic = state
+        .db
+        .request_traffic_series(start_unix_ms, end_unix_ms, bucket_ms, &app_scope)
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+    let server_resources = state
+        .db
+        .server_resource_series(start_unix_ms, end_unix_ms, bucket_ms)
+        .map_err(|error| status_to_api_error(internal_error(error)))?;
+
+    Ok(Json(DashboardMetricsResponse {
+        summary: DashboardSummary {
+            applications_total: metrics.apps_total,
+            managed_services_healthy,
+            domains_total: metrics.domains_total,
+            uptime_30d_percent,
+        },
+        scope: DashboardMetricsScope {
+            window: window.as_str().to_string(),
+            bucket: format_bucket_label(bucket_ms).to_string(),
+            app_id: query.app_id,
+            start_unix_ms,
+            end_unix_ms,
+        },
+        request_traffic,
+        server_resources,
+    }))
 }
 
 fn verify_github_signature(
@@ -7462,6 +8415,8 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         std::env::var("RUSTPLOY_CADDYFILE_PATH").unwrap_or_else(|_| "data/Caddyfile".to_string());
     let upstream = std::env::var("RUSTPLOY_UPSTREAM_ADDR")
         .unwrap_or_else(|_| DEFAULT_CADDY_UPSTREAM.to_string());
+    let caddy_access_log_path = std::env::var("RUSTPLOY_CADDY_ACCESS_LOG_PATH")
+        .unwrap_or_else(|_| DEFAULT_CADDY_ACCESS_LOG_PATH.to_string());
     if let Some(parent) = Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -7489,6 +8444,9 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         }
         content.push_str(&format!("{slug}.localhost {{\n"));
         content.push_str(&format!(
+            "  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n"
+        ));
+        content.push_str(&format!(
             "  reverse_proxy {}:{}\n",
             runtime.upstream_host, runtime.upstream_port
         ));
@@ -7505,6 +8463,9 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
             continue;
         }
         content.push_str(&format!("{} {{\n", normalized));
+        content.push_str(&format!(
+            "  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n"
+        ));
         if domain.tls_mode == "custom" {
             if let (Some(cert), Some(key)) =
                 (domain.cert_path.as_deref(), domain.key_path.as_deref())
@@ -7523,7 +8484,7 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         content.push_str("}\n\n");
     }
     content.push_str(&format!(
-        "*.localhost {{\n  reverse_proxy {upstream}\n}}\n\n"
+        "*.localhost {{\n  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n  reverse_proxy {upstream}\n}}\n\n"
     ));
 
     fs::write(&path, content).with_context(|| format!("failed writing caddyfile at {path}"))?;
@@ -9048,6 +10009,326 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heartbeat_compatibility_and_resource_persistence() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let old_payload = json!({
+            "agent_id": Uuid::new_v4(),
+            "agent_version": "0.1.0",
+            "timestamp_unix_ms": now_unix_ms()
+        });
+        let old_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/heartbeat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(old_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(old_response.status(), StatusCode::ACCEPTED);
+
+        let agent_id = Uuid::new_v4();
+        let rich_payload = json!({
+            "agent_id": agent_id,
+            "agent_version": "0.1.1",
+            "timestamp_unix_ms": now_unix_ms(),
+            "resource": {
+                "cpu_percent": 42.5,
+                "memory_used_bytes": 2147483648u64,
+                "memory_total_bytes": 4294967296u64,
+                "disk_used_bytes": 1000000u64,
+                "disk_total_bytes": 2000000u64,
+                "network_rx_bytes": 1024u64,
+                "network_tx_bytes": 2048u64
+            }
+        });
+        let rich_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/agents/heartbeat")
+                    .header("content-type", "application/json")
+                    .body(Body::from(rich_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rich_response.status(), StatusCode::ACCEPTED);
+
+        let metrics_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/metrics?window=1h&bucket=1m")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metrics_response.status(), StatusCode::OK);
+        let metrics_body = to_bytes(metrics_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let metrics_json: Value = serde_json::from_slice(&metrics_body).unwrap();
+        let has_resource_sample =
+            metrics_json["server_resources"]
+                .as_array()
+                .map_or(false, |items| {
+                    items
+                        .iter()
+                        .any(|point| point["samples"].as_u64().unwrap_or(0) > 0)
+                });
+        assert!(has_resource_sample);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn dashboard_metrics_requires_session_or_token_when_auth_is_enabled() {
+        let db_path = test_db_path();
+        let state = AppState::from_config(AppStateConfig {
+            db_path: db_path.clone(),
+            agent_shared_token: None,
+            github_webhook_secret: None,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: Some("admin@localhost".to_string()),
+            bootstrap_admin_password: Some("password123".to_string()),
+            online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
+            reconciler_enabled: false,
+            reconciler_interval_ms: 1,
+            job_backoff_base_ms: 1,
+            job_backoff_max_ms: 100,
+            job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+        })
+        .unwrap();
+        let app = create_router(state);
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"admin@localhost","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let set_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+        let authorized = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/metrics")
+                    .header("cookie", cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn caddy_access_lines_ingest_domain_and_localhost_traffic() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app = create_router(state.clone());
+
+        let app_one_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"dash-one"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_one_body = to_bytes(app_one_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_one_json: Value = serde_json::from_slice(&app_one_body).unwrap();
+        let app_one_id = app_one_json["id"].as_str().unwrap().to_string();
+
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/apps/{app_one_id}/domains"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"domain":"dash-one.example.com","tls_mode":"managed"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let app_two_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/apps")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"name":"Dash Two"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_two_body = to_bytes(app_two_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_two_json: Value = serde_json::from_slice(&app_two_body).unwrap();
+        let app_two_id = app_two_json["id"].as_str().unwrap().to_string();
+
+        let ts_seconds = now_unix_ms() as f64 / 1000.0;
+        let lines = vec![
+            format!(
+                r#"{{"ts":{ts_seconds},"request":{{"host":"dash-one.example.com"}},"status":502}}"#
+            ),
+            format!(
+                r#"{{"ts":{ts_seconds},"request":{{"host":"dash-two.localhost"}},"status":404}}"#
+            ),
+            "not-json".to_string(),
+        ];
+        ingest_caddy_access_lines(&state, &lines, now_unix_ms()).unwrap();
+
+        let app_one_metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/dashboard/metrics?window=1h&bucket=1m&app_id={app_one_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_one_metrics_body = to_bytes(app_one_metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_one_metrics_json: Value = serde_json::from_slice(&app_one_metrics_body).unwrap();
+        let app_one_requests: u64 = app_one_metrics_json["request_traffic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["total_requests"].as_u64().unwrap_or(0))
+            .sum();
+        let app_one_5xx: u64 = app_one_metrics_json["request_traffic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["errors_5xx"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(app_one_requests, 1);
+        assert_eq!(app_one_5xx, 1);
+
+        let app_two_metrics = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/dashboard/metrics?window=1h&bucket=1m&app_id={app_two_id}"
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let app_two_metrics_body = to_bytes(app_two_metrics.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let app_two_metrics_json: Value = serde_json::from_slice(&app_two_metrics_body).unwrap();
+        let app_two_requests: u64 = app_two_metrics_json["request_traffic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["total_requests"].as_u64().unwrap_or(0))
+            .sum();
+        let app_two_4xx: u64 = app_two_metrics_json["request_traffic"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|point| point["errors_4xx"].as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(app_two_requests, 1);
+        assert_eq!(app_two_4xx, 1);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn dashboard_metrics_validates_query_parameters() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let bad_window = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/metrics?window=2h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_window.status(), StatusCode::BAD_REQUEST);
+
+        let bad_bucket = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/dashboard/metrics?window=1h&bucket=2m")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bad_bucket.status(), StatusCode::BAD_REQUEST);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
     async fn github_webhook_rejects_invalid_signature_and_queues_on_valid_signature() {
         let db_path = test_db_path();
         let secret = "webhook-secret".to_string();
@@ -9067,6 +10348,8 @@ mod tests {
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
             api_rate_limit_per_minute: 10_000,
             webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
         })
         .unwrap();
         let app = create_router(state.clone());
@@ -9332,6 +10615,8 @@ mod tests {
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
             api_rate_limit_per_minute: 10_000,
             webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
         })
         .unwrap();
         let app = create_router(state);
@@ -9427,6 +10712,8 @@ mod tests {
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
             api_rate_limit_per_minute: 10_000,
             webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
         })
         .unwrap();
         let app = create_router(state);
@@ -9492,6 +10779,8 @@ mod tests {
             job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
             api_rate_limit_per_minute: 10_000,
             webhook_rate_limit_per_minute: 10_000,
+            telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
+            caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
         })
         .unwrap();
         let app = create_router(state);

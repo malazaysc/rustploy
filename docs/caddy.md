@@ -7,12 +7,13 @@ Rustploy can generate a Caddyfile from app domain mappings.
 - Domain mappings are stored in SQLite (`domains` table).
 - On startup and domain changes, Rustploy writes Caddy config to `RUSTPLOY_CADDYFILE_PATH`.
 - Reverse proxy target is configurable via `RUSTPLOY_UPSTREAM_ADDR` (defaults to `127.0.0.1:8080`).
+- Access logs for app-facing routes are emitted in JSON format to `RUSTPLOY_CADDY_ACCESS_LOG_PATH` (defaults to `/shared/caddy-access.log`) for dashboard traffic telemetry ingestion.
 - `tls_mode=managed` uses automatic ACME certificates.
 - `tls_mode=custom` uses explicit `cert_path` and `key_path`.
 
 ## Docker Compose
 
-The default `docker-compose.yml` includes a `caddy` service with persistent `rustploy-caddy` and `rustploy-caddy-config` volumes so certificate state survives restarts/upgrades.
+The default `docker-compose.yml` includes a `caddy` service with persistent `rustploy-caddy` and `rustploy-caddy-config` volumes so certificate state survives restarts/upgrades, plus a writable shared volume for `Caddyfile` and access log output consumed by `rustploy-server`.
 
 ## API
 

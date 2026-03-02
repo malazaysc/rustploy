@@ -19,6 +19,8 @@ pub struct AgentHeartbeat {
     pub agent_id: Uuid,
     pub timestamp_unix_ms: u64,
     pub agent_version: String,
+    #[serde(default)]
+    pub resource: Option<AgentResourceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,17 @@ impl HeartbeatAccepted {
     pub fn yes() -> Self {
         Self { accepted: true }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentResourceSnapshot {
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -402,6 +415,52 @@ pub struct TokenListResponse {
 pub struct CreateTokenResponse {
     pub token: String,
     pub summary: TokenSummary,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardSummary {
+    pub applications_total: u64,
+    pub managed_services_healthy: u64,
+    pub domains_total: u64,
+    pub uptime_30d_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardMetricsScope {
+    pub window: String,
+    pub bucket: String,
+    pub app_id: Option<Uuid>,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestTrafficPoint {
+    pub bucket_start_unix_ms: u64,
+    pub total_requests: u64,
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerResourcePoint {
+    pub bucket_start_unix_ms: u64,
+    pub cpu_percent_avg: f64,
+    pub memory_used_bytes_avg: u64,
+    pub memory_total_bytes_avg: u64,
+    pub disk_used_bytes_avg: u64,
+    pub disk_total_bytes_avg: u64,
+    pub network_rx_bytes_avg: u64,
+    pub network_tx_bytes_avg: u64,
+    pub samples: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardMetricsResponse {
+    pub summary: DashboardSummary,
+    pub scope: DashboardMetricsScope,
+    pub request_traffic: Vec<RequestTrafficPoint>,
+    pub server_resources: Vec<ServerResourcePoint>,
 }
 
 #[cfg(test)]

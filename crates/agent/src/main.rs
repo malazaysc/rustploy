@@ -1,7 +1,8 @@
 use std::{env, time::SystemTime};
 
 use anyhow::{Context, Result};
-use shared::{AgentHeartbeat, AgentRegisterRequest};
+use shared::{AgentHeartbeat, AgentRegisterRequest, AgentResourceSnapshot};
+use sysinfo::{CpuExt, DiskExt, NetworkExt, NetworksExt, System, SystemExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -17,6 +18,11 @@ struct AgentConfig {
     interval_seconds: u64,
     oneshot: bool,
     agent_token: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResourceCollector {
+    system: System,
 }
 
 #[tokio::main]
@@ -38,9 +44,10 @@ async fn main() -> Result<()> {
     if let Err(error) = send_registration(&config).await {
         warn!(%error, "agent registration failed");
     }
+    let mut resource_collector = ResourceCollector::new();
 
     if config.oneshot {
-        send_heartbeat(&config).await?;
+        send_heartbeat(&config, Some(resource_collector.collect())).await?;
         return Ok(());
     }
 
@@ -48,7 +55,7 @@ async fn main() -> Result<()> {
 
     loop {
         ticker.tick().await;
-        if let Err(error) = send_heartbeat(&config).await {
+        if let Err(error) = send_heartbeat(&config, Some(resource_collector.collect())).await {
             warn!(%error, "heartbeat failed");
         }
     }
@@ -103,11 +110,15 @@ async fn send_registration(config: &AgentConfig) -> Result<()> {
     .await
 }
 
-async fn send_heartbeat(config: &AgentConfig) -> Result<()> {
+async fn send_heartbeat(
+    config: &AgentConfig,
+    resource: Option<AgentResourceSnapshot>,
+) -> Result<()> {
     let heartbeat = AgentHeartbeat {
         agent_id: config.agent_id,
         timestamp_unix_ms: unix_ms_now(),
         agent_version: config.agent_version.clone(),
+        resource,
     };
 
     send_json_request(
@@ -121,6 +132,59 @@ async fn send_heartbeat(config: &AgentConfig) -> Result<()> {
 
     info!(agent_id = %config.agent_id, "heartbeat accepted");
     Ok(())
+}
+
+impl ResourceCollector {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_cpu();
+        system.refresh_memory();
+        system.refresh_disks_list();
+        system.refresh_disks();
+        system.refresh_networks_list();
+        system.refresh_networks();
+        Self { system }
+    }
+
+    fn collect(&mut self) -> AgentResourceSnapshot {
+        self.system.refresh_cpu();
+        self.system.refresh_memory();
+        self.system.refresh_disks();
+        self.system.refresh_networks();
+
+        let disk_total_bytes = self
+            .system
+            .disks()
+            .iter()
+            .map(|disk| disk.total_space())
+            .sum::<u64>();
+        let disk_available_bytes = self
+            .system
+            .disks()
+            .iter()
+            .map(|disk| disk.available_space())
+            .sum::<u64>();
+        let (network_rx_bytes, network_tx_bytes) =
+            self.system
+                .networks()
+                .iter()
+                .fold((0u64, 0u64), |(rx, tx), (_name, data)| {
+                    (
+                        rx.saturating_add(data.total_received()),
+                        tx.saturating_add(data.total_transmitted()),
+                    )
+                });
+
+        AgentResourceSnapshot {
+            cpu_percent: self.system.global_cpu_info().cpu_usage() as f64,
+            memory_used_bytes: self.system.used_memory().saturating_mul(1024),
+            memory_total_bytes: self.system.total_memory().saturating_mul(1024),
+            disk_used_bytes: disk_total_bytes.saturating_sub(disk_available_bytes),
+            disk_total_bytes,
+            network_rx_bytes,
+            network_tx_bytes,
+        }
+    }
 }
 
 async fn send_json_request<T: serde::Serialize>(

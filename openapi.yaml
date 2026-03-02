@@ -558,6 +558,42 @@ components:
           format: int64
         agent_version:
           type: string
+        resource:
+          oneOf:
+            - $ref: '#/components/schemas/AgentResourceSnapshot'
+            - type: 'null'
+    AgentResourceSnapshot:
+      type: object
+      required:
+        - cpu_percent
+        - memory_used_bytes
+        - memory_total_bytes
+        - disk_used_bytes
+        - disk_total_bytes
+        - network_rx_bytes
+        - network_tx_bytes
+      properties:
+        cpu_percent:
+          type: number
+          format: double
+        memory_used_bytes:
+          type: integer
+          format: int64
+        memory_total_bytes:
+          type: integer
+          format: int64
+        disk_used_bytes:
+          type: integer
+          format: int64
+        disk_total_bytes:
+          type: integer
+          format: int64
+        network_rx_bytes:
+          type: integer
+          format: int64
+        network_tx_bytes:
+          type: integer
+          format: int64
     HeartbeatAccepted:
       type: object
       required: [accepted]
@@ -590,6 +626,113 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AgentSummary'
+    DashboardSummary:
+      type: object
+      required: [applications_total, managed_services_healthy, domains_total, uptime_30d_percent]
+      properties:
+        applications_total:
+          type: integer
+          format: int64
+        managed_services_healthy:
+          type: integer
+          format: int64
+        domains_total:
+          type: integer
+          format: int64
+        uptime_30d_percent:
+          type: [number, 'null']
+          format: double
+    DashboardMetricsScope:
+      type: object
+      required: [window, bucket, app_id, start_unix_ms, end_unix_ms]
+      properties:
+        window:
+          type: string
+          enum: [1h, 24h, 7d]
+        bucket:
+          type: string
+          enum: [1m, 5m, 1h]
+        app_id:
+          type: [string, 'null']
+          format: uuid
+        start_unix_ms:
+          type: integer
+          format: int64
+        end_unix_ms:
+          type: integer
+          format: int64
+    RequestTrafficPoint:
+      type: object
+      required: [bucket_start_unix_ms, total_requests, errors_4xx, errors_5xx]
+      properties:
+        bucket_start_unix_ms:
+          type: integer
+          format: int64
+        total_requests:
+          type: integer
+          format: int64
+        errors_4xx:
+          type: integer
+          format: int64
+        errors_5xx:
+          type: integer
+          format: int64
+    ServerResourcePoint:
+      type: object
+      required:
+        - bucket_start_unix_ms
+        - cpu_percent_avg
+        - memory_used_bytes_avg
+        - memory_total_bytes_avg
+        - disk_used_bytes_avg
+        - disk_total_bytes_avg
+        - network_rx_bytes_avg
+        - network_tx_bytes_avg
+        - samples
+      properties:
+        bucket_start_unix_ms:
+          type: integer
+          format: int64
+        cpu_percent_avg:
+          type: number
+          format: double
+        memory_used_bytes_avg:
+          type: integer
+          format: int64
+        memory_total_bytes_avg:
+          type: integer
+          format: int64
+        disk_used_bytes_avg:
+          type: integer
+          format: int64
+        disk_total_bytes_avg:
+          type: integer
+          format: int64
+        network_rx_bytes_avg:
+          type: integer
+          format: int64
+        network_tx_bytes_avg:
+          type: integer
+          format: int64
+        samples:
+          type: integer
+          format: int64
+    DashboardMetricsResponse:
+      type: object
+      required: [summary, scope, request_traffic, server_resources]
+      properties:
+        summary:
+          $ref: '#/components/schemas/DashboardSummary'
+        scope:
+          $ref: '#/components/schemas/DashboardMetricsScope'
+        request_traffic:
+          type: array
+          items:
+            $ref: '#/components/schemas/RequestTrafficPoint'
+        server_resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ServerResourcePoint'
 paths:
   /health:
     get:
@@ -758,6 +901,45 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HeartbeatAccepted'
+  /dashboard/metrics:
+    get:
+      summary: Dashboard telemetry metrics
+      operationId: dashboardMetrics
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: window
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [1h, 24h, 7d]
+        - name: bucket
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [1m, 5m, 1h]
+        - name: app_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Dashboard telemetry payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardMetricsResponse'
+        '400':
+          description: Invalid query parameter value
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiErrorResponse'
   /apps/import:
     post:
       summary: Import app from repository and detect build profile

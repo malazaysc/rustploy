@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result};
-use server::{create_router, run_reconciler_loop, AppState};
+use server::{create_router, run_caddy_access_log_ingestion_loop, run_reconciler_loop, AppState};
 use tracing::info;
 
 #[tokio::main]
@@ -14,6 +14,7 @@ async fn main() -> Result<()> {
     if state.reconciler_enabled() {
         tokio::spawn(run_reconciler_loop(state.clone()));
     }
+    tokio::spawn(run_caddy_access_log_ingestion_loop(state.clone()));
 
     let addr = read_bind_addr().context("failed to parse bind address")?;
     let listener = tokio::net::TcpListener::bind(addr)
