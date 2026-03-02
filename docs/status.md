@@ -10,6 +10,7 @@
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
+- Dashboard domains and environment variable lists now render via text-safe DOM node construction to prevent stored XSS from user-provided values.
 - Hardened two-column dashboard layout now uses constrained grid sizing to prevent left/right overlap.
 - App rows now wrap long app IDs to avoid overlap with action buttons in narrow cards.
 - App list rows now use explicit text/actions column layout to keep metadata and buttons separated under narrow widths.

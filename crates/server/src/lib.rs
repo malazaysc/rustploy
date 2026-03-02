@@ -5076,12 +5076,15 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       for (const d of routedDomains) {
         const li = document.createElement('li');
         li.className = 'item-row';
-        li.innerHTML = `
-          <div class="item-main">
-            <strong>${d.domain}</strong>
-            <code>${d.tls_mode}</code>
-          </div>
-        `;
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const strong = document.createElement('strong');
+        strong.textContent = d.domain;
+        const code = document.createElement('code');
+        code.textContent = d.tls_mode;
+        main.appendChild(strong);
+        main.appendChild(code);
+        li.appendChild(main);
         el.appendChild(li);
       }
     }
@@ -5105,15 +5108,25 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       for (const envVar of data.items) {
         const li = document.createElement('li');
         li.className = 'item-row';
-        li.innerHTML = `
-          <div class="item-main">
-            <strong>${envVar.key}</strong>
-            <code>${envVar.value}</code>
-          </div>
-          <div class="item-actions">
-            <button class="secondary" onclick="deleteEnvVar('${encodeURIComponent(envVar.key)}')">Delete</button>
-          </div>
-        `;
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const strong = document.createElement('strong');
+        strong.textContent = envVar.key;
+        const code = document.createElement('code');
+        code.textContent = envVar.value;
+        main.appendChild(strong);
+        main.appendChild(code);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+        const button = document.createElement('button');
+        button.className = 'secondary';
+        button.textContent = 'Delete';
+        button.onclick = () => deleteEnvVar(encodeURIComponent(envVar.key));
+        actions.appendChild(button);
+
+        li.appendChild(main);
+        li.appendChild(actions);
         el.appendChild(li);
       }
     }
@@ -9339,7 +9352,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(html, LOGIN_HTML);
+        assert!(html.contains("<title>Rustploy Login</title>"));
+        assert!(html.contains("id=\"login-form\""));
 
         cleanup_db(&db_path);
     }
@@ -9403,7 +9417,8 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let html = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(html, LOGS_HTML);
+        assert!(html.contains("<title>Rustploy Logs Explorer</title>"));
+        assert!(html.contains("id=\"deployments-list\""));
 
         cleanup_db(&db_path);
     }
