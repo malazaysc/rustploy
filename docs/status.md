@@ -4,6 +4,17 @@
 
 - Self-hosted Rust control plane with SQLite state and durable reconciler queue.
 - Web dashboard with auth, app import/create, deploy/rollback, domain mapping, logs, and env var management.
+- Visual refresh for the dashboard is aligned with the new v0 mock (sidebar-first layout, modern dark styling, and card-based information hierarchy) without changing API-backed workflows.
+- Improved scrolling polish now anchors root background/overscroll handling so fast scroll bounce no longer reveals blank top/bottom gaps.
+- Graph placeholders now cover traffic and server resource chart areas so every graph panel is represented before live metrics data is wired in.
+- Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
+- Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
+- Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
+- Dashboard domains and environment variable lists now render via text-safe DOM node construction to prevent stored XSS from user-provided values.
+- Dashboard app selection reset now closes stale live log `EventSource` streams so old app log polling cannot continue in the background.
+- Hardened two-column dashboard layout now uses constrained grid sizing to prevent left/right overlap.
+- App rows now wrap long app IDs to avoid overlap with action buttons in narrow cards.
+- App list rows now use explicit text/actions column layout to keep metadata and buttons separated under narrow widths.
 - Terminal UI (`rustploy-tui`) for SSH-first operations.
 - GitHub repository mapping + webhook-triggered deployments with signature verification.
 - Compose-first runtime deploys:
@@ -42,6 +53,6 @@
 
 ## Last Verified
 
-- Date: 2026-02-28
-- Commit base: `b8d37c5`
-- Note: dashboard reflects `queued/building` deployment state immediately; SSE log stream emits structured JSON payloads, escapes carriage returns, clears stale output on deployment switches, and uses an indexed cursor query in SQLite.
+- Date: 2026-03-01
+- Commit base: `935ac11`
+- Note: dashboard now uses a v0-inspired visual shell (sidebar, stats cards, graph placeholders, and updated panel styling), includes overscroll gap fixes for fast scroll behavior, supports collapsible deployment history with selected-deployment summaries, and pairs with a new `/logs` page for query/filter-based log investigation while preserving structured SSE streaming in the main dashboard.
