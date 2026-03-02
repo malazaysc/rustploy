@@ -4666,6 +4666,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       border: 1px solid var(--line);
       border-radius: 10px;
       overflow: hidden;
+      position: relative;
       background:
         linear-gradient(color-mix(in oklab, var(--line) 55%, transparent) 1px, transparent 1px),
         linear-gradient(90deg, color-mix(in oklab, var(--line) 40%, transparent) 1px, transparent 1px),
@@ -4692,9 +4693,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       vector-effect: non-scaling-stroke;
       stroke-dasharray: 3 3;
     }
-    .traffic-empty {
+    .traffic-empty-state {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      text-align: center;
+      padding: 0 14px;
       font-size: 12px;
-      fill: color-mix(in oklab, var(--muted) 85%, white 15%);
+      color: color-mix(in oklab, var(--muted) 85%, white 15%);
+      letter-spacing: .02em;
+      pointer-events: none;
+    }
+    .traffic-empty-state.hidden {
+      display: none;
     }
     .traffic-legend {
       margin-top: 8px;
@@ -5088,6 +5100,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <div class="graph-body">
             <div class="traffic-chart-shell">
               <svg class="traffic-chart" id="traffic-chart" viewBox="0 0 100 100" preserveAspectRatio="none"></svg>
+              <div class="traffic-empty-state" id="traffic-empty-state">No traffic data in selected window.</div>
             </div>
             <div class="traffic-legend">
               <span class="total">Requests</span>
@@ -5512,17 +5525,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     function renderTrafficChart(series) {
       const svg = document.getElementById('traffic-chart');
+      const emptyState = document.getElementById('traffic-empty-state');
       const note = document.getElementById('traffic-note');
-      if (!svg || !note) return;
+      if (!svg || !note || !emptyState) return;
 
       const points = Array.isArray(series) ? series : [];
       const hasData = points.some((point) => (point.total_requests || 0) > 0 || (point.errors_4xx || 0) > 0 || (point.errors_5xx || 0) > 0);
       if (!hasData || points.length === 0) {
-        svg.innerHTML = '<text class="traffic-empty" x="50" y="52" text-anchor="middle">No traffic data in selected window.</text>';
+        svg.innerHTML = '';
+        emptyState.classList.remove('hidden');
         note.textContent = 'No request telemetry observed for this scope/window yet.';
         return;
       }
 
+      emptyState.classList.add('hidden');
       const maxY = Math.max(
         1,
         ...points.map((point) => Math.max(

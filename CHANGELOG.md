@@ -35,6 +35,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
 - Agent resource sample persistence now clamps client-provided timestamps to bounded server receive time to prevent future-skewed telemetry writes.
 - Dashboard metrics rendering now ignores stale out-of-order responses when app selection changes during async refreshes.
+- Request Traffic empty-state copy now renders as a positioned HTML overlay instead of SVG text so message sizing remains stable across viewport/chart aspect changes.
 
 ### Added
 
