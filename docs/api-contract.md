@@ -26,6 +26,7 @@ Base path: `/api/v1` (metrics endpoint is additionally exposed at `/metrics`).
 - Agents: `GET /agents`, `POST /agents/register`, `POST /agents/heartbeat`
 - Dashboard telemetry: `GET /dashboard/metrics`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
+- App runtime probe: `GET /apps/{app_id}/runtime`
 - Effective config: `GET /apps/{app_id}/config`
 - Env vars: `GET/PUT /apps/{app_id}/env`, `DELETE /apps/{app_id}/env/{key}`
 - Domains: `GET/POST /apps/{app_id}/domains`
@@ -129,3 +130,13 @@ Response includes:
 - `scope` (effective window/bucket/app scope and unix-ms range)
 - `request_traffic[]` (bucketed totals + 4xx/5xx)
 - `server_resources[]` (bucketed host resource averages + sample counts)
+
+## App runtime health endpoint
+
+`GET /apps/{app_id}/runtime` returns the current runtime probe state for an app:
+
+- `configured`: whether an `app_runtimes` route exists for the app
+- `reachable`: TCP probe result to current runtime upstream
+- `upstream_host`, `upstream_port`: current runtime endpoint (nullable when unconfigured)
+- `deployment_id`: deployment currently bound to runtime route (nullable when unconfigured)
+- `checked_at_unix_ms`: probe timestamp

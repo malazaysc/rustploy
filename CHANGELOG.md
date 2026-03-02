@@ -37,6 +37,11 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Dashboard metrics rendering now ignores stale out-of-order responses when app selection changes during async refreshes.
 - Request Traffic empty-state copy now renders as a positioned HTML overlay instead of SVG text so message sizing remains stable across viewport/chart aspect changes.
 - Agent memory telemetry no longer applies an extra byte scaling factor, fixing inflated dashboard memory totals/usages in Server Resources.
+- Dashboard summary card labels now reflect their true semantics (applications total, managed services reachable) instead of implying live runtime health.
+- Managed services summary count now probes TCP reachability of healthy managed-service endpoints before reporting them as online.
+- Routing panel deployment badge now explicitly shows "last deploy" state, clarifying it is deployment history and not current runtime liveness.
+- Dashboard deployment status text now renders successful deployments as `succeeded` in UI labels to reduce ambiguity with live runtime health.
+- Agent disk telemetry now de-duplicates repeated device entries and skips virtual filesystems so Server Resources disk totals are not overstated by duplicated mounts.
 
 ### Added
 
@@ -75,3 +80,4 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - New dashboard telemetry endpoint: `GET /api/v1/dashboard/metrics` with window/bucket/app-scope query support.
 - SQLite telemetry persistence for dashboard widgets (`agent_resource_samples`, `request_traffic_buckets`) with retention pruning.
 - Caddy JSON access-log emission/ingestion path for request traffic aggregation (`RUSTPLOY_CADDY_ACCESS_LOG_PATH`).
+- App runtime probe endpoint (`GET /api/v1/apps/{app_id}/runtime`) and dashboard routing-card integration to show live runtime online/offline state independent of deployment history.

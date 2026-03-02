@@ -52,6 +52,36 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/App'
+    AppRuntimeHealthResponse:
+      type: object
+      required:
+        - app_id
+        - configured
+        - reachable
+        - upstream_host
+        - upstream_port
+        - deployment_id
+        - checked_at_unix_ms
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        configured:
+          type: boolean
+        reachable:
+          type: boolean
+        upstream_host:
+          type: [string, 'null']
+        upstream_port:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 65535
+        deployment_id:
+          type: [string, 'null']
+          format: uuid
+        checked_at_unix_ms:
+          type: integer
+          format: int64
     CreateDeploymentRequest:
       type: object
       properties:
@@ -1026,6 +1056,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GithubIntegrationSummary'
+  /apps/{app_id}/runtime:
+    get:
+      summary: Probe app runtime endpoint reachability
+      operationId: getAppRuntimeHealth
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Runtime endpoint status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppRuntimeHealthResponse'
+        '404':
+          description: App not found
   /apps/{app_id}/config:
     get:
       summary: Get effective import/build configuration for app

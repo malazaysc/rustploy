@@ -34,6 +34,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
+- `GET /api/v1/apps/{app_id}/runtime`
 - `GET /api/v1/apps/{app_id}/config`
 - `GET /api/v1/apps/{app_id}/env`
 - `PUT /api/v1/apps/{app_id}/env`
@@ -69,6 +70,8 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Dashboard live-log client now tears down app-level SSE streams when app selection is cleared, preventing stale background requests against `/api/v1/apps/{app_id}/logs/stream`.
 - Dashboard metrics endpoint (`GET /api/v1/dashboard/metrics`) returns live summary cards plus request traffic/resource time series for configurable windows (`1h|24h|7d`) and buckets (`1m|5m|1h`), optionally filtered by `app_id` for request traffic.
 - Request Traffic no-data messaging now renders via a dashboard HTML overlay (instead of SVG text), with no changes to `/api/v1/dashboard/metrics` request/response fields.
+- Dashboard summary `managed_services_healthy` now reflects currently reachable managed-service TCP endpoints (for rows marked healthy), rather than a raw count of stored managed-service records.
+- App runtime probe endpoint (`GET /api/v1/apps/{app_id}/runtime`) reports whether an app currently has a configured runtime upstream and whether that upstream is reachable via TCP.
 - Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
 - Dashboard metrics client refreshes apply latest-request guards so stale responses are dropped when app scope changes mid-request.

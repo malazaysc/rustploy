@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     env,
     time::{Duration, SystemTime},
 };
@@ -158,18 +159,7 @@ impl ResourceCollector {
         self.system.refresh_disks();
         self.system.refresh_networks();
 
-        let disk_total_bytes = self
-            .system
-            .disks()
-            .iter()
-            .map(|disk| disk.total_space())
-            .sum::<u64>();
-        let disk_available_bytes = self
-            .system
-            .disks()
-            .iter()
-            .map(|disk| disk.available_space())
-            .sum::<u64>();
+        let (disk_total_bytes, disk_available_bytes) = aggregate_disk_capacity(self.system.disks());
         let (network_rx_bytes, network_tx_bytes) =
             self.system
                 .networks()
@@ -192,6 +182,77 @@ impl ResourceCollector {
             network_tx_bytes,
         }
     }
+}
+
+fn aggregate_disk_capacity(disks: &[sysinfo::Disk]) -> (u64, u64) {
+    if let Some(root_disk) = disks
+        .iter()
+        .find(|disk| disk.mount_point() == std::path::Path::new("/") && disk.total_space() > 0)
+    {
+        return (root_disk.total_space(), root_disk.available_space());
+    }
+
+    let mut seen_devices = HashSet::new();
+    let mut total = 0u64;
+    let mut available = 0u64;
+
+    for disk in disks {
+        let fs_name = std::str::from_utf8(disk.file_system())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if should_skip_filesystem(&fs_name) {
+            continue;
+        }
+
+        let mut key = disk.name().to_string_lossy().trim().to_ascii_lowercase();
+        if key.is_empty() {
+            key = disk
+                .mount_point()
+                .display()
+                .to_string()
+                .to_ascii_lowercase();
+        }
+        if !seen_devices.insert(key) {
+            continue;
+        }
+
+        total = total.saturating_add(disk.total_space());
+        available = available.saturating_add(disk.available_space());
+    }
+
+    if total == 0 {
+        for disk in disks {
+            total = total.saturating_add(disk.total_space());
+            available = available.saturating_add(disk.available_space());
+        }
+    }
+
+    (total, available)
+}
+
+fn should_skip_filesystem(fs_name: &str) -> bool {
+    matches!(
+        fs_name,
+        "overlay"
+            | "tmpfs"
+            | "devtmpfs"
+            | "squashfs"
+            | "ramfs"
+            | "aufs"
+            | "proc"
+            | "procfs"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2fs"
+            | "nsfs"
+            | "autofs"
+            | "tracefs"
+            | "debugfs"
+            | "securityfs"
+            | "fusectl"
+            | "mqueue"
+            | "devpts"
+    )
 }
 
 async fn send_json_request<T: serde::Serialize>(
@@ -264,4 +325,18 @@ fn unix_ms_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_skip_filesystem;
+
+    #[test]
+    fn skips_virtual_and_overlay_filesystems() {
+        assert!(should_skip_filesystem("overlay"));
+        assert!(should_skip_filesystem("tmpfs"));
+        assert!(should_skip_filesystem("proc"));
+        assert!(!should_skip_filesystem("ext4"));
+        assert!(!should_skip_filesystem("xfs"));
+    }
 }

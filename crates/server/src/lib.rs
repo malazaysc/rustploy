@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     convert::Infallible,
     fs,
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
@@ -26,8 +26,8 @@ use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered,
     AgentResourceSnapshot, AgentStatus, AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse,
-    AppEnvVarListResponse, AppEnvVarSummary, AppListResponse, AppSummary, AuthLoginRequest,
-    AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
+    AppEnvVarListResponse, AppEnvVarSummary, AppListResponse, AppRuntimeHealthResponse, AppSummary,
+    AuthLoginRequest, AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
     CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
     CreateTokenResponse, DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary,
     DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
@@ -187,6 +187,12 @@ struct ManagedServiceRecord {
     username: String,
     password: String,
     healthy: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ManagedServiceEndpoint {
+    host: String,
+    port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -1455,6 +1461,54 @@ impl Database {
         Ok(items)
     }
 
+    fn app_runtime_route(&self, app_id: Uuid) -> Result<Option<AppRuntimeRoute>> {
+        let conn = self.conn.lock().expect("database mutex poisoned");
+        let row = conn
+            .query_row(
+                "SELECT app_id, deployment_id, project_name, service_name, upstream_host, upstream_port
+                 FROM app_runtimes
+                 WHERE app_id = ?1
+                 LIMIT 1",
+                params![app_id.to_string()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .context("failed querying app runtime route")?;
+
+        let Some((
+            app_id_raw,
+            deployment_id_raw,
+            project_name,
+            service_name,
+            upstream_host,
+            upstream_port_raw,
+        )) = row
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(AppRuntimeRoute {
+            app_id: Uuid::parse_str(&app_id_raw)
+                .with_context(|| format!("invalid app runtime app_id: {app_id_raw}"))?,
+            deployment_id: Uuid::parse_str(&deployment_id_raw).with_context(|| {
+                format!("invalid app runtime deployment_id: {deployment_id_raw}")
+            })?,
+            project_name,
+            service_name,
+            upstream_host,
+            upstream_port: to_u16(upstream_port_raw)?,
+        }))
+    }
+
     fn upsert_app_env_var(
         &self,
         app_id: Uuid,
@@ -1940,16 +1994,31 @@ impl Database {
         })
     }
 
-    fn healthy_managed_services_total(&self) -> Result<u64> {
+    fn managed_service_endpoints(&self) -> Result<Vec<ManagedServiceEndpoint>> {
         let conn = self.conn.lock().expect("database mutex poisoned");
-        let value: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM managed_services WHERE healthy = 1",
-                [],
-                |row| row.get(0),
+        let mut stmt = conn
+            .prepare(
+                "SELECT host, port
+                 FROM managed_services
+                 WHERE healthy = 1",
             )
-            .context("failed counting healthy managed services")?;
-        to_u64(value)
+            .context("failed preparing managed service endpoint query")?;
+        let mut rows = stmt
+            .query([])
+            .context("failed querying managed service endpoints")?;
+        let mut items = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .context("failed iterating managed service endpoints")?
+        {
+            let host: String = row.get(0).context("failed reading managed service host")?;
+            let port_raw: i64 = row.get(1).context("failed reading managed service port")?;
+            items.push(ManagedServiceEndpoint {
+                host,
+                port: to_u16(port_raw)?,
+            });
+        }
+        Ok(items)
     }
 
     fn uptime_30d_percent(&self, now_unix_ms: u64) -> Result<Option<f64>> {
@@ -3726,6 +3795,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/apps/import", post(import_app))
         .route("/api/v1/apps", get(list_apps).post(create_app))
         .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
+        .route("/api/v1/apps/:app_id/runtime", get(get_app_runtime_health))
         .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
         .route(
             "/api/v1/apps/:app_id/env",
@@ -5070,14 +5140,14 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
       <section class="stats">
         <article class="stat-card">
-          <div class="stat-kicker"><span>Applications</span><span>Live</span></div>
+          <div class="stat-kicker"><span>Applications</span><span>Total</span></div>
           <div class="stat-value" id="stat-applications">0</div>
-          <div class="stat-note">Deployments managed from one panel</div>
+          <div class="stat-note">Applications configured in this control plane</div>
         </article>
         <article class="stat-card">
-          <div class="stat-kicker"><span>Databases</span><span>Healthy</span></div>
+          <div class="stat-kicker"><span>Managed Services</span><span>Reachable</span></div>
           <div class="stat-value" id="stat-databases">0</div>
-          <div class="stat-note">Managed backing services online</div>
+          <div class="stat-note">Managed dependency endpoints reachable from control plane</div>
         </article>
         <article class="stat-card">
           <div class="stat-kicker"><span>Domains</span><span>SSL</span></div>
@@ -5213,7 +5283,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
             <div class="card-body">
               <ul id="routes" class="list"></ul>
               <p class="hint" id="runtime-note">
-                Latest healthy compose deployments are routed to live runtime containers.
+                Latest deployment and live runtime probe are shown below.
               </p>
             </div>
           </article>
@@ -5272,7 +5342,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       latestDeployment: null,
       selectedDeployment: null,
       deployments: [],
-      config: null
+      config: null,
+      runtimeHealth: null
     };
     const pendingDeploymentsByApp = new Map();
     const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
@@ -5297,6 +5368,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (status === 'deploying') return 'status-deploying';
       if (status === 'retrying') return 'status-retrying';
       return 'status-queued';
+    }
+
+    function deploymentStatusDisplay(value) {
+      const status = normalizeDeploymentStatus(value);
+      if (status === 'healthy') return 'succeeded';
+      return status;
     }
 
     function applyDeploymentsCollapsed() {
@@ -5347,7 +5424,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       const topStrong = document.createElement('strong');
       const topPill = document.createElement('span');
       topPill.className = `pill-status ${deploymentPillClass(status)}`;
-      topPill.textContent = status;
+      topPill.textContent = deploymentStatusDisplay(status);
       topStrong.appendChild(topPill);
       const topCode = document.createElement('code');
       topCode.textContent = deployment.id;
@@ -5398,7 +5475,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const building = isActiveDeploymentStatus(status);
         const isSelected =
           selectedState.selectedDeployment && selectedState.selectedDeployment.id === deployment.id;
-        const statusLabel = building ? `${status} (building)` : status;
+        const statusLabel = building
+          ? `${deploymentStatusDisplay(status)} (building)`
+          : deploymentStatusDisplay(status);
 
         const item = document.createElement('li');
         item.className = `item-row ${building ? 'in-progress' : ''} ${isSelected ? 'selected' : ''}`.trim();
@@ -5702,7 +5781,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         empty.textContent = 'Select an app to inspect routing details.';
         routes.appendChild(empty);
         note.textContent =
-          'Latest healthy compose deployments are routed to live runtime containers.';
+          'Latest deployment and live runtime probe are shown below.';
         return;
       }
 
@@ -5735,7 +5814,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const sourceRef = selectedState.latestDeployment.source_ref || 'manual';
         const status = normalizeDeploymentStatus(selectedState.latestDeployment.status);
         const building = isActiveDeploymentStatus(status);
-        const statusLabel = building ? `${status} (building)` : status;
+        const statusLabel = building
+          ? `${deploymentStatusDisplay(status)} (building)`
+          : `last deploy: ${deploymentStatusDisplay(status)}`;
         deploymentRow.className = `item-row ${building ? 'in-progress' : ''}`.trim();
         deploymentRow.innerHTML = `
           <div class="item-main">
@@ -5752,6 +5833,30 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         `;
       }
       routes.appendChild(deploymentRow);
+
+      const runtimeRow = document.createElement('li');
+      runtimeRow.className = 'item-row';
+      const runtime = selectedState.runtimeHealth;
+      if (!runtime || !runtime.configured) {
+        runtimeRow.innerHTML = `
+          <div class="item-main">
+            <strong>Runtime</strong>
+            <code>not configured</code>
+          </div>
+        `;
+      } else {
+        const runtimeLabel = runtime.reachable ? 'runtime: online' : 'runtime: offline';
+        const runtimeClass = runtime.reachable ? 'status-healthy' : 'status-failed';
+        const upstreamHost = runtime.upstream_host || 'unknown';
+        const upstreamPort = runtime.upstream_port || 'n/a';
+        runtimeRow.innerHTML = `
+          <div class="item-main">
+            <strong><span class="pill-status ${runtimeClass}">${runtimeLabel}</span></strong>
+            <code>${upstreamHost}:${upstreamPort}</code>
+          </div>
+        `;
+      }
+      routes.appendChild(runtimeRow);
 
       const routedDomains = selectedState.domains.filter((domain) =>
         !isControlPlaneDomain(domain.domain)
@@ -5812,7 +5917,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           'Build in progress. Status auto-refreshes every few seconds; logs stream live below.';
       } else {
         note.textContent =
-          'Use the app localhost URL above to reach the latest healthy deployment. Compose apps are now routed to live runtime containers.';
+          'Deployment history and runtime reachability are reported separately.';
       }
     }
 
@@ -5844,6 +5949,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.selectedDeployment = null;
         selectedState.deployments = [];
         selectedState.config = null;
+        selectedState.runtimeHealth = null;
         const empty = document.createElement('li');
         empty.className = 'hint';
         empty.textContent = 'No apps yet.';
@@ -5899,6 +6005,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.selectedDeployment = null;
         selectedState.deployments = [];
         selectedState.config = null;
+        selectedState.runtimeHealth = null;
         setSelectedPill(null);
         renderRoutes();
         renderSelectedDeployment();
@@ -5966,10 +6073,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       selectedState.selectedDeployment = null;
       selectedState.deployments = [];
       selectedState.config = null;
+      selectedState.runtimeHealth = null;
       setSelectedPill(selectedAppName);
       renderRoutes();
       renderSelectedDeployment();
       await refreshDeployments();
+      await refreshRuntimeHealth();
       await refreshDomains();
       await refreshEnvVars();
       await refreshAppConfig();
@@ -6047,6 +6156,18 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       renderRoutes();
       renderSelectedDeployment();
       renderDashboardDeploymentsList(items);
+    }
+
+    async function refreshRuntimeHealth() {
+      if (!selectedApp) return;
+      const appAtRequest = selectedApp;
+      const res = await api(`/api/v1/apps/${appAtRequest}/runtime`);
+      const data = await res.json();
+      if (selectedApp !== appAtRequest) {
+        return;
+      }
+      selectedState.runtimeHealth = data;
+      renderRoutes();
     }
 
     async function showLogs(appId, deploymentId) {
@@ -6285,6 +6406,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       });
     setInterval(() => refreshApps().catch(() => {}), 15000);
     setInterval(() => refreshDeployments().catch(() => {}), 4000);
+    setInterval(() => refreshRuntimeHealth().catch(() => {}), 8000);
     setInterval(() => refreshEnvVars().catch(() => {}), 10000);
     setInterval(() => refreshDashboardMetrics().catch((error) => renderDashboardMetricsError(error.message)), 10000);
   </script>
@@ -7673,6 +7795,52 @@ async fn list_apps(
     Ok(Json(AppListResponse { items }))
 }
 
+async fn get_app_runtime_health(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AppRuntimeHealthResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/runtime",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let checked_at_unix_ms = now_unix_ms();
+    let runtime = state.db.app_runtime_route(app_id).map_err(internal_error)?;
+
+    let response = if let Some(route) = runtime {
+        let reachable = is_tcp_endpoint_reachable(&route.upstream_host, route.upstream_port).await;
+        AppRuntimeHealthResponse {
+            app_id,
+            configured: true,
+            reachable,
+            upstream_host: Some(route.upstream_host),
+            upstream_port: Some(route.upstream_port),
+            deployment_id: Some(route.deployment_id),
+            checked_at_unix_ms,
+        }
+    } else {
+        AppRuntimeHealthResponse {
+            app_id,
+            configured: false,
+            reachable: false,
+            upstream_host: None,
+            upstream_port: None,
+            deployment_id: None,
+            checked_at_unix_ms,
+        }
+    };
+
+    Ok(Json(response))
+}
+
 async fn connect_github_repo(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -8495,10 +8663,11 @@ async fn dashboard_metrics(
         .db
         .metrics_snapshot()
         .map_err(|error| status_to_api_error(internal_error(error)))?;
-    let managed_services_healthy = state
+    let managed_service_endpoints = state
         .db
-        .healthy_managed_services_total()
+        .managed_service_endpoints()
         .map_err(|error| status_to_api_error(internal_error(error)))?;
+    let managed_services_healthy = count_reachable_tcp_endpoints(&managed_service_endpoints).await;
     let uptime_30d_percent = state
         .db
         .uptime_30d_percent(now)
@@ -8529,6 +8698,36 @@ async fn dashboard_metrics(
         request_traffic,
         server_resources,
     }))
+}
+
+async fn count_reachable_tcp_endpoints(endpoints: &[ManagedServiceEndpoint]) -> u64 {
+    let mut seen = HashSet::new();
+    let mut reachable = 0u64;
+    for endpoint in endpoints {
+        let key = format!("{}:{}", endpoint.host.trim(), endpoint.port);
+        if !seen.insert(key) {
+            continue;
+        }
+        if is_tcp_endpoint_reachable(&endpoint.host, endpoint.port).await {
+            reachable = reachable.saturating_add(1);
+        }
+    }
+    reachable
+}
+
+async fn is_tcp_endpoint_reachable(host: &str, port: u16) -> bool {
+    if host.trim().is_empty() || port == 0 {
+        return false;
+    }
+    let address = format!("{}:{}", host.trim(), port);
+    matches!(
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            tokio::net::TcpStream::connect(address)
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 fn verify_github_signature(
@@ -10485,6 +10684,119 @@ mod tests {
         );
         assert_eq!(normalize_host_value("[]:443"), None);
         assert_eq!(normalize_host_value("   "), None);
+    }
+
+    #[tokio::test]
+    async fn managed_service_reachability_counts_live_tcp_endpoints() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        let endpoints = vec![
+            ManagedServiceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: live_port,
+            },
+            ManagedServiceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: live_port,
+            },
+            ManagedServiceEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 9,
+            },
+        ];
+
+        let reachable = count_reachable_tcp_endpoints(&endpoints).await;
+        assert_eq!(reachable, 1);
+    }
+
+    #[tokio::test]
+    async fn app_runtime_health_reports_unconfigured_runtime() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("runtime-empty", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{}/runtime", app_row.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["configured"], json!(false));
+        assert_eq!(payload["reachable"], json!(false));
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_runtime_health_reports_live_runtime_endpoint() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("runtime-live", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let deployment = state
+            .db
+            .create_deployment_and_enqueue_job(
+                app_row.id,
+                &CreateDeploymentRequest {
+                    source_ref: None,
+                    image_ref: None,
+                    commit_sha: None,
+                    simulate_failures: None,
+                    force_rebuild: None,
+                },
+                now_unix_ms(),
+                DEFAULT_JOB_MAX_ATTEMPTS,
+            )
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_port = listener.local_addr().unwrap().port();
+        state
+            .db
+            .upsert_app_runtime(
+                &AppRuntimeRoute {
+                    app_id: app_row.id,
+                    deployment_id: deployment.deployment_id,
+                    project_name: "runtime-live".to_string(),
+                    service_name: "web".to_string(),
+                    upstream_host: "127.0.0.1".to_string(),
+                    upstream_port: live_port,
+                },
+                now_unix_ms(),
+            )
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{}/runtime", app_row.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["configured"], json!(true));
+        assert_eq!(payload["reachable"], json!(true));
+        assert_eq!(payload["upstream_port"], json!(live_port));
+
+        cleanup_db(&db_path);
     }
 
     #[tokio::test]

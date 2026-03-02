@@ -105,6 +105,17 @@ pub struct AppListResponse {
     pub items: Vec<AppSummary>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppRuntimeHealthResponse {
+    pub app_id: Uuid,
+    pub configured: bool,
+    pub reachable: bool,
+    pub upstream_host: Option<String>,
+    pub upstream_port: Option<u16>,
+    pub deployment_id: Option<Uuid>,
+    pub checked_at_unix_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
     pub source_ref: Option<String>,
@@ -602,6 +613,37 @@ mod tests {
 
         let decoded: DashboardMetricsResponse =
             serde_json::from_value(encoded).expect("deserialize dashboard metrics");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn app_runtime_health_response_json_shape_roundtrip() {
+        let app_id = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let deployment_id = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+        let response = AppRuntimeHealthResponse {
+            app_id,
+            configured: true,
+            reachable: false,
+            upstream_host: Some("127.0.0.1".to_string()),
+            upstream_port: Some(32000),
+            deployment_id: Some(deployment_id),
+            checked_at_unix_ms: 1_700_000_000_000,
+        };
+        let encoded = serde_json::to_value(&response).expect("serialize runtime health");
+        assert_eq!(
+            encoded,
+            json!({
+                "app_id": "22222222-2222-2222-2222-222222222222",
+                "configured": true,
+                "reachable": false,
+                "upstream_host": "127.0.0.1",
+                "upstream_port": 32000,
+                "deployment_id": "33333333-3333-3333-3333-333333333333",
+                "checked_at_unix_ms": 1700000000000u64
+            })
+        );
+        let decoded: AppRuntimeHealthResponse =
+            serde_json::from_value(encoded).expect("deserialize runtime health");
         assert_eq!(decoded, response);
     }
 }

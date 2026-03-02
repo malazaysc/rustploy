@@ -14,6 +14,10 @@
 - Dashboard metrics refresh now drops stale async responses when selected app context changes, preventing out-of-order widget renders.
 - Request Traffic empty-state messaging now uses a fixed-position HTML overlay in the chart shell, preventing stretched/oversized text artifacts from SVG scaling.
 - Agent memory telemetry collection now records sysinfo byte values directly (no extra scaling), so Server Resources memory readings align with actual host totals/usages.
+- Agent disk telemetry now de-duplicates repeated filesystem/device entries and skips virtual filesystems, reducing inflated disk-capacity readings in containerized environments.
+- Dashboard summary now reports managed-service reachability (TCP probe) instead of raw DB health flags, reducing false-positive "healthy" database counts.
+- Dashboard stat-card and routing-copy labels now distinguish deployment history from current runtime liveness to avoid "healthy but offline" confusion.
+- Added `GET /api/v1/apps/{app_id}/runtime` runtime probe and wired dashboard routing panel to display live runtime online/offline state separately from deployment history.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
