@@ -16,6 +16,8 @@ services:
       RUSTPLOY_DB_PATH: /data/rustploy.db
       RUSTPLOY_RUNTIME_ROOT: /data/runtime
       RUSTPLOY_CADDYFILE_PATH: /shared/Caddyfile
+      RUSTPLOY_CADDY_ACCESS_LOG_PATH: /var/log/caddy/caddy-access.log
+      RUSTPLOY_CADDY_ACCESS_LOG_ENABLED: "1"
       RUSTPLOY_UPSTREAM_ADDR: server:8080
       RUSTPLOY_ADMIN_EMAIL: admin@localhost
       RUSTPLOY_ADMIN_PASSWORD: admin
@@ -24,6 +26,7 @@ services:
     volumes:
       - rustploy-data:/data
       - rustploy-shared:/shared
+      - rustploy-caddy-logs:/var/log/caddy:ro
       - /var/run/docker.sock:/var/run/docker.sock
     depends_on:
       - sqlite
@@ -56,6 +59,7 @@ services:
       - "8080:8080"
     volumes:
       - rustploy-shared:/shared:ro
+      - rustploy-caddy-logs:/var/log/caddy
       - rustploy-caddy:/data
       - rustploy-caddy-config:/config
     extra_hosts:
@@ -67,5 +71,6 @@ services:
 volumes:
   rustploy-data:
   rustploy-shared:
+  rustploy-caddy-logs:
   rustploy-caddy:
   rustploy-caddy-config:

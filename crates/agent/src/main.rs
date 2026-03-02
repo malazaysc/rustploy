@@ -1,7 +1,12 @@
-use std::{env, time::SystemTime};
+use std::{
+    collections::HashSet,
+    env,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
-use shared::{AgentHeartbeat, AgentRegisterRequest};
+use shared::{AgentHeartbeat, AgentRegisterRequest, AgentResourceSnapshot};
+use sysinfo::{CpuExt, DiskExt, NetworkExt, NetworksExt, System, SystemExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -17,6 +22,11 @@ struct AgentConfig {
     interval_seconds: u64,
     oneshot: bool,
     agent_token: Option<String>,
+}
+
+#[derive(Debug)]
+struct ResourceCollector {
+    system: System,
 }
 
 #[tokio::main]
@@ -38,17 +48,21 @@ async fn main() -> Result<()> {
     if let Err(error) = send_registration(&config).await {
         warn!(%error, "agent registration failed");
     }
+    let mut resource_collector = ResourceCollector::new();
+    tokio::time::sleep(System::MINIMUM_CPU_UPDATE_INTERVAL).await;
 
     if config.oneshot {
-        send_heartbeat(&config).await?;
+        send_heartbeat(&config, Some(resource_collector.collect())).await?;
         return Ok(());
     }
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(config.interval_seconds));
+    let heartbeat_interval =
+        Duration::from_secs(config.interval_seconds).max(System::MINIMUM_CPU_UPDATE_INTERVAL);
+    let mut ticker = tokio::time::interval(heartbeat_interval);
 
     loop {
         ticker.tick().await;
-        if let Err(error) = send_heartbeat(&config).await {
+        if let Err(error) = send_heartbeat(&config, Some(resource_collector.collect())).await {
             warn!(%error, "heartbeat failed");
         }
     }
@@ -103,11 +117,15 @@ async fn send_registration(config: &AgentConfig) -> Result<()> {
     .await
 }
 
-async fn send_heartbeat(config: &AgentConfig) -> Result<()> {
+async fn send_heartbeat(
+    config: &AgentConfig,
+    resource: Option<AgentResourceSnapshot>,
+) -> Result<()> {
     let heartbeat = AgentHeartbeat {
         agent_id: config.agent_id,
         timestamp_unix_ms: unix_ms_now(),
         agent_version: config.agent_version.clone(),
+        resource,
     };
 
     send_json_request(
@@ -121,6 +139,153 @@ async fn send_heartbeat(config: &AgentConfig) -> Result<()> {
 
     info!(agent_id = %config.agent_id, "heartbeat accepted");
     Ok(())
+}
+
+impl ResourceCollector {
+    fn new() -> Self {
+        let mut system = System::new_all();
+        system.refresh_cpu();
+        system.refresh_memory();
+        system.refresh_disks_list();
+        system.refresh_disks();
+        system.refresh_networks_list();
+        system.refresh_networks();
+        Self { system }
+    }
+
+    fn collect(&mut self) -> AgentResourceSnapshot {
+        self.system.refresh_cpu();
+        self.system.refresh_memory();
+        self.system.refresh_disks();
+        self.system.refresh_networks();
+
+        let (disk_total_bytes, disk_available_bytes) = aggregate_disk_capacity(self.system.disks());
+        let (network_rx_bytes, network_tx_bytes) =
+            self.system
+                .networks()
+                .iter()
+                .fold((0u64, 0u64), |(rx, tx), (_name, data)| {
+                    (
+                        rx.saturating_add(data.total_received()),
+                        tx.saturating_add(data.total_transmitted()),
+                    )
+                });
+
+        AgentResourceSnapshot {
+            cpu_percent: self.system.global_cpu_info().cpu_usage() as f64,
+            // sysinfo already reports memory in bytes on our pinned version.
+            memory_used_bytes: self.system.used_memory(),
+            memory_total_bytes: self.system.total_memory(),
+            disk_used_bytes: disk_total_bytes.saturating_sub(disk_available_bytes),
+            disk_total_bytes,
+            network_rx_bytes,
+            network_tx_bytes,
+        }
+    }
+}
+
+fn aggregate_disk_capacity(disks: &[sysinfo::Disk]) -> (u64, u64) {
+    if let Some(root_disk) = disks
+        .iter()
+        .find(|disk| disk.mount_point() == std::path::Path::new("/") && disk.total_space() > 0)
+    {
+        return (root_disk.total_space(), root_disk.available_space());
+    }
+
+    let mut seen_devices = HashSet::new();
+    let mut total = 0u64;
+    let mut available = 0u64;
+
+    for disk in disks {
+        let fs_name = std::str::from_utf8(disk.file_system())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if should_skip_filesystem(&fs_name) {
+            continue;
+        }
+
+        let Some(key) = disk_dedup_key(disk, &fs_name) else {
+            continue;
+        };
+        if !seen_devices.insert(key) {
+            continue;
+        }
+
+        total = total.saturating_add(disk.total_space());
+        available = available.saturating_add(disk.available_space());
+    }
+
+    if total == 0 {
+        for disk in disks {
+            total = total.saturating_add(disk.total_space());
+            available = available.saturating_add(disk.available_space());
+        }
+    }
+
+    (total, available)
+}
+
+fn disk_dedup_key(disk: &sysinfo::Disk, fs_name: &str) -> Option<String> {
+    let name = disk.name().to_string_lossy().trim().to_ascii_lowercase();
+    if fs_name == "btrfs" {
+        if !name.is_empty() {
+            return Some(format!("btrfs:device:{name}"));
+        }
+        return Some(format!(
+            "btrfs:mount:{}",
+            btrfs_mount_group(disk.mount_point())
+        ));
+    }
+    if !name.is_empty() {
+        return Some(name);
+    }
+    let mount_key = disk
+        .mount_point()
+        .display()
+        .to_string()
+        .to_ascii_lowercase();
+    if mount_key.is_empty() {
+        None
+    } else {
+        Some(mount_key)
+    }
+}
+
+fn btrfs_mount_group(mount_point: &std::path::Path) -> String {
+    let mut segments = mount_point.components().filter_map(|part| match part {
+        std::path::Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    });
+    match (segments.next(), segments.next()) {
+        (Some(first), Some(second)) => format!("/{first}/{second}"),
+        (Some(first), None) => format!("/{first}"),
+        _ => "/".to_string(),
+    }
+}
+
+fn should_skip_filesystem(fs_name: &str) -> bool {
+    matches!(
+        fs_name,
+        "overlay"
+            | "tmpfs"
+            | "devtmpfs"
+            | "squashfs"
+            | "ramfs"
+            | "aufs"
+            | "proc"
+            | "procfs"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2fs"
+            | "nsfs"
+            | "autofs"
+            | "tracefs"
+            | "debugfs"
+            | "securityfs"
+            | "fusectl"
+            | "mqueue"
+            | "devpts"
+    )
 }
 
 async fn send_json_request<T: serde::Serialize>(
@@ -193,4 +358,29 @@ fn unix_ms_now() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{btrfs_mount_group, should_skip_filesystem};
+    use std::path::Path;
+
+    #[test]
+    fn skips_virtual_and_overlay_filesystems() {
+        assert!(should_skip_filesystem("overlay"));
+        assert!(should_skip_filesystem("tmpfs"));
+        assert!(should_skip_filesystem("proc"));
+        assert!(!should_skip_filesystem("ext4"));
+        assert!(!should_skip_filesystem("xfs"));
+    }
+
+    #[test]
+    fn groups_btrfs_subvolume_mounts() {
+        assert_eq!(btrfs_mount_group(Path::new("/")), "/");
+        assert_eq!(btrfs_mount_group(Path::new("/home")), "/home");
+        assert_eq!(
+            btrfs_mount_group(Path::new("/mnt/data/subvolumes/app-a")),
+            "/mnt/data"
+        );
+    }
 }

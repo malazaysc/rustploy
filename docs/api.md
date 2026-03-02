@@ -29,10 +29,12 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `GET /api/v1/auth/me`
 - `POST /api/v1/auth/password-reset/request`
 - `POST /api/v1/auth/password-reset/confirm`
+- `GET /api/v1/dashboard/metrics`
 - `POST /api/v1/apps/import`
 - `POST /api/v1/apps`
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
+- `GET /api/v1/apps/{app_id}/runtime`
 - `GET /api/v1/apps/{app_id}/config`
 - `GET /api/v1/apps/{app_id}/env`
 - `PUT /api/v1/apps/{app_id}/env`
@@ -66,6 +68,14 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Logs explorer query UI applies a latest-request guard so stale out-of-order responses are dropped instead of overwriting newer query results.
 - Dashboard domain and env list rendering now uses text-safe DOM node assembly, preserving endpoint contracts while preventing stored script injection from user-controlled fields.
 - Dashboard live-log client now tears down app-level SSE streams when app selection is cleared, preventing stale background requests against `/api/v1/apps/{app_id}/logs/stream`.
+- Dashboard metrics endpoint (`GET /api/v1/dashboard/metrics`) returns live summary cards plus request traffic/resource time series for configurable windows (`1h|24h|7d`) and buckets (`1m|5m|1h`), optionally filtered by `app_id` for request traffic.
+- Request Traffic no-data messaging now renders via a dashboard HTML overlay (instead of SVG text), with no changes to `/api/v1/dashboard/metrics` request/response fields.
+- Dashboard summary `managed_services_healthy` now reflects currently reachable managed-service TCP endpoints (for rows marked healthy), rather than a raw count of stored managed-service records.
+- App runtime probe endpoint (`GET /api/v1/apps/{app_id}/runtime`) reports whether an app currently has a configured runtime upstream and whether that upstream is reachable via TCP.
+- Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
+- Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
+- Agent heartbeat ingestion treats resource-snapshot persistence as best-effort: the API still returns `202 Accepted` when telemetry writes fail, and failures are logged server-side.
+- Dashboard metrics client refreshes apply latest-request guards so stale responses are dropped when app scope changes mid-request.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.
