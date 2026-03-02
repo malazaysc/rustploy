@@ -2943,6 +2943,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/", get(dashboard_ui))
         .route("/logs", get(logs_ui))
+        .route("/ui/shared.js", get(shared_ui_js))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
@@ -3058,6 +3059,17 @@ async fn logs_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<Stri
     } else {
         Html(LOGIN_HTML.to_string())
     }
+}
+
+async fn shared_ui_js() -> impl axum::response::IntoResponse {
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
+        SHARED_UI_JS,
+    )
 }
 
 fn request_host(headers: &HeaderMap) -> Option<String> {
@@ -3532,6 +3544,22 @@ const LOGIN_HTML: &str = r#"<!doctype html>
 </body>
 </html>
 "#;
+
+const SHARED_UI_JS: &str = r#"(() => {
+  function formatUnixMs(value) {
+    if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
+      return 'unknown';
+    }
+    try {
+      return new Date(value).toLocaleString();
+    } catch (_) {
+      return 'unknown';
+    }
+  }
+
+  window.rustployUi = window.rustployUi || {};
+  window.rustployUi.formatUnixMs = formatUnixMs;
+})();"#;
 
 const DASHBOARD_HTML: &str = r#"<!doctype html>
 <html lang="en">
@@ -4431,6 +4459,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       </section>
     </main>
   </div>
+  <script src="/ui/shared.js"></script>
   <script>
     let selectedApp = null;
     let selectedAppName = null;
@@ -4447,6 +4476,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     };
     const pendingDeploymentsByApp = new Map();
     const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+    const formatUnixMs = window.rustployUi.formatUnixMs;
     let deploymentsCollapsed = false;
 
     function normalizeDeploymentStatus(value) {
@@ -4464,17 +4494,6 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (status === 'deploying') return 'status-deploying';
       if (status === 'retrying') return 'status-retrying';
       return 'status-queued';
-    }
-
-    function formatUnixMs(value) {
-      if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
-        return 'unknown';
-      }
-      try {
-        return new Date(value).toLocaleString();
-      } catch (_) {
-        return 'unknown';
-      }
     }
 
     function applyDeploymentsCollapsed() {
@@ -5777,6 +5796,7 @@ const LOGS_HTML: &str = r#"<!doctype html>
       </section>
     </main>
   </div>
+  <script src="/ui/shared.js"></script>
   <script>
     let apps = [];
     let allDeployments = [];
@@ -5784,8 +5804,10 @@ const LOGS_HTML: &str = r#"<!doctype html>
     let selectedDeployment = null;
     let rawLogs = '';
     let statusTimeout = null;
+    let latestQueryId = 0;
 
     const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+    const formatUnixMs = window.rustployUi.formatUnixMs;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -5828,17 +5850,6 @@ const LOGS_HTML: &str = r#"<!doctype html>
         throw new Error(text || `request failed: ${res.status}`);
       }
       return res;
-    }
-
-    function formatUnixMs(value) {
-      if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
-        return 'unknown';
-      }
-      try {
-        return new Date(value).toLocaleString();
-      } catch (_) {
-        return 'unknown';
-      }
     }
 
     function withinHours(updatedAtUnixMs, hours) {
@@ -5905,14 +5916,17 @@ const LOGS_HTML: &str = r#"<!doctype html>
     }
 
     async function runQuery() {
+      const localQueryId = ++latestQueryId;
       if (apps.length === 0) {
         await loadApps();
+        if (localQueryId !== latestQueryId) return;
       }
       setStatus('Querying deployment data...');
 
       const appId = document.getElementById('filter-app').value || 'all';
       const targets = appId === 'all' ? apps : apps.filter((app) => app.id === appId);
       if (targets.length === 0) {
+        if (localQueryId !== latestQueryId) return;
         allDeployments = [];
         filteredDeployments = [];
         selectedDeployment = null;
@@ -5935,6 +5949,7 @@ const LOGS_HTML: &str = r#"<!doctype html>
           }));
         })
       );
+      if (localQueryId !== latestQueryId) return;
 
       const successful = [];
       const failedApps = [];
@@ -9308,6 +9323,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn logs_route_returns_login_html_without_valid_session() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let response = app
+            .oneshot(Request::builder().uri("/logs").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(html, LOGIN_HTML);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn logs_route_returns_logs_html_with_valid_session() {
+        let db_path = test_db_path();
+        let state = AppState::from_config(AppStateConfig {
+            db_path: db_path.clone(),
+            agent_shared_token: None,
+            github_webhook_secret: None,
+            session_ttl_ms: DEFAULT_SESSION_TTL_MS,
+            password_reset_ttl_ms: DEFAULT_PASSWORD_RESET_TTL_MS,
+            bootstrap_admin_email: Some("admin@localhost".to_string()),
+            bootstrap_admin_password: Some("password123".to_string()),
+            online_window_ms: DEFAULT_ONLINE_WINDOW_MS,
+            reconciler_enabled: false,
+            reconciler_interval_ms: 1,
+            job_backoff_base_ms: 1,
+            job_backoff_max_ms: 100,
+            job_max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+            api_rate_limit_per_minute: 10_000,
+            webhook_rate_limit_per_minute: 10_000,
+        })
+        .unwrap();
+        let app = create_router(state);
+
+        let login = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/auth/login")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"email":"admin@localhost","password":"password123"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(login.status(), StatusCode::OK);
+        let set_cookie = login
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap()
+            .to_string();
+        let cookie_pair = set_cookie.split(';').next().unwrap().to_string();
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/logs")
+                    .header("cookie", cookie_pair)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        assert_eq!(html, LOGS_HTML);
 
         cleanup_db(&db_path);
     }

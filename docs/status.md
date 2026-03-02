@@ -4,15 +4,15 @@
 
 - Self-hosted Rust control plane with SQLite state and durable reconciler queue.
 - Web dashboard with auth, app import/create, deploy/rollback, domain mapping, logs, and env var management.
-- Dashboard visual refresh aligned to the new v0 mock (sidebar-first layout, modern dark styling, and card-based information hierarchy) without changing API-backed workflows.
-- Dashboard scrolling polish: root background/overscroll handling now prevents blank top/bottom gaps during fast scroll bounce.
-- Dashboard graph placeholders now cover traffic and server resource chart areas so all graph panels are represented before live metrics data is wired in.
-- Dashboard operations panel now includes a collapsible "Recent Deployments" card and a dedicated "Selected Deployment" summary card with condensed status/metadata.
+- Visual refresh for the dashboard is aligned to the new v0 mock (sidebar-first layout, modern dark styling, and card-based information hierarchy) without changing API-backed workflows.
+- Improved scrolling polish now anchors root background/overscroll handling so fast scroll bounce no longer reveals blank top/bottom gaps.
+- Graph placeholders now cover traffic and server resource chart areas so every graph panel is represented before live metrics data is wired in.
+- Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
-- Logs Explorer query flow now tolerates per-app fetch failures (partial results mode) and uses DOM-safe rendering for deployment summaries/results.
-- Dashboard layout hardening: two-column panels now use constrained grid sizing to prevent left/right overlap.
-- Dashboard app rows now wrap long app IDs to avoid overlap with action buttons in narrow cards.
-- Dashboard app list rows now use explicit text/actions column layout to keep metadata and buttons separated under narrow widths.
+- Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
+- Hardened two-column dashboard layout now uses constrained grid sizing to prevent left/right overlap.
+- App rows now wrap long app IDs to avoid overlap with action buttons in narrow cards.
+- App list rows now use explicit text/actions column layout to keep metadata and buttons separated under narrow widths.
 - Terminal UI (`rustploy-tui`) for SSH-first operations.
 - GitHub repository mapping + webhook-triggered deployments with signature verification.
 - Compose-first runtime deploys:

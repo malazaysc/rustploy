@@ -27,9 +27,10 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
 - Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
 - Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
-- Dashboard two-column layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
-- Dashboard app list rows now wrap app IDs safely instead of overflowing beneath action buttons.
-- Dashboard app rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
+- Logs Explorer query execution now ignores stale out-of-order responses so older requests cannot overwrite newer query results.
+- Two-column dashboard layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
+- App list rows now wrap app IDs safely instead of overflowing beneath action buttons.
+- App rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
 
 ### Added
 
