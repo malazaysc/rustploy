@@ -65,6 +65,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Logs explorer query execution aggregates successful per-app deployment fetches and surfaces partial-failure warnings when one app query fails.
 - Logs explorer query UI applies a latest-request guard so stale out-of-order responses are dropped instead of overwriting newer query results.
 - Dashboard domain and env list rendering now uses text-safe DOM node assembly, preserving endpoint contracts while preventing stored script injection from user-controlled fields.
+- Dashboard live-log client now tears down app-level SSE streams when app selection is cleared, preventing stale background requests against `/api/v1/apps/{app_id}/logs/stream`.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.

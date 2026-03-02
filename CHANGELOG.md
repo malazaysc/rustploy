@@ -29,6 +29,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
 - Logs Explorer query execution now ignores stale out-of-order responses so older requests cannot overwrite newer query results.
 - Dashboard domain/env list rendering now uses text-safe DOM nodes to prevent stored XSS from user-provided values.
+- Dashboard now closes active app log SSE streams when app selection is cleared, preventing stale background log polling.
 - Two-column dashboard layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
 - App list rows now wrap app IDs safely instead of overflowing beneath action buttons.
 - App rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.

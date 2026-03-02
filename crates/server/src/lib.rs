@@ -15,7 +15,7 @@ use axum::{
     body::Bytes,
     extract::{Path as AxumPath, State},
     http::{header, HeaderMap, StatusCode},
-    response::{sse::Event, sse::KeepAlive, Html, Sse},
+    response::{sse::Event, sse::KeepAlive, Html, IntoResponse, Sse},
     routing::{delete, get, post},
     Json, Router,
 };
@@ -3052,12 +3052,27 @@ async fn dashboard_ui(State(state): State<AppState>, headers: HeaderMap) -> Html
     }
 }
 
-async fn logs_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
-    let session = authorize_session_request(&state, &headers).ok().flatten();
-    if session.is_some() {
-        Html(LOGS_HTML.to_string())
-    } else {
-        Html(LOGIN_HTML.to_string())
+async fn logs_ui(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl axum::response::IntoResponse {
+    match authorize_session_request(&state, &headers) {
+        Ok(Some(_)) => (StatusCode::OK, Html(LOGS_HTML.to_string())).into_response(),
+        Ok(None) => (StatusCode::OK, Html(LOGIN_HTML.to_string())).into_response(),
+        Err(error) => {
+            error!(
+                error = %redact_secrets(&error.to_string()),
+                "failed authorizing logs ui session"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Html(
+                    "<!doctype html><html><body><h1>Internal Server Error</h1></body></html>"
+                        .to_string(),
+                ),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -4866,6 +4881,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         setSelectedPill(null);
         renderRoutes();
         renderSelectedDeployment();
+        stopLogsStream();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
         return;
       }
@@ -4911,6 +4927,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         setSelectedPill(null);
         renderRoutes();
         renderSelectedDeployment();
+        stopLogsStream();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
       }
     }
@@ -4980,13 +4997,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       startLogsStream();
     }
 
-    function startLogsStream() {
+    function stopLogsStream(resetOutput = true) {
       if (logsStream) {
         logsStream.close();
         logsStream = null;
       }
-      if (!selectedApp) return;
       selectedLogsDeploymentId = null;
+      if (!resetOutput) return;
+      const logsEl = document.getElementById('logs');
+      if (logsEl) logsEl.textContent = '(no logs)';
+    }
+
+    function startLogsStream() {
+      stopLogsStream(false);
+      if (!selectedApp) return;
       document.getElementById('logs').textContent = '(waiting for logs...)';
       logsStream = new EventSource(`/api/v1/apps/${selectedApp}/logs/stream`, { withCredentials: true });
       logsStream.addEventListener('logs', (event) => {
@@ -5255,16 +5279,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
 
     async function logout() {
-      if (logsStream) {
-        logsStream.close();
-        logsStream = null;
-      }
+      stopLogsStream(false);
       await api('/api/v1/auth/logout', { method:'POST' });
       window.location.reload();
     }
 
     window.addEventListener('beforeunload', () => {
-      if (logsStream) logsStream.close();
+      stopLogsStream(false);
     });
 
     renderRoutes();
@@ -8949,6 +8970,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn shared_ui_js_route_serves_javascript() {
+        let db_path = test_db_path();
+        let app = create_router(AppState::for_tests(&db_path, None));
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/ui/shared.js")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/javascript; charset=utf-8")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let javascript = String::from_utf8(body.to_vec()).unwrap();
+        assert!(javascript.contains("window.rustployUi"));
+
         cleanup_db(&db_path);
     }
 
