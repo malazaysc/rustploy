@@ -16,6 +16,10 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Added a dedicated SQLite index for incremental deployment log stream queries to reduce polling overhead at scale.
 - Dashboard deployment UX now shows optimistic `queued/building` status immediately after deploy actions and keeps status pills updated during rollout.
 - Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
+- Metric cards and telemetry widgets in the dashboard now render live backend data (global/per-app request traffic + host resource samples) instead of placeholder values.
+- Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
+- Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
+- CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
 
 ### Fixed
 
@@ -29,6 +33,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Two-column dashboard layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
 - App list rows now wrap app IDs safely instead of overflowing beneath action buttons.
 - App rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
+- Agent resource sample persistence now clamps client-provided timestamps to bounded server receive time to prevent future-skewed telemetry writes.
+- Dashboard metrics rendering now ignores stale out-of-order responses when app selection changes during async refreshes.
 
 ### Added
 
@@ -64,3 +70,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Manual deployment resync/rebuild support via `force_rebuild` deployment option and dashboard "Resync & Rebuild" action.
 - Documentation governance baseline: root `AGENTS.md`, `docs/status.md`, PR template checklist, and CI `docs-guard` enforcement.
 - Live deployment log piping for compose/git commands, persisted line-by-line and visible through `/api/v1/apps/:id/logs/stream`.
+- New dashboard telemetry endpoint: `GET /api/v1/dashboard/metrics` with window/bucket/app-scope query support.
+- SQLite telemetry persistence for dashboard widgets (`agent_resource_samples`, `request_traffic_buckets`) with retention pruning.
+- Caddy JSON access-log emission/ingestion path for request traffic aggregation (`RUSTPLOY_CADDY_ACCESS_LOG_PATH`).

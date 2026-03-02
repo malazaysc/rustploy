@@ -19,6 +19,8 @@ pub struct AgentHeartbeat {
     pub agent_id: Uuid,
     pub timestamp_unix_ms: u64,
     pub agent_version: String,
+    #[serde(default)]
+    pub resource: Option<AgentResourceSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,6 +32,17 @@ impl HeartbeatAccepted {
     pub fn yes() -> Self {
         Self { accepted: true }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentResourceSnapshot {
+    pub cpu_percent: f64,
+    pub memory_used_bytes: u64,
+    pub memory_total_bytes: u64,
+    pub disk_used_bytes: u64,
+    pub disk_total_bytes: u64,
+    pub network_rx_bytes: u64,
+    pub network_tx_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -404,9 +417,56 @@ pub struct CreateTokenResponse {
     pub summary: TokenSummary,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardSummary {
+    pub applications_total: u64,
+    pub managed_services_healthy: u64,
+    pub domains_total: u64,
+    pub uptime_30d_percent: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardMetricsScope {
+    pub window: String,
+    pub bucket: String,
+    pub app_id: Option<Uuid>,
+    pub start_unix_ms: u64,
+    pub end_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RequestTrafficPoint {
+    pub bucket_start_unix_ms: u64,
+    pub total_requests: u64,
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ServerResourcePoint {
+    pub bucket_start_unix_ms: u64,
+    pub cpu_percent_avg: f64,
+    pub memory_used_bytes_avg: u64,
+    pub memory_total_bytes_avg: u64,
+    pub disk_used_bytes_avg: u64,
+    pub disk_total_bytes_avg: u64,
+    pub network_rx_bytes_avg: u64,
+    pub network_tx_bytes_avg: u64,
+    pub samples: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DashboardMetricsResponse {
+    pub summary: DashboardSummary,
+    pub scope: DashboardMetricsScope,
+    pub request_traffic: Vec<RequestTrafficPoint>,
+    pub server_resources: Vec<ServerResourcePoint>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn health_ok_response_is_stable() {
@@ -436,5 +496,112 @@ mod tests {
         );
         assert_eq!(DeploymentStatus::Healthy.as_str(), "healthy");
         assert_eq!(DeploymentStatus::parse("unknown"), None);
+    }
+
+    #[test]
+    fn agent_resource_snapshot_json_shape_roundtrip() {
+        let snapshot = AgentResourceSnapshot {
+            cpu_percent: 37.5,
+            memory_used_bytes: 1_500,
+            memory_total_bytes: 4_000,
+            disk_used_bytes: 40_000,
+            disk_total_bytes: 120_000,
+            network_rx_bytes: 9_000,
+            network_tx_bytes: 8_500,
+        };
+        let encoded = serde_json::to_value(&snapshot).expect("serialize resource snapshot");
+        assert_eq!(
+            encoded,
+            json!({
+                "cpu_percent": 37.5,
+                "memory_used_bytes": 1500,
+                "memory_total_bytes": 4000,
+                "disk_used_bytes": 40000,
+                "disk_total_bytes": 120000,
+                "network_rx_bytes": 9000,
+                "network_tx_bytes": 8500
+            })
+        );
+        let decoded: AgentResourceSnapshot =
+            serde_json::from_value(encoded).expect("deserialize resource snapshot");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn dashboard_metrics_response_json_shape_roundtrip() {
+        let app_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let response = DashboardMetricsResponse {
+            summary: DashboardSummary {
+                applications_total: 2,
+                managed_services_healthy: 1,
+                domains_total: 3,
+                uptime_30d_percent: Some(99.7),
+            },
+            scope: DashboardMetricsScope {
+                window: "24h".to_string(),
+                bucket: "5m".to_string(),
+                app_id: Some(app_id),
+                start_unix_ms: 1_700_000_000_000,
+                end_unix_ms: 1_700_086_400_000,
+            },
+            request_traffic: vec![RequestTrafficPoint {
+                bucket_start_unix_ms: 1_700_000_000_000,
+                total_requests: 120,
+                errors_4xx: 4,
+                errors_5xx: 2,
+            }],
+            server_resources: vec![ServerResourcePoint {
+                bucket_start_unix_ms: 1_700_000_000_000,
+                cpu_percent_avg: 21.3,
+                memory_used_bytes_avg: 2_000,
+                memory_total_bytes_avg: 8_000,
+                disk_used_bytes_avg: 50_000,
+                disk_total_bytes_avg: 100_000,
+                network_rx_bytes_avg: 10_000,
+                network_tx_bytes_avg: 12_000,
+                samples: 5,
+            }],
+        };
+
+        let encoded = serde_json::to_value(&response).expect("serialize dashboard metrics");
+        assert_eq!(
+            encoded,
+            json!({
+                "summary": {
+                    "applications_total": 2,
+                    "managed_services_healthy": 1,
+                    "domains_total": 3,
+                    "uptime_30d_percent": 99.7
+                },
+                "scope": {
+                    "window": "24h",
+                    "bucket": "5m",
+                    "app_id": "11111111-1111-1111-1111-111111111111",
+                    "start_unix_ms": 1700000000000u64,
+                    "end_unix_ms": 1700086400000u64
+                },
+                "request_traffic": [{
+                    "bucket_start_unix_ms": 1700000000000u64,
+                    "total_requests": 120,
+                    "errors_4xx": 4,
+                    "errors_5xx": 2
+                }],
+                "server_resources": [{
+                    "bucket_start_unix_ms": 1700000000000u64,
+                    "cpu_percent_avg": 21.3,
+                    "memory_used_bytes_avg": 2000,
+                    "memory_total_bytes_avg": 8000,
+                    "disk_used_bytes_avg": 50000,
+                    "disk_total_bytes_avg": 100000,
+                    "network_rx_bytes_avg": 10000,
+                    "network_tx_bytes_avg": 12000,
+                    "samples": 5
+                }]
+            })
+        );
+
+        let decoded: DashboardMetricsResponse =
+            serde_json::from_value(encoded).expect("deserialize dashboard metrics");
+        assert_eq!(decoded, response);
     }
 }
