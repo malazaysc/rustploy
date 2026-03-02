@@ -18,6 +18,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
 - Dashboard metric cards and telemetry widgets now render live backend data (global/per-app request traffic + host resource samples) instead of placeholder values.
 - Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
+- CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
 
 ### Fixed
 
