@@ -61,6 +61,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Publish OpenAPI spec from source.
 - Include curl examples in user docs.
 - Keep API compatibility stable across web and TUI client releases.
+- The `/logs` web explorer UI consumes existing deployment and logs endpoints (`GET /api/v1/apps`, `GET /api/v1/apps/{app_id}/deployments`, `GET /api/v1/apps/{app_id}/deployments/{deployment_id}/logs`) and does not introduce a new wire contract.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.
