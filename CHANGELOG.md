@@ -8,6 +8,12 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 
 ### Changed
 
+- Reworked the embedded web dashboard to match the provided v0 mock style (sidebar navigation, top header, metric cards, and refreshed dark theme) while preserving existing live deploy/log/domain/env workflows.
+- Dashboard shell now anchors `html/body` background and disables vertical overscroll bounce so fast scrolling no longer reveals blank top/bottom gaps.
+- Added graph placeholders to the dashboard for traffic and server resources so all chart regions are visually represented while live metrics integrations are pending.
+- Dashboard "Recent Deployments" panel is now collapsible from its card header.
+- Added a new "Selected Deployment" summary card with condensed deployment metadata and quick status context.
+- Added a dedicated `/logs` explorer page with deployment querying/filtering (app, status, source/deployment search, time window) plus in-page log text filtering controls.
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Improved live deployment log robustness and error handling, including tolerant decoding for non-UTF8 runtime output.
 - Improved live log stream efficiency by switching SSE updates to incremental log chunks per deployment.
@@ -20,6 +26,9 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
 - Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
 - Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
+- Dashboard two-column layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
+- Dashboard app list rows now wrap app IDs safely instead of overflowing beneath action buttons.
+- Dashboard app rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
 
 ### Added
 

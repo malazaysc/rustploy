@@ -2942,6 +2942,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/metrics", get(metrics_prometheus))
         .route("/api/v1/health", get(health))
         .route("/", get(dashboard_ui))
+        .route("/logs", get(logs_ui))
         .route("/api/v1/auth/login", post(auth_login))
         .route("/api/v1/auth/logout", post(auth_logout))
         .route("/api/v1/auth/me", get(auth_me))
@@ -3045,6 +3046,15 @@ async fn dashboard_ui(State(state): State<AppState>, headers: HeaderMap) -> Html
     let session = authorize_session_request(&state, &headers).ok().flatten();
     if session.is_some() {
         Html(DASHBOARD_HTML.to_string())
+    } else {
+        Html(LOGIN_HTML.to_string())
+    }
+}
+
+async fn logs_ui(State(state): State<AppState>, headers: HeaderMap) -> Html<String> {
+    let session = authorize_session_request(&state, &headers).ok().flatten();
+    if session.is_some() {
+        Html(LOGS_HTML.to_string())
     } else {
         Html(LOGIN_HTML.to_string())
     }
@@ -3530,126 +3540,467 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Rustploy Dashboard</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;500;700&family=JetBrains+Mono:wght@500&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@500&display=swap');
     :root {
-      --bg: #060b14;
-      --bg-grid: rgba(0, 245, 212, 0.06);
-      --ink: #dffaff;
-      --muted: #81a7ba;
-      --line: #1f3655;
-      --panel: #0d1628;
-      --paper: #111c33;
-      --accent: #00f5d4;
-      --accent-ink: #042822;
-      --warning: #ffbe5c;
-      --danger: #ff6b7d;
-      --ok: #7affea;
-      --shadow: 0 14px 40px rgba(0, 0, 0, 0.46);
+      --bg: oklch(0.13 0.005 260);
+      --foreground: oklch(0.95 0 0);
+      --card: oklch(0.16 0.005 260);
+      --sidebar: oklch(0.11 0.005 260);
+      --sidebar-accent: oklch(0.18 0.008 260);
+      --secondary: oklch(0.2 0.005 260);
+      --line: oklch(0.24 0.008 260);
+      --muted: oklch(0.55 0.01 260);
+      --primary: oklch(0.65 0.2 145);
+      --danger: oklch(0.55 0.2 25);
+      --warning: oklch(0.75 0.15 65);
+      --chart-2: oklch(0.6 0.15 250);
+      --chart-3: oklch(0.7 0.15 55);
+      --ok: oklch(0.65 0.2 145);
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
     }
     * { box-sizing: border-box; }
+    html {
+      min-height: 100%;
+      background: var(--bg);
+      overscroll-behavior-y: none;
+    }
     body {
       margin: 0;
-      font-family: 'Chakra Petch', sans-serif;
-      color: var(--ink);
       min-height: 100vh;
-      background-color: var(--bg);
-      background-image:
-        linear-gradient(var(--bg-grid) 1px, transparent 1px),
-        linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px);
-      background-size: 44px 44px;
+      color: var(--foreground);
+      font-family: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      overscroll-behavior-y: none;
+      background:
+        radial-gradient(1200px 560px at 100% -140px, rgba(89, 97, 249, 0.12), transparent 70%),
+        radial-gradient(950px 500px at -10% 0%, rgba(39, 191, 122, 0.14), transparent 60%),
+        linear-gradient(var(--bg), var(--bg));
     }
-    .wrap {
-      width: min(1240px, 100%);
-      margin: 0 auto;
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 244px minmax(0, 1fr);
+    }
+    .sidebar {
+      background: color-mix(in oklab, var(--sidebar) 90%, black 10%);
+      border-right: 1px solid var(--line);
+      padding: 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 100vh;
+      position: sticky;
+      top: 0;
+    }
+    .brand-block {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 2px 6px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: color-mix(in oklab, var(--primary) 82%, white 18%);
+      color: #081810;
+      display: grid;
+      place-items: center;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .brand-title { margin: 0; font-size: 13px; font-weight: 600; }
+    .brand-sub { margin: 1px 0 0; font-size: 11px; color: var(--muted); }
+    .search {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--secondary) 92%, black 8%);
+      color: var(--muted);
+      font-size: 12px;
+      padding: 8px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .search code {
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: color-mix(in oklab, var(--secondary) 70%, black 30%);
+      padding: 2px 6px;
+      font-size: 10px;
+    }
+    .side-group {
+      display: grid;
+      gap: 4px;
+      margin-top: 8px;
+    }
+    .side-label {
+      padding: 0 8px 3px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .side-item {
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: left;
+      padding: 9px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: none;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .side-item strong { color: inherit; }
+    .side-item.active {
+      background: color-mix(in oklab, var(--primary) 14%, transparent);
+      border-color: color-mix(in oklab, var(--primary) 24%, var(--line));
+      color: color-mix(in oklab, var(--primary) 80%, white 20%);
+      font-weight: 600;
+    }
+    .side-count {
+      font-size: 10px;
+      border-radius: 999px;
+      background: color-mix(in oklab, var(--secondary) 88%, black 12%);
+      border: 1px solid var(--line);
+      padding: 2px 7px;
+      color: var(--muted);
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .sidebar-bottom {
+      margin-top: auto;
+      display: grid;
+      gap: 10px;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .new-project {
+      width: 100%;
+      border-radius: 10px;
+      border: 0;
+      box-shadow: none;
+      padding: 10px 12px;
+      background: color-mix(in oklab, var(--primary) 88%, white 12%);
+      color: #07170f;
+      font-weight: 600;
+      font-size: 12px;
+      text-align: center;
+    }
+    .profile {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 8px;
+      display: grid;
+      gap: 2px;
+      background: color-mix(in oklab, var(--secondary) 85%, black 15%);
+    }
+    .profile strong { font-size: 12px; }
+    .profile span { font-size: 11px; color: var(--muted); }
+    .main {
       padding: 18px;
+      min-width: 0;
+      display: grid;
+      gap: 12px;
+      align-content: start;
     }
     .topbar {
       display: flex;
-      flex-wrap: wrap;
-      justify-content: space-between;
       gap: 12px;
       align-items: center;
-      padding: 14px 16px;
+      justify-content: space-between;
       border: 1px solid var(--line);
       border-radius: 12px;
-      background: rgba(13, 22, 40, 0.92);
+      background: color-mix(in oklab, var(--card) 88%, black 12%);
       box-shadow: var(--shadow);
-      margin-bottom: 14px;
-      animation: rise .22s ease-out;
+      padding: 12px 14px;
     }
-    .brand h1 { margin: 0; font-size: 1.45rem; letter-spacing: 0.03em; }
-    .brand p { margin: 3px 0 0; font-size: .88rem; color: var(--muted); }
+    .title h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+    }
+    .title p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
     .actions {
       display: flex;
-      gap: 8px;
       align-items: center;
+      gap: 8px;
       flex-wrap: wrap;
     }
     .pill {
-      border: 1px solid #1f8e82;
-      color: #8cfcee;
-      background: rgba(0, 245, 212, 0.13);
+      border: 1px solid color-mix(in oklab, var(--primary) 34%, var(--line));
       border-radius: 999px;
-      font-size: 12px;
-      padding: 6px 10px;
-      font-weight: 700;
+      padding: 5px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      color: color-mix(in oklab, var(--primary) 70%, white 30%);
+      background: color-mix(in oklab, var(--primary) 12%, transparent);
+      letter-spacing: 0.03em;
       text-transform: uppercase;
-      letter-spacing: .05em;
     }
     .status {
-      min-height: 34px;
+      min-height: 36px;
       border-radius: 10px;
-      border: 1px solid #14544f;
-      background: rgba(0, 245, 212, 0.12);
-      color: var(--ok);
+      border: 1px solid color-mix(in oklab, var(--primary) 30%, var(--line));
+      background: color-mix(in oklab, var(--primary) 12%, transparent);
+      color: color-mix(in oklab, var(--primary) 78%, white 22%);
       padding: 8px 11px;
-      font-size: .88rem;
-      margin-bottom: 10px;
+      font-size: 13px;
       display: flex;
       align-items: center;
     }
     .status.warn {
-      border-color: #8a642a;
-      background: rgba(255, 190, 92, 0.13);
-      color: var(--warning);
+      border-color: color-mix(in oklab, var(--warning) 35%, var(--line));
+      background: color-mix(in oklab, var(--warning) 14%, transparent);
+      color: color-mix(in oklab, var(--warning) 78%, white 22%);
     }
     .status.err {
-      border-color: #883144;
-      background: rgba(255, 107, 125, 0.13);
-      color: var(--danger);
+      border-color: color-mix(in oklab, var(--danger) 35%, var(--line));
+      background: color-mix(in oklab, var(--danger) 14%, transparent);
+      color: color-mix(in oklab, var(--danger) 80%, white 20%);
     }
-    .layout {
+    .stats {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+    .stat-card {
+      border-radius: 11px;
+      border: 1px solid var(--line);
+      background: color-mix(in oklab, var(--card) 86%, black 14%);
+      padding: 12px;
+      display: grid;
+      gap: 8px;
+      animation: rise .2s ease;
+    }
+    .stat-kicker {
       display: flex;
-      gap: 14px;
-      align-items: flex-start;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .stat-kicker span:last-child {
+      border: 1px solid color-mix(in oklab, var(--primary) 28%, var(--line));
+      background: color-mix(in oklab, var(--primary) 11%, transparent);
+      color: color-mix(in oklab, var(--primary) 70%, white 30%);
+      font-size: 10px;
+      border-radius: 999px;
+      padding: 2px 7px;
+      font-weight: 600;
+    }
+    .stat-value {
+      font-size: 24px;
+      letter-spacing: -0.02em;
+      line-height: 1;
+      font-weight: 600;
+    }
+    .stat-note {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .graph-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+      min-width: 0;
+      align-items: stretch;
+    }
+    .graph-shell {
+      border-radius: 11px;
+      border: 1px solid var(--line);
+      background: color-mix(in oklab, var(--card) 88%, black 12%);
+      box-shadow: 0 12px 22px -18px rgba(0, 0, 0, 0.8);
+      min-width: 0;
+      animation: rise .2s ease;
+    }
+    .graph-head {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .graph-head h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .graph-tag {
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: color-mix(in oklab, var(--secondary) 86%, black 14%);
+      color: var(--muted);
+      font-size: 10px;
+      padding: 3px 8px;
+      font-weight: 600;
+      letter-spacing: .02em;
+    }
+    .graph-body {
+      padding: 12px 14px;
       min-width: 0;
     }
-    .layout > .stack:first-child {
-      flex: 0 0 clamp(300px, 32vw, 380px);
+    .traffic-placeholder {
+      position: relative;
+      height: 210px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background:
+        linear-gradient(color-mix(in oklab, var(--line) 55%, transparent) 1px, transparent 1px),
+        linear-gradient(90deg, color-mix(in oklab, var(--line) 40%, transparent) 1px, transparent 1px),
+        color-mix(in oklab, var(--sidebar) 65%, black 35%);
+      background-size: 100% 36px, 40px 100%, auto;
     }
-    .layout > .stack:last-child {
-      flex: 1 1 0;
+    .traffic-wave {
+      position: absolute;
+      inset: auto 0 0;
+      height: 65%;
+      background:
+        radial-gradient(140% 85% at 8% 100%, color-mix(in oklab, var(--primary) 34%, transparent) 0 30%, transparent 32%),
+        radial-gradient(130% 90% at 32% 100%, color-mix(in oklab, var(--chart-2) 26%, transparent) 0 30%, transparent 32%),
+        radial-gradient(130% 85% at 52% 100%, color-mix(in oklab, var(--primary) 30%, transparent) 0 28%, transparent 31%),
+        radial-gradient(110% 95% at 74% 100%, color-mix(in oklab, var(--chart-2) 22%, transparent) 0 29%, transparent 33%),
+        radial-gradient(120% 100% at 94% 100%, color-mix(in oklab, var(--primary) 26%, transparent) 0 27%, transparent 31%);
+      opacity: .95;
+    }
+    .traffic-line {
+      position: absolute;
+      left: 14px;
+      right: 14px;
+      bottom: 18px;
+      height: 120px;
+      border-radius: 8px;
+      border: 1px dashed color-mix(in oklab, var(--primary) 46%, transparent);
+      background:
+        linear-gradient(120deg,
+          transparent 0% 8%,
+          color-mix(in oklab, var(--primary) 72%, transparent) 8% 10%,
+          transparent 10% 21%,
+          color-mix(in oklab, var(--primary) 72%, transparent) 21% 23%,
+          transparent 23% 38%,
+          color-mix(in oklab, var(--primary) 72%, transparent) 38% 40%,
+          transparent 40% 58%,
+          color-mix(in oklab, var(--primary) 72%, transparent) 58% 60%,
+          transparent 60% 78%,
+          color-mix(in oklab, var(--primary) 72%, transparent) 78% 80%,
+          transparent 80% 100%);
+      opacity: .52;
+    }
+    .graph-note {
+      margin-top: 9px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .gauge-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+    }
+    .gauge {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--secondary) 82%, black 18%);
+      padding: 10px;
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 10px;
+      align-items: center;
+    }
+    .gauge-ring {
+      width: 52px;
+      height: 52px;
+      border-radius: 999px;
+      background:
+        conic-gradient(
+          color-mix(in oklab, var(--primary) 80%, white 20%) 0 230deg,
+          color-mix(in oklab, var(--line) 85%, black 15%) 230deg 360deg
+        );
+      position: relative;
+    }
+    .gauge-ring::after {
+      content: "";
+      position: absolute;
+      inset: 7px;
+      border-radius: inherit;
+      background: color-mix(in oklab, var(--sidebar) 75%, black 25%);
+      border: 1px solid var(--line);
+    }
+    .gauge:nth-child(2) .gauge-ring {
+      background: conic-gradient(color-mix(in oklab, var(--chart-2) 80%, white 20%) 0 260deg, color-mix(in oklab, var(--line) 85%, black 15%) 260deg 360deg);
+    }
+    .gauge:nth-child(3) .gauge-ring {
+      background: conic-gradient(color-mix(in oklab, var(--chart-3) 80%, white 20%) 0 190deg, color-mix(in oklab, var(--line) 85%, black 15%) 190deg 360deg);
+    }
+    .gauge:nth-child(4) .gauge-ring {
+      background: conic-gradient(color-mix(in oklab, var(--warning) 85%, white 15%) 0 160deg, color-mix(in oklab, var(--line) 85%, black 15%) 160deg 360deg);
+    }
+    .gauge strong {
+      display: block;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+    .gauge span {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 2px;
+    }
+    .layout {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1.6fr) minmax(0, 1fr);
+      align-items: start;
       min-width: 0;
     }
     .stack {
       display: grid;
-      gap: 14px;
+      gap: 12px;
       align-content: start;
       min-width: 0;
     }
     .card {
-      background: var(--paper);
+      border-radius: 11px;
       border: 1px solid var(--line);
-      border-radius: 12px;
-      box-shadow: 0 18px 28px -18px rgba(0, 0, 0, 0.8);
-      padding: 14px;
-      animation: rise .22s ease-out;
+      background: color-mix(in oklab, var(--card) 88%, black 12%);
+      box-shadow: 0 12px 22px -18px rgba(0, 0, 0, 0.8);
+      min-width: 0;
+      animation: rise .2s ease;
     }
-    .card h3 {
-      margin: 0 0 10px;
-      font-size: 1.05rem;
-      letter-spacing: .03em;
-      text-transform: uppercase;
+    .card-head {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .card-head h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .card-body {
+      padding: 12px 14px;
+      min-width: 0;
+    }
+    .card-body.collapsed {
+      display: none;
+    }
+    .collapse-btn {
+      min-width: 86px;
+      text-align: center;
     }
     .row {
       display: grid;
@@ -3666,38 +4017,39 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       padding: 9px 10px;
       border: 1px solid var(--line);
       border-radius: 9px;
-      background: #0a1221;
-      color: var(--ink);
+      background: color-mix(in oklab, var(--secondary) 90%, black 10%);
+      color: var(--foreground);
       font: inherit;
-      font-size: .94rem;
+      font-size: 13px;
+      transition: border-color .12s ease, box-shadow .12s ease;
     }
-    input::placeholder { color: #608aa3; }
+    input::placeholder { color: color-mix(in oklab, var(--muted) 84%, white 16%); }
     input:focus {
       outline: none;
-      border-color: #36d7c2;
-      box-shadow: 0 0 0 3px rgba(0, 245, 212, 0.17);
+      border-color: color-mix(in oklab, var(--primary) 50%, var(--line));
+      box-shadow: 0 0 0 3px color-mix(in oklab, var(--primary) 16%, transparent);
     }
     button {
       border: 0;
       border-radius: 9px;
       padding: 9px 11px;
       font: inherit;
-      font-weight: 700;
-      color: var(--accent-ink);
-      background: var(--accent);
+      font-size: 12px;
+      font-weight: 600;
+      color: #07170f;
+      background: color-mix(in oklab, var(--primary) 88%, white 12%);
       cursor: pointer;
       white-space: nowrap;
-      transition: transform .08s ease, filter .15s ease;
-      box-shadow: 0 0 20px rgba(0, 245, 212, 0.3);
+      transition: filter .16s ease, transform .08s ease;
+      box-shadow: none;
     }
-    button:hover { filter: brightness(1.03); }
+    button:hover { filter: brightness(1.04); }
     button:active { transform: translateY(1px); }
     button.secondary {
-      background: #0b1322;
-      color: #b0d2e3;
+      background: color-mix(in oklab, var(--secondary) 88%, black 12%);
+      color: color-mix(in oklab, var(--muted) 75%, white 25%);
       border: 1px solid var(--line);
-      font-weight: 600;
-      box-shadow: none;
+      font-weight: 500;
     }
     .list {
       list-style: none;
@@ -3709,192 +4061,379 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     .item-row {
       border: 1px solid var(--line);
       border-radius: 10px;
-      background: #0b1323;
-      padding: 9px;
-      display: flex;
-      justify-content: space-between;
+      background: color-mix(in oklab, var(--secondary) 78%, black 22%);
+      padding: 9px 10px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 10px;
-      align-items: center;
+      align-items: start;
+      min-width: 0;
     }
     .item-row.selected {
-      border-color: #36d7c2;
-      background: rgba(0, 245, 212, 0.09);
+      border-color: color-mix(in oklab, var(--primary) 42%, var(--line));
+      background: color-mix(in oklab, var(--primary) 12%, transparent);
     }
     .item-main {
       display: grid;
       gap: 2px;
       min-width: 0;
+      width: 100%;
     }
     .item-main strong {
-      font-size: .92rem;
+      font-size: 12px;
       overflow: hidden;
       text-overflow: ellipsis;
       white-space: nowrap;
     }
     .item-main code {
-      font-family: 'JetBrains Mono', monospace;
+      display: block;
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 11px;
       color: var(--muted);
+      white-space: normal;
+      overflow-wrap: break-word;
     }
     .item-actions {
       display: flex;
       gap: 6px;
       flex-wrap: wrap;
-      justify-content: end;
+      justify-content: flex-end;
+      align-items: flex-start;
     }
     .item-actions button {
       padding: 6px 8px;
-      font-size: .81rem;
+      font-size: 11px;
     }
     .pill-status {
       border-radius: 999px;
-      font-size: 11px;
+      font-size: 10px;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: .04em;
       padding: 4px 8px;
-      border: 1px solid #26706f;
-      background: rgba(0, 245, 212, 0.12);
-      color: #8cfcee;
+      border: 1px solid color-mix(in oklab, var(--ok) 36%, var(--line));
+      background: color-mix(in oklab, var(--ok) 12%, transparent);
+      color: color-mix(in oklab, var(--ok) 80%, white 20%);
     }
     .pill-status.status-queued,
     .pill-status.status-deploying,
     .pill-status.status-retrying {
-      border-color: #8a6b1a;
-      background: rgba(250, 198, 26, 0.2);
-      color: #ffd67a;
+      border-color: color-mix(in oklab, var(--warning) 40%, var(--line));
+      background: color-mix(in oklab, var(--warning) 14%, transparent);
+      color: color-mix(in oklab, var(--warning) 80%, white 20%);
     }
     .pill-status.status-healthy {
-      border-color: #26706f;
-      background: rgba(0, 245, 212, 0.12);
-      color: #8cfcee;
+      border-color: color-mix(in oklab, var(--ok) 36%, var(--line));
+      background: color-mix(in oklab, var(--ok) 12%, transparent);
+      color: color-mix(in oklab, var(--ok) 80%, white 20%);
     }
     .pill-status.status-failed {
-      border-color: #7a2634;
-      background: rgba(255, 88, 120, 0.15);
-      color: #ff8ca4;
+      border-color: color-mix(in oklab, var(--danger) 42%, var(--line));
+      background: color-mix(in oklab, var(--danger) 15%, transparent);
+      color: color-mix(in oklab, var(--danger) 82%, white 18%);
     }
     .item-row.in-progress {
-      border-color: #8a6b1a;
-      background: rgba(250, 198, 26, 0.08);
+      border-color: color-mix(in oklab, var(--warning) 36%, var(--line));
+      background: color-mix(in oklab, var(--warning) 10%, transparent);
+    }
+    .item-row.in-progress {
+      border-color: color-mix(in oklab, var(--warning) 36%, var(--line));
+      background: color-mix(in oklab, var(--warning) 10%, transparent);
     }
     pre {
       margin: 0;
-      min-height: 220px;
-      max-height: 360px;
+      min-height: 260px;
+      max-height: 460px;
       overflow: auto;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
       border-radius: 10px;
-      background: #070d18;
-      color: #d8f8ff;
-      font-family: 'JetBrains Mono', monospace;
+      background: color-mix(in oklab, var(--sidebar) 70%, black 30%);
+      color: color-mix(in oklab, var(--foreground) 92%, white 8%);
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
       font-size: 12px;
       line-height: 1.45;
-      border: 1px solid #1f3655;
-      padding: 10px;
+      border: 1px solid var(--line);
+      padding: 11px;
     }
     .hint {
       color: var(--muted);
-      font-size: .86rem;
+      font-size: 12px;
       margin-top: 8px;
     }
     @keyframes rise {
-      from { opacity: 0; transform: translateY(6px); }
+      from { opacity: 0; transform: translateY(5px); }
       to { opacity: 1; transform: translateY(0); }
     }
-    @media (max-width: 980px) {
-      .layout { display: grid; grid-template-columns: 1fr; }
-      .layout > .stack:first-child,
-      .layout > .stack:last-child { flex: initial; }
+    @media (max-width: 1120px) {
+      .stats { grid-template-columns: 1fr 1fr; }
+      .graph-grid { grid-template-columns: 1fr; }
+      .layout { grid-template-columns: 1fr; }
       .triple { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 920px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar {
+        position: static;
+        min-height: auto;
+      }
+      .side-group { grid-template-columns: 1fr 1fr; }
+      .sidebar-bottom { margin-top: 2px; }
+    }
+    @media (max-width: 640px) {
+      .main { padding: 12px; }
+      .topbar {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .actions { justify-content: space-between; }
+      .stats { grid-template-columns: 1fr; }
+      .gauge-grid { grid-template-columns: 1fr; }
+      .side-group { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <header class="topbar">
-      <div class="brand">
-        <h1>Rustploy Dashboard</h1>
-        <p>Git-driven deploy control plane, optimized for small nodes.</p>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <div class="brand-icon">R</div>
+        <div>
+          <p class="brand-title">Rustploy</p>
+          <p class="brand-sub">Control Plane</p>
+        </div>
       </div>
-      <div class="actions">
-        <span class="pill" id="active-app-pill">No app selected</span>
-        <button class="secondary" onclick="logout()">Logout</button>
+
+      <div class="search">
+        <span>Search...</span>
+        <code>/</code>
       </div>
-    </header>
 
-    <div id="status" class="status">Ready.</div>
+      <div class="side-group">
+        <button class="side-item active">Dashboard <span class="side-count">01</span></button>
+        <button class="side-item"><strong>Projects</strong> <span class="side-count">12</span></button>
+        <button class="side-item"><strong>Domains</strong></button>
+        <button class="side-item"><strong>Deployments</strong></button>
+        <button class="side-item" onclick="window.location.href='/logs'"><strong>Logs Explorer</strong></button>
+      </div>
 
-    <div class="layout">
-      <section class="stack">
-        <article class="card">
-          <h3>Create App</h3>
-          <div class="row">
-            <input id="app-name" placeholder="my-app" />
-            <button onclick="createApp()">Create App</button>
-          </div>
+      <div class="side-group">
+        <div class="side-label">Infrastructure</div>
+        <button class="side-item"><strong>Servers</strong></button>
+        <button class="side-item"><strong>Certificates</strong></button>
+        <button class="side-item"><strong>Team</strong></button>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="new-project">+ New Project</button>
+        <div class="profile">
+          <strong>Owner Session</strong>
+          <span>admin@localhost</span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="title">
+          <h1>Dashboard</h1>
+          <p>Git-driven deploy control for small-node runtimes.</p>
+        </div>
+        <div class="actions">
+          <button class="secondary" onclick="window.location.href='/logs'">Logs Page</button>
+          <span class="pill" id="active-app-pill">No app selected</span>
+          <button class="secondary" onclick="logout()">Logout</button>
+        </div>
+      </header>
+
+      <div id="status" class="status">Ready.</div>
+
+      <section class="stats">
+        <article class="stat-card">
+          <div class="stat-kicker"><span>Applications</span><span>Live</span></div>
+          <div class="stat-value">12</div>
+          <div class="stat-note">Deployments managed from one panel</div>
         </article>
-
-        <article class="card">
-          <h3>Import GitHub Repo</h3>
-          <div class="triple">
-            <input id="owner" placeholder="owner" />
-            <input id="repo" placeholder="repo" />
-            <input id="branch" placeholder="main" value="main" />
-          </div>
-          <div class="row" style="margin-top:8px">
-            <button onclick="importApp()">Import Repository</button>
-          </div>
+        <article class="stat-card">
+          <div class="stat-kicker"><span>Databases</span><span>Healthy</span></div>
+          <div class="stat-value">4</div>
+          <div class="stat-note">Managed backing services online</div>
         </article>
-
-        <article class="card">
-          <h3>Apps</h3>
-          <ul id="apps" class="list"></ul>
+        <article class="stat-card">
+          <div class="stat-kicker"><span>Domains</span><span>SSL</span></div>
+          <div class="stat-value">18</div>
+          <div class="stat-note">Routed endpoints with managed TLS</div>
         </article>
-
-        <article class="card">
-          <h3>Domains</h3>
-          <div class="row">
-            <input id="domain" placeholder="app.example.com" />
-            <button onclick="addDomain()">Add Domain</button>
-          </div>
-          <ul id="domains" class="list" style="margin-top:10px"></ul>
-        </article>
-
-        <article class="card">
-          <h3>Environment</h3>
-          <div class="row">
-            <input id="env-key" placeholder="DATABASE_URL" />
-            <input id="env-value" placeholder="value" />
-            <button onclick="setEnvVar()">Set</button>
-          </div>
-          <ul id="env-vars" class="list" style="margin-top:10px"></ul>
-          <p class="hint">Applied to the app service during compose deployments.</p>
+        <article class="stat-card">
+          <div class="stat-kicker"><span>Uptime</span><span>30d</span></div>
+          <div class="stat-value">99.97%</div>
+          <div class="stat-note">Runtime availability trend</div>
         </article>
       </section>
 
-      <section class="stack">
-        <article class="card">
-          <h3>Deployments</h3>
-          <ul id="deployments" class="list"></ul>
-          <p class="hint">Stream updates enabled for selected app.</p>
+      <section class="graph-grid">
+        <article class="graph-shell">
+          <div class="graph-head">
+            <h3>Request Traffic</h3>
+            <span class="graph-tag">Placeholder</span>
+          </div>
+          <div class="graph-body">
+            <div class="traffic-placeholder">
+              <div class="traffic-wave"></div>
+              <div class="traffic-line"></div>
+            </div>
+            <p class="graph-note">Chart placeholder for request/error timeseries.</p>
+          </div>
         </article>
 
-        <article class="card">
-          <h3>Routing & Runtime</h3>
-          <ul id="routes" class="list"></ul>
-          <p class="hint" id="runtime-note">
-            Latest healthy compose deployments are routed to live runtime containers.
-          </p>
-        </article>
-
-        <article class="card">
-          <h3>Live Logs</h3>
-          <pre id="logs">(no logs yet)</pre>
+        <article class="graph-shell">
+          <div class="graph-head">
+            <h3>Server Resources</h3>
+            <span class="graph-tag">Placeholder</span>
+          </div>
+          <div class="graph-body">
+            <div class="gauge-grid">
+              <div class="gauge">
+                <div class="gauge-ring"></div>
+                <div><strong>CPU</strong><span>graph placeholder</span></div>
+              </div>
+              <div class="gauge">
+                <div class="gauge-ring"></div>
+                <div><strong>Memory</strong><span>graph placeholder</span></div>
+              </div>
+              <div class="gauge">
+                <div class="gauge-ring"></div>
+                <div><strong>Disk</strong><span>graph placeholder</span></div>
+              </div>
+              <div class="gauge">
+                <div class="gauge-ring"></div>
+                <div><strong>Network</strong><span>graph placeholder</span></div>
+              </div>
+            </div>
+            <p class="graph-note">Resource gauges are placeholders until live metrics wiring lands.</p>
+          </div>
         </article>
       </section>
-    </div>
+
+      <section class="layout">
+        <div class="stack">
+          <article class="card">
+            <div class="card-head">
+              <h3>Projects</h3>
+            </div>
+            <div class="card-body">
+              <ul id="apps" class="list"></ul>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Recent Deployments</h3>
+              <button
+                class="secondary collapse-btn"
+                id="deployments-collapse-btn"
+                onclick="toggleDeploymentsCard()"
+              >
+                Collapse
+              </button>
+            </div>
+            <div class="card-body" id="deployments-card-body">
+              <ul id="deployments" class="list"></ul>
+              <p class="hint">Stream updates enabled for selected app.</p>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Live Logs</h3>
+            </div>
+            <div class="card-body">
+              <pre id="logs">(no logs yet)</pre>
+            </div>
+          </article>
+        </div>
+
+        <div class="stack">
+          <article class="card">
+            <div class="card-head">
+              <h3>Create App</h3>
+            </div>
+            <div class="card-body">
+              <div class="row">
+                <input id="app-name" placeholder="my-app" />
+                <button onclick="createApp()">Create App</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Import GitHub Repo</h3>
+            </div>
+            <div class="card-body">
+              <div class="triple">
+                <input id="owner" placeholder="owner" />
+                <input id="repo" placeholder="repo" />
+                <input id="branch" placeholder="main" value="main" />
+              </div>
+              <div class="row" style="margin-top:8px">
+                <button onclick="importApp()">Import Repository</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Routing & Runtime</h3>
+            </div>
+            <div class="card-body">
+              <ul id="routes" class="list"></ul>
+              <p class="hint" id="runtime-note">
+                Latest healthy compose deployments are routed to live runtime containers.
+              </p>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Selected Deployment</h3>
+            </div>
+            <div class="card-body">
+              <ul id="selected-deployment-summary" class="list"></ul>
+              <p class="hint">Shows condensed details for the selected deployment entry.</p>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Domains</h3>
+            </div>
+            <div class="card-body">
+              <div class="row">
+                <input id="domain" placeholder="app.example.com" />
+                <button onclick="addDomain()">Add Domain</button>
+              </div>
+              <ul id="domains" class="list" style="margin-top:10px"></ul>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Environment</h3>
+            </div>
+            <div class="card-body">
+              <div class="row">
+                <input id="env-key" placeholder="DATABASE_URL" />
+                <input id="env-value" placeholder="value" />
+                <button onclick="setEnvVar()">Set</button>
+              </div>
+              <ul id="env-vars" class="list" style="margin-top:10px"></ul>
+              <p class="hint">Applied to the app service during compose deployments.</p>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
   </div>
   <script>
     let selectedApp = null;
@@ -3902,9 +4441,17 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let selectedLogsDeploymentId = null;
     let logsStream = null;
     let statusTimeout = null;
-    const selectedState = { domains: [], envVars: [], latestDeployment: null, config: null };
+    const selectedState = {
+      domains: [],
+      envVars: [],
+      latestDeployment: null,
+      selectedDeployment: null,
+      deployments: [],
+      config: null
+    };
     const pendingDeploymentsByApp = new Map();
     const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+    let deploymentsCollapsed = false;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -3921,6 +4468,89 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (status === 'deploying') return 'status-deploying';
       if (status === 'retrying') return 'status-retrying';
       return 'status-queued';
+    }
+
+    function formatUnixMs(value) {
+      if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
+        return 'unknown';
+      }
+      try {
+        return new Date(value).toLocaleString();
+      } catch (_) {
+        return 'unknown';
+      }
+    }
+
+    function applyDeploymentsCollapsed() {
+      const body = document.getElementById('deployments-card-body');
+      const button = document.getElementById('deployments-collapse-btn');
+      if (!body || !button) return;
+      body.classList.toggle('collapsed', deploymentsCollapsed);
+      button.textContent = deploymentsCollapsed ? 'Expand' : 'Collapse';
+    }
+
+    function toggleDeploymentsCard() {
+      deploymentsCollapsed = !deploymentsCollapsed;
+      applyDeploymentsCollapsed();
+    }
+
+    function renderSelectedDeployment() {
+      const el = document.getElementById('selected-deployment-summary');
+      if (!el) return;
+      el.innerHTML = '';
+
+      if (!selectedApp) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'Select an app to inspect deployment details.';
+        el.appendChild(empty);
+        return;
+      }
+
+      const deployment = selectedState.selectedDeployment;
+      if (!deployment) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No deployment selected yet.';
+        el.appendChild(empty);
+        return;
+      }
+
+      const status = normalizeDeploymentStatus(deployment.status);
+      const sourceRef = deployment.source_ref || 'manual';
+      const commitSha = deployment.commit_sha || 'n/a';
+      const imageRef = deployment.image_ref || 'n/a';
+      const updatedAt = formatUnixMs(deployment.updated_at_unix_ms);
+
+      const rowTop = document.createElement('li');
+      rowTop.className = `item-row ${isActiveDeploymentStatus(status) ? 'in-progress' : ''}`.trim();
+      rowTop.innerHTML = `
+        <div class="item-main">
+          <strong><span class="pill-status ${deploymentPillClass(status)}">${status}</span></strong>
+          <code>${deployment.id}</code>
+        </div>
+      `;
+      el.appendChild(rowTop);
+
+      const rowDetails = document.createElement('li');
+      rowDetails.className = 'item-row';
+      rowDetails.innerHTML = `
+        <div class="item-main">
+          <strong>${selectedAppName || 'Selected app'}</strong>
+          <code>source=${sourceRef}</code>
+          <code>commit=${commitSha}</code>
+          <code>image=${imageRef}</code>
+          <code>updated=${updatedAt}</code>
+        </div>
+      `;
+      el.appendChild(rowDetails);
+    }
+
+    function selectDeployment(deploymentId) {
+      const found = selectedState.deployments.find((item) => item.id === deploymentId);
+      if (!found) return;
+      selectedState.selectedDeployment = found;
+      renderSelectedDeployment();
     }
 
     function markPendingDeployment(appId, deploymentId, status, sourceRef) {
@@ -4137,6 +4767,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.domains = [];
         selectedState.envVars = [];
         selectedState.latestDeployment = null;
+        selectedState.selectedDeployment = null;
+        selectedState.deployments = [];
         selectedState.config = null;
         const empty = document.createElement('li');
         empty.className = 'hint';
@@ -4144,6 +4776,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         apps.appendChild(empty);
         setSelectedPill(null);
         renderRoutes();
+        renderSelectedDeployment();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
         return;
       }
@@ -4183,9 +4816,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.domains = [];
         selectedState.envVars = [];
         selectedState.latestDeployment = null;
+        selectedState.selectedDeployment = null;
+        selectedState.deployments = [];
         selectedState.config = null;
         setSelectedPill(null);
         renderRoutes();
+        renderSelectedDeployment();
         document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
       }
     }
@@ -4241,9 +4877,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       selectedState.domains = [];
       selectedState.envVars = [];
       selectedState.latestDeployment = null;
+      selectedState.selectedDeployment = null;
+      selectedState.deployments = [];
       selectedState.config = null;
       setSelectedPill(selectedAppName);
       renderRoutes();
+      renderSelectedDeployment();
       await refreshDeployments();
       await refreshDomains();
       await refreshEnvVars();
@@ -4303,8 +4942,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       const res = await api(`/api/v1/apps/${selectedApp}/deployments`);
       const data = await res.json();
       const items = mergePendingDeployment(selectedApp, data.items || []);
+      selectedState.deployments = items;
       selectedState.latestDeployment = items[0] || null;
+      const selectedDeploymentId = selectedState.selectedDeployment ? selectedState.selectedDeployment.id : null;
+      selectedState.selectedDeployment = items.find((item) => item.id === selectedDeploymentId) || items[0] || null;
       renderRoutes();
+      renderSelectedDeployment();
       const el = document.getElementById('deployments');
       el.innerHTML = '';
 
@@ -4321,14 +4964,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const sourceRef = d.source_ref || 'manual';
         const status = normalizeDeploymentStatus(d.status);
         const building = isActiveDeploymentStatus(status);
+        const isSelected = selectedState.selectedDeployment && selectedState.selectedDeployment.id === d.id;
         const statusLabel = building ? `${status} (building)` : status;
-        li.className = `item-row ${building ? 'in-progress' : ''}`.trim();
+        li.className = `item-row ${building ? 'in-progress' : ''} ${isSelected ? 'selected' : ''}`.trim();
         li.innerHTML = `
           <div class="item-main">
             <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
             <code>${sourceRef}</code>
           </div>
           <div class="item-actions">
+            <button class="secondary" onclick="selectDeployment('${d.id}')">${isSelected ? 'Selected' : 'Select'}</button>
             <button class="secondary" onclick="showLogs('${selectedApp}','${d.id}')">Logs</button>
           </div>
         `;
@@ -4341,6 +4986,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
         const data = await res.json();
         selectedLogsDeploymentId = deploymentId;
+        selectDeployment(deploymentId);
         document.getElementById('logs').textContent = data.logs || '(no logs)';
       } catch (error) {
         setStatus(`Unable to load logs: ${error.message}`, 'err');
@@ -4550,6 +5196,8 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     });
 
     renderRoutes();
+    renderSelectedDeployment();
+    applyDeploymentsCollapsed();
     document.getElementById('env-vars').innerHTML = '<li class="hint">Select an app.</li>';
     refreshApps().catch((error) => setStatus(`Initial load failed: ${error.message}`, 'err'));
     setInterval(() => refreshApps().catch(() => {}), 15000);
@@ -4559,6 +5207,882 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 </body>
 </html>
 "#;
+
+const LOGS_HTML: &str = r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Rustploy Logs Explorer</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=Geist+Mono:wght@500&display=swap');
+    :root {
+      --bg: oklch(0.13 0.005 260);
+      --foreground: oklch(0.95 0 0);
+      --card: oklch(0.16 0.005 260);
+      --sidebar: oklch(0.11 0.005 260);
+      --secondary: oklch(0.2 0.005 260);
+      --line: oklch(0.24 0.008 260);
+      --muted: oklch(0.55 0.01 260);
+      --primary: oklch(0.65 0.2 145);
+      --danger: oklch(0.55 0.2 25);
+      --warning: oklch(0.75 0.15 65);
+      --ok: oklch(0.65 0.2 145);
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.4);
+    }
+    * { box-sizing: border-box; }
+    html {
+      min-height: 100%;
+      background: var(--bg);
+      overscroll-behavior-y: none;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--foreground);
+      font-family: 'Geist', ui-sans-serif, system-ui, -apple-system, sans-serif;
+      overscroll-behavior-y: none;
+      background:
+        radial-gradient(1200px 560px at 100% -140px, rgba(89, 97, 249, 0.12), transparent 70%),
+        radial-gradient(950px 500px at -10% 0%, rgba(39, 191, 122, 0.14), transparent 60%),
+        linear-gradient(var(--bg), var(--bg));
+    }
+    .shell {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 244px minmax(0, 1fr);
+    }
+    .sidebar {
+      background: color-mix(in oklab, var(--sidebar) 90%, black 10%);
+      border-right: 1px solid var(--line);
+      padding: 16px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      min-height: 100vh;
+      position: sticky;
+      top: 0;
+    }
+    .brand-block {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 2px 6px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand-icon {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: color-mix(in oklab, var(--primary) 82%, white 18%);
+      color: #081810;
+      display: grid;
+      place-items: center;
+      font-size: 16px;
+      font-weight: 700;
+    }
+    .brand-title { margin: 0; font-size: 13px; font-weight: 600; }
+    .brand-sub { margin: 1px 0 0; font-size: 11px; color: var(--muted); }
+    .side-group {
+      display: grid;
+      gap: 4px;
+      margin-top: 8px;
+    }
+    .side-item {
+      border: 1px solid transparent;
+      border-radius: 9px;
+      background: transparent;
+      color: var(--muted);
+      font-size: 12px;
+      text-align: left;
+      padding: 9px 10px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: none;
+      font-weight: 500;
+      cursor: pointer;
+    }
+    .side-item strong { color: inherit; }
+    .side-item.active {
+      background: color-mix(in oklab, var(--primary) 14%, transparent);
+      border-color: color-mix(in oklab, var(--primary) 24%, var(--line));
+      color: color-mix(in oklab, var(--primary) 80%, white 20%);
+      font-weight: 600;
+    }
+    .side-count {
+      font-size: 10px;
+      border-radius: 999px;
+      background: color-mix(in oklab, var(--secondary) 88%, black 12%);
+      border: 1px solid var(--line);
+      padding: 2px 7px;
+      color: var(--muted);
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    .sidebar-bottom {
+      margin-top: auto;
+      padding-top: 10px;
+      border-top: 1px solid var(--line);
+    }
+    .sidebar-bottom button {
+      width: 100%;
+    }
+    .main {
+      padding: 18px;
+      min-width: 0;
+      display: grid;
+      gap: 12px;
+      align-content: start;
+    }
+    .topbar {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: color-mix(in oklab, var(--card) 88%, black 12%);
+      box-shadow: var(--shadow);
+      padding: 12px 14px;
+    }
+    .title h1 {
+      margin: 0;
+      font-size: 18px;
+      line-height: 1.2;
+      letter-spacing: -0.01em;
+    }
+    .title p { margin: 2px 0 0; font-size: 12px; color: var(--muted); }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .status {
+      min-height: 36px;
+      border-radius: 10px;
+      border: 1px solid color-mix(in oklab, var(--primary) 30%, var(--line));
+      background: color-mix(in oklab, var(--primary) 12%, transparent);
+      color: color-mix(in oklab, var(--primary) 78%, white 22%);
+      padding: 8px 11px;
+      font-size: 13px;
+      display: flex;
+      align-items: center;
+    }
+    .status.warn {
+      border-color: color-mix(in oklab, var(--warning) 35%, var(--line));
+      background: color-mix(in oklab, var(--warning) 14%, transparent);
+      color: color-mix(in oklab, var(--warning) 78%, white 22%);
+    }
+    .status.err {
+      border-color: color-mix(in oklab, var(--danger) 35%, var(--line));
+      background: color-mix(in oklab, var(--danger) 14%, transparent);
+      color: color-mix(in oklab, var(--danger) 80%, white 20%);
+    }
+    .layout {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr);
+      align-items: start;
+      min-width: 0;
+    }
+    .stack {
+      display: grid;
+      gap: 12px;
+      align-content: start;
+      min-width: 0;
+    }
+    .card {
+      border-radius: 11px;
+      border: 1px solid var(--line);
+      background: color-mix(in oklab, var(--card) 88%, black 12%);
+      box-shadow: 0 12px 22px -18px rgba(0, 0, 0, 0.8);
+      min-width: 0;
+    }
+    .card-head {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .card-head h3 {
+      margin: 0;
+      font-size: 13px;
+      font-weight: 600;
+    }
+    .card-body {
+      padding: 12px 14px;
+      min-width: 0;
+    }
+    .grid {
+      display: grid;
+      gap: 8px;
+      grid-template-columns: 1fr 1fr;
+    }
+    .grid.three {
+      grid-template-columns: 1fr 1fr 1fr;
+    }
+    .field {
+      display: grid;
+      gap: 4px;
+    }
+    .field label {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    input, select {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid var(--line);
+      border-radius: 9px;
+      background: color-mix(in oklab, var(--secondary) 90%, black 10%);
+      color: var(--foreground);
+      font: inherit;
+      font-size: 13px;
+      transition: border-color .12s ease, box-shadow .12s ease;
+    }
+    input::placeholder { color: color-mix(in oklab, var(--muted) 84%, white 16%); }
+    input:focus, select:focus {
+      outline: none;
+      border-color: color-mix(in oklab, var(--primary) 50%, var(--line));
+      box-shadow: 0 0 0 3px color-mix(in oklab, var(--primary) 16%, transparent);
+    }
+    button {
+      border: 0;
+      border-radius: 9px;
+      padding: 9px 11px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      color: #07170f;
+      background: color-mix(in oklab, var(--primary) 88%, white 12%);
+      cursor: pointer;
+      white-space: nowrap;
+      transition: filter .16s ease, transform .08s ease;
+      box-shadow: none;
+    }
+    button:hover { filter: brightness(1.04); }
+    button:active { transform: translateY(1px); }
+    button.secondary {
+      background: color-mix(in oklab, var(--secondary) 88%, black 12%);
+      color: color-mix(in oklab, var(--muted) 75%, white 25%);
+      border: 1px solid var(--line);
+      font-weight: 500;
+    }
+    .list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      display: grid;
+      gap: 7px;
+      max-height: 410px;
+      overflow: auto;
+    }
+    .item-row {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--secondary) 78%, black 22%);
+      padding: 9px 10px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: start;
+      min-width: 0;
+    }
+    .item-row.selected {
+      border-color: color-mix(in oklab, var(--primary) 42%, var(--line));
+      background: color-mix(in oklab, var(--primary) 12%, transparent);
+    }
+    .item-main {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+      width: 100%;
+    }
+    .item-main strong {
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .item-main code {
+      display: block;
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px;
+      color: var(--muted);
+      white-space: normal;
+      overflow-wrap: break-word;
+    }
+    .item-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+      align-items: flex-start;
+    }
+    .item-actions button {
+      padding: 6px 8px;
+      font-size: 11px;
+    }
+    .pill-status {
+      border-radius: 999px;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      padding: 4px 8px;
+      border: 1px solid color-mix(in oklab, var(--ok) 36%, var(--line));
+      background: color-mix(in oklab, var(--ok) 12%, transparent);
+      color: color-mix(in oklab, var(--ok) 80%, white 20%);
+    }
+    .pill-status.status-queued,
+    .pill-status.status-deploying,
+    .pill-status.status-retrying {
+      border-color: color-mix(in oklab, var(--warning) 40%, var(--line));
+      background: color-mix(in oklab, var(--warning) 14%, transparent);
+      color: color-mix(in oklab, var(--warning) 80%, white 20%);
+    }
+    .pill-status.status-healthy {
+      border-color: color-mix(in oklab, var(--ok) 36%, var(--line));
+      background: color-mix(in oklab, var(--ok) 12%, transparent);
+      color: color-mix(in oklab, var(--ok) 80%, white 20%);
+    }
+    .pill-status.status-failed {
+      border-color: color-mix(in oklab, var(--danger) 42%, var(--line));
+      background: color-mix(in oklab, var(--danger) 15%, transparent);
+      color: color-mix(in oklab, var(--danger) 82%, white 18%);
+    }
+    pre {
+      margin: 0;
+      min-height: 420px;
+      max-height: 620px;
+      overflow: auto;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-radius: 10px;
+      background: color-mix(in oklab, var(--sidebar) 70%, black 30%);
+      color: color-mix(in oklab, var(--foreground) 92%, white 8%);
+      font-family: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.45;
+      border: 1px solid var(--line);
+      padding: 11px;
+    }
+    .hint {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 8px;
+    }
+    .checks {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+    }
+    .checks label {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+    }
+    @media (max-width: 1120px) {
+      .layout { grid-template-columns: 1fr; }
+      .grid, .grid.three { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 920px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar {
+        position: static;
+        min-height: auto;
+      }
+    }
+    @media (max-width: 640px) {
+      .main { padding: 12px; }
+      .topbar {
+        flex-direction: column;
+        align-items: stretch;
+      }
+      .actions { justify-content: space-between; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <div class="brand-icon">R</div>
+        <div>
+          <p class="brand-title">Rustploy</p>
+          <p class="brand-sub">Control Plane</p>
+        </div>
+      </div>
+
+      <div class="side-group">
+        <button class="side-item" onclick="window.location.href='/'"><strong>Dashboard</strong> <span class="side-count">01</span></button>
+        <button class="side-item active"><strong>Logs Explorer</strong></button>
+      </div>
+
+      <div class="sidebar-bottom">
+        <button class="secondary" onclick="window.location.href='/'">Back To Dashboard</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="title">
+          <h1>Logs Explorer</h1>
+          <p>Query deployments, filter results, and inspect logs across apps.</p>
+        </div>
+        <div class="actions">
+          <button class="secondary" onclick="window.location.href='/'">Dashboard</button>
+          <button class="secondary" onclick="logout()">Logout</button>
+        </div>
+      </header>
+
+      <div id="status" class="status">Ready.</div>
+
+      <section class="layout">
+        <div class="stack">
+          <article class="card">
+            <div class="card-head">
+              <h3>Query Filters</h3>
+            </div>
+            <div class="card-body">
+              <div class="grid three">
+                <div class="field">
+                  <label for="filter-app">App</label>
+                  <select id="filter-app"></select>
+                </div>
+                <div class="field">
+                  <label for="filter-status">Status</label>
+                  <select id="filter-status">
+                    <option value="all">All</option>
+                    <option value="healthy">healthy</option>
+                    <option value="failed">failed</option>
+                    <option value="queued">queued</option>
+                    <option value="deploying">deploying</option>
+                    <option value="retrying">retrying</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="filter-hours">Updated Within (hours)</label>
+                  <input id="filter-hours" type="number" min="1" value="168" />
+                </div>
+              </div>
+              <div class="grid" style="margin-top:8px">
+                <div class="field">
+                  <label for="filter-source">Source Ref Contains</label>
+                  <input id="filter-source" placeholder="main / feature branch / manual" />
+                </div>
+                <div class="field">
+                  <label for="filter-deployment">Deployment Query</label>
+                  <input id="filter-deployment" placeholder="id, commit, image, app name" />
+                </div>
+              </div>
+              <div class="item-actions" style="margin-top:10px">
+                <button id="run-query-btn" onclick="runQuery()">Run Query</button>
+                <button class="secondary" onclick="clearFilters()">Clear Filters</button>
+              </div>
+              <p id="results-meta" class="hint">No query run yet.</p>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Deployment Results</h3>
+            </div>
+            <div class="card-body">
+              <ul id="deployments-list" class="list"></ul>
+            </div>
+          </article>
+        </div>
+
+        <div class="stack">
+          <article class="card">
+            <div class="card-head">
+              <h3>Selected Deployment</h3>
+            </div>
+            <div class="card-body">
+              <ul id="selected-deployment" class="list"></ul>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Logs</h3>
+            </div>
+            <div class="card-body">
+              <div class="grid">
+                <div class="field">
+                  <label for="log-query">Log Text Filter</label>
+                  <input id="log-query" placeholder="error, warning, stack trace..." />
+                </div>
+                <div class="item-actions" style="align-items:end">
+                  <button class="secondary" onclick="applyLogFilter()">Apply</button>
+                  <button class="secondary" onclick="clearLogFilter()">Clear</button>
+                </div>
+              </div>
+              <div class="checks" style="margin-top:8px">
+                <label><input id="log-case-sensitive" type="checkbox" /> Case sensitive</label>
+                <label><input id="log-only-matches" type="checkbox" checked /> Show matching lines only</label>
+              </div>
+              <p id="logs-meta" class="hint">No deployment selected.</p>
+              <pre id="logs-output">(no logs loaded)</pre>
+            </div>
+          </article>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script>
+    let apps = [];
+    let allDeployments = [];
+    let filteredDeployments = [];
+    let selectedDeployment = null;
+    let rawLogs = '';
+    let statusTimeout = null;
+
+    const ACTIVE_DEPLOYMENT_STATUSES = new Set(['queued', 'deploying', 'retrying']);
+
+    function normalizeDeploymentStatus(value) {
+      return (value || 'queued').toString().toLowerCase();
+    }
+
+    function deploymentPillClass(value) {
+      const status = normalizeDeploymentStatus(value);
+      if (status === 'healthy') return 'status-healthy';
+      if (status === 'failed') return 'status-failed';
+      if (status === 'deploying') return 'status-deploying';
+      if (status === 'retrying') return 'status-retrying';
+      return 'status-queued';
+    }
+
+    function isActiveDeploymentStatus(value) {
+      return ACTIVE_DEPLOYMENT_STATUSES.has(normalizeDeploymentStatus(value));
+    }
+
+    function setStatus(message, level = 'ok') {
+      const el = document.getElementById('status');
+      el.textContent = message;
+      el.className = 'status';
+      if (level === 'warn') el.classList.add('warn');
+      if (level === 'err') el.classList.add('err');
+      if (statusTimeout) clearTimeout(statusTimeout);
+      statusTimeout = setTimeout(() => {
+        el.textContent = 'Ready.';
+        el.className = 'status';
+      }, 4500);
+    }
+
+    async function api(path, opts = {}) {
+      const res = await fetch(path, { credentials: 'include', ...opts });
+      if (res.status === 401) {
+        window.location.reload();
+        throw new Error('unauthorized');
+      }
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(text || `request failed: ${res.status}`);
+      }
+      return res;
+    }
+
+    function formatUnixMs(value) {
+      if (typeof value !== 'number' || Number.isNaN(value) || value <= 0) {
+        return 'unknown';
+      }
+      try {
+        return new Date(value).toLocaleString();
+      } catch (_) {
+        return 'unknown';
+      }
+    }
+
+    function withinHours(updatedAtUnixMs, hours) {
+      if (!Number.isFinite(hours) || hours <= 0) return true;
+      if (typeof updatedAtUnixMs !== 'number' || updatedAtUnixMs <= 0) return false;
+      return Date.now() - updatedAtUnixMs <= hours * 60 * 60 * 1000;
+    }
+
+    function renderAppOptions() {
+      const select = document.getElementById('filter-app');
+      const selected = select.value || 'all';
+      select.innerHTML = '';
+      const allOption = document.createElement('option');
+      allOption.value = 'all';
+      allOption.textContent = 'All apps';
+      select.appendChild(allOption);
+      for (const app of apps) {
+        const option = document.createElement('option');
+        option.value = app.id;
+        option.textContent = app.name;
+        select.appendChild(option);
+      }
+      select.value = apps.some((app) => app.id === selected) ? selected : 'all';
+    }
+
+    async function loadApps() {
+      const res = await api('/api/v1/apps');
+      const data = await res.json();
+      apps = data.items || [];
+      renderAppOptions();
+    }
+
+    function applyFiltersAndRender() {
+      const appId = document.getElementById('filter-app').value;
+      const status = document.getElementById('filter-status').value;
+      const sourceQuery = document.getElementById('filter-source').value.trim().toLowerCase();
+      const deploymentQuery = document.getElementById('filter-deployment').value.trim().toLowerCase();
+      const hours = Number.parseFloat(document.getElementById('filter-hours').value);
+
+      filteredDeployments = allDeployments.filter((deployment) => {
+        const deploymentStatus = normalizeDeploymentStatus(deployment.status);
+        if (appId !== 'all' && deployment.app_id !== appId) return false;
+        if (status !== 'all' && deploymentStatus !== status) return false;
+        if (sourceQuery && !String(deployment.source_ref || '').toLowerCase().includes(sourceQuery)) return false;
+        if (!withinHours(deployment.updated_at_unix_ms, hours)) return false;
+        if (deploymentQuery) {
+          const queryHaystack = [
+            deployment.id,
+            deployment.app_name,
+            deployment.source_ref || '',
+            deployment.commit_sha || '',
+            deployment.image_ref || ''
+          ]
+            .join(' ')
+            .toLowerCase();
+          if (!queryHaystack.includes(deploymentQuery)) return false;
+        }
+        return true;
+      });
+
+      renderDeployments();
+      document.getElementById('results-meta').textContent =
+        `${filteredDeployments.length} result(s) from ${allDeployments.length} deployment(s).`;
+    }
+
+    async function runQuery() {
+      if (apps.length === 0) {
+        await loadApps();
+      }
+      setStatus('Querying deployment data...');
+
+      const appId = document.getElementById('filter-app').value || 'all';
+      const targets = appId === 'all' ? apps : apps.filter((app) => app.id === appId);
+      if (targets.length === 0) {
+        allDeployments = [];
+        filteredDeployments = [];
+        selectedDeployment = null;
+        rawLogs = '';
+        renderDeployments();
+        renderSelectedDeployment();
+        applyLogFilter();
+        setStatus('No apps available for querying.', 'warn');
+        return;
+      }
+
+      const responses = await Promise.all(
+        targets.map(async (app) => {
+          const res = await api(`/api/v1/apps/${app.id}/deployments`);
+          const data = await res.json();
+          return (data.items || []).map((deployment) => ({
+            ...deployment,
+            app_id: app.id,
+            app_name: app.name
+          }));
+        })
+      );
+
+      allDeployments = responses
+        .flat()
+        .sort((a, b) => (b.updated_at_unix_ms || 0) - (a.updated_at_unix_ms || 0));
+
+      if (!selectedDeployment || !allDeployments.some((item) => item.id === selectedDeployment.id)) {
+        selectedDeployment = allDeployments[0] || null;
+      } else {
+        selectedDeployment =
+          allDeployments.find((item) => item.id === selectedDeployment.id) || selectedDeployment;
+      }
+
+      applyFiltersAndRender();
+      renderSelectedDeployment();
+      setStatus(`Query complete. Loaded ${allDeployments.length} deployment(s).`);
+    }
+
+    function renderDeployments() {
+      const el = document.getElementById('deployments-list');
+      el.innerHTML = '';
+
+      if (filteredDeployments.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No deployment results for the current filters.';
+        el.appendChild(empty);
+        return;
+      }
+
+      for (const deployment of filteredDeployments) {
+        const status = normalizeDeploymentStatus(deployment.status);
+        const isSelected = selectedDeployment && selectedDeployment.id === deployment.id;
+        const item = document.createElement('li');
+        item.className = `item-row ${isSelected ? 'selected' : ''} ${
+          isActiveDeploymentStatus(status) ? 'in-progress' : ''
+        }`.trim();
+        item.innerHTML = `
+          <div class="item-main">
+            <strong>${deployment.app_name}</strong>
+            <code><span class="pill-status ${deploymentPillClass(status)}">${status}</span> ${deployment.id}</code>
+            <code>source=${deployment.source_ref || 'manual'} | updated=${formatUnixMs(deployment.updated_at_unix_ms)}</code>
+          </div>
+          <div class="item-actions">
+            <button class="secondary" onclick="selectDeployment('${deployment.app_id}','${deployment.id}')">${
+              isSelected ? 'Selected' : 'Select'
+            }</button>
+            <button class="secondary" onclick="openDeploymentLogs('${deployment.app_id}','${deployment.id}')">Logs</button>
+          </div>
+        `;
+        el.appendChild(item);
+      }
+    }
+
+    function renderSelectedDeployment() {
+      const el = document.getElementById('selected-deployment');
+      el.innerHTML = '';
+
+      if (!selectedDeployment) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'Select a deployment to view condensed details.';
+        el.appendChild(empty);
+        return;
+      }
+
+      const status = normalizeDeploymentStatus(selectedDeployment.status);
+      const rowA = document.createElement('li');
+      rowA.className = `item-row ${isActiveDeploymentStatus(status) ? 'in-progress' : ''}`.trim();
+      rowA.innerHTML = `
+        <div class="item-main">
+          <strong>${selectedDeployment.app_name}</strong>
+          <code><span class="pill-status ${deploymentPillClass(status)}">${status}</span> ${selectedDeployment.id}</code>
+          <code>source=${selectedDeployment.source_ref || 'manual'}</code>
+        </div>
+      `;
+      el.appendChild(rowA);
+
+      const rowB = document.createElement('li');
+      rowB.className = 'item-row';
+      rowB.innerHTML = `
+        <div class="item-main">
+          <strong>Metadata</strong>
+          <code>commit=${selectedDeployment.commit_sha || 'n/a'}</code>
+          <code>image=${selectedDeployment.image_ref || 'n/a'}</code>
+          <code>updated=${formatUnixMs(selectedDeployment.updated_at_unix_ms)}</code>
+        </div>
+      `;
+      el.appendChild(rowB);
+    }
+
+    function selectDeployment(appId, deploymentId) {
+      const found = allDeployments.find(
+        (deployment) => deployment.app_id === appId && deployment.id === deploymentId
+      );
+      if (!found) return;
+      selectedDeployment = found;
+      renderSelectedDeployment();
+      renderDeployments();
+    }
+
+    async function openDeploymentLogs(appId, deploymentId) {
+      selectDeployment(appId, deploymentId);
+      try {
+        setStatus('Fetching deployment logs...');
+        const res = await api(`/api/v1/apps/${appId}/deployments/${deploymentId}/logs`);
+        const data = await res.json();
+        rawLogs = data.logs || '';
+        applyLogFilter();
+        setStatus('Logs loaded.');
+      } catch (error) {
+        setStatus(`Unable to load logs: ${error.message}`, 'err');
+      }
+    }
+
+    function applyLogFilter() {
+      const query = document.getElementById('log-query').value;
+      const caseSensitive = document.getElementById('log-case-sensitive').checked;
+      const onlyMatches = document.getElementById('log-only-matches').checked;
+      const output = document.getElementById('logs-output');
+      const meta = document.getElementById('logs-meta');
+
+      if (!rawLogs) {
+        output.textContent = '(no logs loaded)';
+        meta.textContent = 'No logs loaded.';
+        return;
+      }
+
+      const lines = rawLogs.split('\n');
+      if (!query) {
+        output.textContent = rawLogs;
+        meta.textContent = `${lines.length} line(s) loaded.`;
+        return;
+      }
+
+      const target = caseSensitive ? query : query.toLowerCase();
+      const matches = lines.filter((line) => {
+        const haystack = caseSensitive ? line : line.toLowerCase();
+        return haystack.includes(target);
+      });
+
+      if (onlyMatches) {
+        output.textContent = matches.length > 0 ? matches.join('\n') : '(no matching lines)';
+      } else {
+        output.textContent = rawLogs;
+      }
+
+      meta.textContent = `${matches.length} matching line(s) out of ${lines.length}.`;
+    }
+
+    function clearLogFilter() {
+      document.getElementById('log-query').value = '';
+      document.getElementById('log-case-sensitive').checked = false;
+      document.getElementById('log-only-matches').checked = true;
+      applyLogFilter();
+    }
+
+    function clearFilters() {
+      document.getElementById('filter-app').value = 'all';
+      document.getElementById('filter-status').value = 'all';
+      document.getElementById('filter-hours').value = '168';
+      document.getElementById('filter-source').value = '';
+      document.getElementById('filter-deployment').value = '';
+      applyFiltersAndRender();
+    }
+
+    async function logout() {
+      await api('/api/v1/auth/logout', { method: 'POST' });
+      window.location.reload();
+    }
+
+    document.getElementById('filter-source').addEventListener('input', applyFiltersAndRender);
+    document.getElementById('filter-deployment').addEventListener('input', applyFiltersAndRender);
+    document.getElementById('filter-status').addEventListener('change', applyFiltersAndRender);
+    document.getElementById('filter-app').addEventListener('change', applyFiltersAndRender);
+    document.getElementById('filter-hours').addEventListener('change', applyFiltersAndRender);
+
+    document.getElementById('log-query').addEventListener('input', applyLogFilter);
+    document.getElementById('log-case-sensitive').addEventListener('change', applyLogFilter);
+    document.getElementById('log-only-matches').addEventListener('change', applyLogFilter);
+
+    document.getElementById('deployments-list').innerHTML = '<li class="hint">Run a query to load deployment data.</li>';
+    document.getElementById('selected-deployment').innerHTML = '<li class="hint">Select a deployment to view condensed details.</li>';
+    runQuery().catch((error) => setStatus(`Initial load failed: ${error.message}`, 'err'));
+  </script>
+</body>
+</html>
+"#;
+
 async fn auth_login(
     State(state): State<AppState>,
     Json(payload): Json<AuthLoginRequest>,
