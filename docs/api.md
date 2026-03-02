@@ -74,6 +74,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - App runtime probe endpoint (`GET /api/v1/apps/{app_id}/runtime`) reports whether an app currently has a configured runtime upstream and whether that upstream is reachable via TCP.
 - Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
+- Agent heartbeat ingestion treats resource-snapshot persistence as best-effort: the API still returns `202 Accepted` when telemetry writes fail, and failures are logged server-side.
 - Dashboard metrics client refreshes apply latest-request guards so stale responses are dropped when app scope changes mid-request.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
