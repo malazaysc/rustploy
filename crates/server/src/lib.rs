@@ -4136,10 +4136,6 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       border-color: color-mix(in oklab, var(--warning) 36%, var(--line));
       background: color-mix(in oklab, var(--warning) 10%, transparent);
     }
-    .item-row.in-progress {
-      border-color: color-mix(in oklab, var(--warning) 36%, var(--line));
-      background: color-mix(in oklab, var(--warning) 10%, transparent);
-    }
     pre {
       margin: 0;
       min-height: 260px;
@@ -4524,26 +4520,99 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
       const rowTop = document.createElement('li');
       rowTop.className = `item-row ${isActiveDeploymentStatus(status) ? 'in-progress' : ''}`.trim();
-      rowTop.innerHTML = `
-        <div class="item-main">
-          <strong><span class="pill-status ${deploymentPillClass(status)}">${status}</span></strong>
-          <code>${deployment.id}</code>
-        </div>
-      `;
+      const topMain = document.createElement('div');
+      topMain.className = 'item-main';
+      const topStrong = document.createElement('strong');
+      const topPill = document.createElement('span');
+      topPill.className = `pill-status ${deploymentPillClass(status)}`;
+      topPill.textContent = status;
+      topStrong.appendChild(topPill);
+      const topCode = document.createElement('code');
+      topCode.textContent = deployment.id;
+      topMain.appendChild(topStrong);
+      topMain.appendChild(topCode);
+      rowTop.appendChild(topMain);
       el.appendChild(rowTop);
 
       const rowDetails = document.createElement('li');
       rowDetails.className = 'item-row';
-      rowDetails.innerHTML = `
-        <div class="item-main">
-          <strong>${selectedAppName || 'Selected app'}</strong>
-          <code>source=${sourceRef}</code>
-          <code>commit=${commitSha}</code>
-          <code>image=${imageRef}</code>
-          <code>updated=${updatedAt}</code>
-        </div>
-      `;
+      const detailMain = document.createElement('div');
+      detailMain.className = 'item-main';
+      const detailStrong = document.createElement('strong');
+      detailStrong.textContent = selectedAppName || 'Selected app';
+      const sourceCode = document.createElement('code');
+      sourceCode.textContent = `source=${sourceRef}`;
+      const commitCode = document.createElement('code');
+      commitCode.textContent = `commit=${commitSha}`;
+      const imageCode = document.createElement('code');
+      imageCode.textContent = `image=${imageRef}`;
+      const updatedCode = document.createElement('code');
+      updatedCode.textContent = `updated=${updatedAt}`;
+      detailMain.appendChild(detailStrong);
+      detailMain.appendChild(sourceCode);
+      detailMain.appendChild(commitCode);
+      detailMain.appendChild(imageCode);
+      detailMain.appendChild(updatedCode);
+      rowDetails.appendChild(detailMain);
       el.appendChild(rowDetails);
+    }
+
+    function renderDashboardDeploymentsList(items) {
+      const el = document.getElementById('deployments');
+      if (!el) return;
+      el.innerHTML = '';
+
+      if (!items || items.length === 0) {
+        const empty = document.createElement('li');
+        empty.className = 'hint';
+        empty.textContent = 'No deployments yet.';
+        el.appendChild(empty);
+        return;
+      }
+
+      for (const deployment of items) {
+        const sourceRef = deployment.source_ref || 'manual';
+        const status = normalizeDeploymentStatus(deployment.status);
+        const building = isActiveDeploymentStatus(status);
+        const isSelected =
+          selectedState.selectedDeployment && selectedState.selectedDeployment.id === deployment.id;
+        const statusLabel = building ? `${status} (building)` : status;
+
+        const item = document.createElement('li');
+        item.className = `item-row ${building ? 'in-progress' : ''} ${isSelected ? 'selected' : ''}`.trim();
+
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const strong = document.createElement('strong');
+        const pill = document.createElement('span');
+        pill.className = `pill-status ${deploymentPillClass(status)}`;
+        pill.textContent = statusLabel;
+        strong.appendChild(pill);
+        const code = document.createElement('code');
+        code.textContent = sourceRef;
+        main.appendChild(strong);
+        main.appendChild(code);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+
+        const selectButton = document.createElement('button');
+        selectButton.className = 'secondary';
+        selectButton.textContent = isSelected ? 'Selected' : 'Select';
+        selectButton.onclick = () => selectDeployment(deployment.id);
+
+        const logsButton = document.createElement('button');
+        logsButton.className = 'secondary';
+        logsButton.textContent = 'Logs';
+        logsButton.onclick = () => showLogs(selectedApp, deployment.id);
+
+        actions.appendChild(selectButton);
+        actions.appendChild(logsButton);
+
+        item.appendChild(main);
+        item.appendChild(actions);
+        el.appendChild(item);
+      }
     }
 
     function selectDeployment(deploymentId) {
@@ -4551,6 +4620,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (!found) return;
       selectedState.selectedDeployment = found;
       renderSelectedDeployment();
+      renderDashboardDeploymentsList(selectedState.deployments);
     }
 
     function markPendingDeployment(appId, deploymentId, status, sourceRef) {
@@ -4948,37 +5018,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       selectedState.selectedDeployment = items.find((item) => item.id === selectedDeploymentId) || items[0] || null;
       renderRoutes();
       renderSelectedDeployment();
-      const el = document.getElementById('deployments');
-      el.innerHTML = '';
-
-      if (items.length === 0) {
-        const empty = document.createElement('li');
-        empty.className = 'hint';
-        empty.textContent = 'No deployments yet.';
-        el.appendChild(empty);
-        return;
-      }
-
-      for (const d of items) {
-        const li = document.createElement('li');
-        const sourceRef = d.source_ref || 'manual';
-        const status = normalizeDeploymentStatus(d.status);
-        const building = isActiveDeploymentStatus(status);
-        const isSelected = selectedState.selectedDeployment && selectedState.selectedDeployment.id === d.id;
-        const statusLabel = building ? `${status} (building)` : status;
-        li.className = `item-row ${building ? 'in-progress' : ''} ${isSelected ? 'selected' : ''}`.trim();
-        li.innerHTML = `
-          <div class="item-main">
-            <strong><span class="pill-status ${deploymentPillClass(status)}">${statusLabel}</span></strong>
-            <code>${sourceRef}</code>
-          </div>
-          <div class="item-actions">
-            <button class="secondary" onclick="selectDeployment('${d.id}')">${isSelected ? 'Selected' : 'Select'}</button>
-            <button class="secondary" onclick="showLogs('${selectedApp}','${d.id}')">Logs</button>
-          </div>
-        `;
-        el.appendChild(li);
-      }
+      renderDashboardDeploymentsList(items);
     }
 
     async function showLogs(appId, deploymentId) {
@@ -5884,7 +5924,7 @@ const LOGS_HTML: &str = r#"<!doctype html>
         return;
       }
 
-      const responses = await Promise.all(
+      const settled = await Promise.allSettled(
         targets.map(async (app) => {
           const res = await api(`/api/v1/apps/${app.id}/deployments`);
           const data = await res.json();
@@ -5896,8 +5936,19 @@ const LOGS_HTML: &str = r#"<!doctype html>
         })
       );
 
-      allDeployments = responses
-        .flat()
+      const successful = [];
+      const failedApps = [];
+      settled.forEach((result, index) => {
+        if (result.status === 'fulfilled') {
+          successful.push(...result.value);
+          return;
+        }
+        const app = targets[index];
+        failedApps.push(app);
+        console.error('deployment query failed', app ? app.id : 'unknown-app', result.reason);
+      });
+
+      allDeployments = successful
         .sort((a, b) => (b.updated_at_unix_ms || 0) - (a.updated_at_unix_ms || 0));
 
       if (!selectedDeployment || !allDeployments.some((item) => item.id === selectedDeployment.id)) {
@@ -5909,7 +5960,15 @@ const LOGS_HTML: &str = r#"<!doctype html>
 
       applyFiltersAndRender();
       renderSelectedDeployment();
-      setStatus(`Query complete. Loaded ${allDeployments.length} deployment(s).`);
+      if (failedApps.length > 0) {
+        const failedList = failedApps.map((app) => app.name || app.id).join(', ');
+        setStatus(
+          `Query complete with partial failures (${failedList}). Loaded ${allDeployments.length} deployment(s).`,
+          'warn'
+        );
+      } else {
+        setStatus(`Query complete. Loaded ${allDeployments.length} deployment(s).`);
+      }
     }
 
     function renderDeployments() {
@@ -5931,19 +5990,40 @@ const LOGS_HTML: &str = r#"<!doctype html>
         item.className = `item-row ${isSelected ? 'selected' : ''} ${
           isActiveDeploymentStatus(status) ? 'in-progress' : ''
         }`.trim();
-        item.innerHTML = `
-          <div class="item-main">
-            <strong>${deployment.app_name}</strong>
-            <code><span class="pill-status ${deploymentPillClass(status)}">${status}</span> ${deployment.id}</code>
-            <code>source=${deployment.source_ref || 'manual'} | updated=${formatUnixMs(deployment.updated_at_unix_ms)}</code>
-          </div>
-          <div class="item-actions">
-            <button class="secondary" onclick="selectDeployment('${deployment.app_id}','${deployment.id}')">${
-              isSelected ? 'Selected' : 'Select'
-            }</button>
-            <button class="secondary" onclick="openDeploymentLogs('${deployment.app_id}','${deployment.id}')">Logs</button>
-          </div>
-        `;
+
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const strong = document.createElement('strong');
+        strong.textContent = deployment.app_name;
+        const codeStatus = document.createElement('code');
+        const statusPill = document.createElement('span');
+        statusPill.className = `pill-status ${deploymentPillClass(status)}`;
+        statusPill.textContent = status;
+        codeStatus.appendChild(statusPill);
+        codeStatus.appendChild(document.createTextNode(` ${deployment.id}`));
+        const codeMeta = document.createElement('code');
+        codeMeta.textContent = `source=${deployment.source_ref || 'manual'} | updated=${formatUnixMs(
+          deployment.updated_at_unix_ms
+        )}`;
+        main.appendChild(strong);
+        main.appendChild(codeStatus);
+        main.appendChild(codeMeta);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+        const selectButton = document.createElement('button');
+        selectButton.className = 'secondary';
+        selectButton.textContent = isSelected ? 'Selected' : 'Select';
+        selectButton.onclick = () => selectDeployment(deployment.app_id, deployment.id);
+        const logsButton = document.createElement('button');
+        logsButton.className = 'secondary';
+        logsButton.textContent = 'Logs';
+        logsButton.onclick = () => openDeploymentLogs(deployment.app_id, deployment.id);
+        actions.appendChild(selectButton);
+        actions.appendChild(logsButton);
+
+        item.appendChild(main);
+        item.appendChild(actions);
         el.appendChild(item);
       }
     }
@@ -5963,25 +6043,42 @@ const LOGS_HTML: &str = r#"<!doctype html>
       const status = normalizeDeploymentStatus(selectedDeployment.status);
       const rowA = document.createElement('li');
       rowA.className = `item-row ${isActiveDeploymentStatus(status) ? 'in-progress' : ''}`.trim();
-      rowA.innerHTML = `
-        <div class="item-main">
-          <strong>${selectedDeployment.app_name}</strong>
-          <code><span class="pill-status ${deploymentPillClass(status)}">${status}</span> ${selectedDeployment.id}</code>
-          <code>source=${selectedDeployment.source_ref || 'manual'}</code>
-        </div>
-      `;
+
+      const rowAMain = document.createElement('div');
+      rowAMain.className = 'item-main';
+      const rowAStrong = document.createElement('strong');
+      rowAStrong.textContent = selectedDeployment.app_name;
+      const rowAStatus = document.createElement('code');
+      const rowAPill = document.createElement('span');
+      rowAPill.className = `pill-status ${deploymentPillClass(status)}`;
+      rowAPill.textContent = status;
+      rowAStatus.appendChild(rowAPill);
+      rowAStatus.appendChild(document.createTextNode(` ${selectedDeployment.id}`));
+      const rowASource = document.createElement('code');
+      rowASource.textContent = `source=${selectedDeployment.source_ref || 'manual'}`;
+      rowAMain.appendChild(rowAStrong);
+      rowAMain.appendChild(rowAStatus);
+      rowAMain.appendChild(rowASource);
+      rowA.appendChild(rowAMain);
       el.appendChild(rowA);
 
       const rowB = document.createElement('li');
       rowB.className = 'item-row';
-      rowB.innerHTML = `
-        <div class="item-main">
-          <strong>Metadata</strong>
-          <code>commit=${selectedDeployment.commit_sha || 'n/a'}</code>
-          <code>image=${selectedDeployment.image_ref || 'n/a'}</code>
-          <code>updated=${formatUnixMs(selectedDeployment.updated_at_unix_ms)}</code>
-        </div>
-      `;
+      const rowBMain = document.createElement('div');
+      rowBMain.className = 'item-main';
+      const rowBStrong = document.createElement('strong');
+      rowBStrong.textContent = 'Metadata';
+      const rowBCommit = document.createElement('code');
+      rowBCommit.textContent = `commit=${selectedDeployment.commit_sha || 'n/a'}`;
+      const rowBImage = document.createElement('code');
+      rowBImage.textContent = `image=${selectedDeployment.image_ref || 'n/a'}`;
+      const rowBUpdated = document.createElement('code');
+      rowBUpdated.textContent = `updated=${formatUnixMs(selectedDeployment.updated_at_unix_ms)}`;
+      rowBMain.appendChild(rowBStrong);
+      rowBMain.appendChild(rowBCommit);
+      rowBMain.appendChild(rowBImage);
+      rowBMain.appendChild(rowBUpdated);
+      rowB.appendChild(rowBMain);
       el.appendChild(rowB);
     }
 

@@ -14,6 +14,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Dashboard "Recent Deployments" panel is now collapsible from its card header.
 - Added a new "Selected Deployment" summary card with condensed deployment metadata and quick status context.
 - Added a dedicated `/logs` explorer page with deployment querying/filtering (app, status, source/deployment search, time window) plus in-page log text filtering controls.
+- Hardened deployment/log rendering by switching selected-deployment and logs explorer result cards to DOM-safe text rendering and improved logs explorer query resilience with per-app partial-failure handling.
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Improved live deployment log robustness and error handling, including tolerant decoding for non-UTF8 runtime output.
 - Improved live log stream efficiency by switching SSE updates to incremental log chunks per deployment.

@@ -9,6 +9,7 @@
 - Dashboard graph placeholders now cover traffic and server resource chart areas so all graph panels are represented before live metrics data is wired in.
 - Dashboard operations panel now includes a collapsible "Recent Deployments" card and a dedicated "Selected Deployment" summary card with condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
+- Logs Explorer query flow now tolerates per-app fetch failures (partial results mode) and uses DOM-safe rendering for deployment summaries/results.
 - Dashboard layout hardening: two-column panels now use constrained grid sizing to prevent left/right overlap.
 - Dashboard app rows now wrap long app IDs to avoid overlap with action buttons in narrow cards.
 - Dashboard app list rows now use explicit text/actions column layout to keep metadata and buttons separated under narrow widths.
