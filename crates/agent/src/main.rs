@@ -204,14 +204,9 @@ fn aggregate_disk_capacity(disks: &[sysinfo::Disk]) -> (u64, u64) {
             continue;
         }
 
-        let mut key = disk.name().to_string_lossy().trim().to_ascii_lowercase();
-        if key.is_empty() {
-            key = disk
-                .mount_point()
-                .display()
-                .to_string()
-                .to_ascii_lowercase();
-        }
+        let Some(key) = disk_dedup_key(disk, &fs_name) else {
+            continue;
+        };
         if !seen_devices.insert(key) {
             continue;
         }
@@ -228,6 +223,44 @@ fn aggregate_disk_capacity(disks: &[sysinfo::Disk]) -> (u64, u64) {
     }
 
     (total, available)
+}
+
+fn disk_dedup_key(disk: &sysinfo::Disk, fs_name: &str) -> Option<String> {
+    let name = disk.name().to_string_lossy().trim().to_ascii_lowercase();
+    if fs_name == "btrfs" {
+        if !name.is_empty() {
+            return Some(format!("btrfs:device:{name}"));
+        }
+        return Some(format!(
+            "btrfs:mount:{}",
+            btrfs_mount_group(disk.mount_point())
+        ));
+    }
+    if !name.is_empty() {
+        return Some(name);
+    }
+    let mount_key = disk
+        .mount_point()
+        .display()
+        .to_string()
+        .to_ascii_lowercase();
+    if mount_key.is_empty() {
+        None
+    } else {
+        Some(mount_key)
+    }
+}
+
+fn btrfs_mount_group(mount_point: &std::path::Path) -> String {
+    let mut segments = mount_point.components().filter_map(|part| match part {
+        std::path::Component::Normal(value) => Some(value.to_string_lossy().to_ascii_lowercase()),
+        _ => None,
+    });
+    match (segments.next(), segments.next()) {
+        (Some(first), Some(second)) => format!("/{first}/{second}"),
+        (Some(first), None) => format!("/{first}"),
+        _ => "/".to_string(),
+    }
 }
 
 fn should_skip_filesystem(fs_name: &str) -> bool {
@@ -329,7 +362,8 @@ fn unix_ms_now() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::should_skip_filesystem;
+    use super::{btrfs_mount_group, should_skip_filesystem};
+    use std::path::Path;
 
     #[test]
     fn skips_virtual_and_overlay_filesystems() {
@@ -338,5 +372,15 @@ mod tests {
         assert!(should_skip_filesystem("proc"));
         assert!(!should_skip_filesystem("ext4"));
         assert!(!should_skip_filesystem("xfs"));
+    }
+
+    #[test]
+    fn groups_btrfs_subvolume_mounts() {
+        assert_eq!(btrfs_mount_group(Path::new("/")), "/");
+        assert_eq!(btrfs_mount_group(Path::new("/home")), "/home");
+        assert_eq!(
+            btrfs_mount_group(Path::new("/mnt/data/subvolumes/app-a")),
+            "/mnt/data"
+        );
     }
 }

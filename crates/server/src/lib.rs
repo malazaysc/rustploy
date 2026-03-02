@@ -67,8 +67,10 @@ const DEFAULT_CADDY_ACCESS_LOG_PATH: &str = "/shared/caddy-access.log";
 const DEFAULT_CADDY_ACCESS_LOG_ENABLED: bool = false;
 const DEFAULT_TELEMETRY_RETENTION_DAYS: u64 = 30;
 const DEFAULT_CADDY_ACCESS_LOG_POLL_INTERVAL_MS: u64 = 2_000;
+const MAX_CADDY_ACCESS_LOG_READ_BYTES_PER_POLL: u64 = 4 * 1024 * 1024;
 const DEFAULT_CADDY_HOST_LOOKUP_CACHE_MS: u64 = 30_000;
 const DEFAULT_TELEMETRY_RETENTION_SWEEP_MS: u64 = 60 * 60 * 1000;
+const TCP_ENDPOINT_PROBE_CONCURRENCY_LIMIT: usize = 16;
 const CONTROL_PLANE_HOST: &str = "localhost";
 const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
 const GLOBAL_TRAFFIC_SCOPE: &str = "__global__";
@@ -695,8 +697,12 @@ fn read_caddy_access_log_lines(
     let mut file = fs::File::open(path).with_context(|| format!("failed opening {path}"))?;
     file.seek(SeekFrom::Start(read_state.offset))
         .with_context(|| format!("failed seeking {path}"))?;
+    let bytes_to_read = file_len
+        .saturating_sub(read_state.offset)
+        .min(MAX_CADDY_ACCESS_LOG_READ_BYTES_PER_POLL);
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    file.take(bytes_to_read)
+        .read_to_end(&mut bytes)
         .with_context(|| format!("failed reading appended bytes from {path}"))?;
     read_state.offset = read_state.offset.saturating_add(bytes.len() as u64);
 
@@ -5732,6 +5738,16 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
 
     function renderDashboardMetricsError(message) {
+      latestDashboardMetrics = null;
+      latestNetworkCounters = null;
+      document.getElementById('stat-applications').textContent = 'n/a';
+      document.getElementById('stat-databases').textContent = 'n/a';
+      document.getElementById('stat-domains').textContent = 'n/a';
+      document.getElementById('stat-uptime').textContent = 'n/a';
+      document.getElementById('traffic-scope-tag').textContent = 'unavailable';
+      document.getElementById('resource-scope-tag').textContent = 'unavailable';
+      renderTrafficChart([]);
+      renderResourceGauges([]);
       document.getElementById('traffic-note').textContent = `Unable to load traffic metrics: ${message}`;
       document.getElementById('resource-note').textContent = `Unable to load resource metrics: ${message}`;
     }
@@ -8582,14 +8598,18 @@ async fn agent_heartbeat(
         .record_heartbeat(&normalized_payload, received_unix_ms)
         .map_err(internal_error)?;
     if let Some(snapshot) = normalized_payload.resource.as_ref() {
-        state
-            .db
-            .insert_agent_resource_sample(
-                normalized_payload.agent_id,
-                snapshot,
-                clamped_reported_unix_ms,
-            )
-            .map_err(internal_error)?;
+        if let Err(error) = state.db.insert_agent_resource_sample(
+            normalized_payload.agent_id,
+            snapshot,
+            clamped_reported_unix_ms,
+        ) {
+            warn!(
+                %error,
+                agent_id = %normalized_payload.agent_id,
+                captured_at_unix_ms = clamped_reported_unix_ms,
+                "failed persisting agent resource snapshot"
+            );
+        }
     }
 
     Ok((StatusCode::ACCEPTED, Json(HeartbeatAccepted::yes())))
@@ -8702,14 +8722,41 @@ async fn dashboard_metrics(
 
 async fn count_reachable_tcp_endpoints(endpoints: &[ManagedServiceEndpoint]) -> u64 {
     let mut seen = HashSet::new();
-    let mut reachable = 0u64;
+    let mut unique_endpoints = Vec::new();
     for endpoint in endpoints {
         let key = format!("{}:{}", endpoint.host.trim(), endpoint.port);
         if !seen.insert(key) {
             continue;
         }
-        if is_tcp_endpoint_reachable(&endpoint.host, endpoint.port).await {
-            reachable = reachable.saturating_add(1);
+        unique_endpoints.push((endpoint.host.clone(), endpoint.port));
+    }
+    if unique_endpoints.is_empty() {
+        return 0;
+    }
+
+    let mut reachable = 0u64;
+    let mut join_set = tokio::task::JoinSet::new();
+    let mut pending = unique_endpoints.into_iter();
+
+    for _ in 0..TCP_ENDPOINT_PROBE_CONCURRENCY_LIMIT {
+        let Some((host, port)) = pending.next() else {
+            break;
+        };
+        join_set.spawn(async move { is_tcp_endpoint_reachable(&host, port).await });
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(true) => {
+                reachable = reachable.saturating_add(1);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(%error, "managed service reachability probe task failed");
+            }
+        }
+        if let Some((host, port)) = pending.next() {
+            join_set.spawn(async move { is_tcp_endpoint_reachable(&host, port).await });
         }
     }
     reachable

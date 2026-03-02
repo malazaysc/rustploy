@@ -15,6 +15,8 @@
 - Request Traffic empty-state messaging now uses a fixed-position HTML overlay in the chart shell, preventing stretched/oversized text artifacts from SVG scaling.
 - Agent memory telemetry collection now records sysinfo byte values directly (no extra scaling), so Server Resources memory readings align with actual host totals/usages.
 - Agent disk telemetry now de-duplicates repeated filesystem/device entries and skips virtual filesystems, reducing inflated disk-capacity readings in containerized environments.
+- Agent heartbeat acceptance now treats optional resource-snapshot persistence as best-effort (logs on failure without rejecting the heartbeat), and caddy log polling now uses capped per-read bytes to avoid ingestion memory spikes.
+- Dashboard telemetry error rendering now explicitly clears stale stat/chart/gauge values, and managed-service TCP reachability probes run with bounded concurrency for steadier metrics latency.
 - Dashboard summary now reports managed-service reachability (TCP probe) instead of raw DB health flags, reducing false-positive "healthy" database counts.
 - Dashboard stat-card and routing-copy labels now distinguish deployment history from current runtime liveness to avoid "healthy but offline" confusion.
 - Added `GET /api/v1/apps/{app_id}/runtime` runtime probe and wired dashboard routing panel to display live runtime online/offline state separately from deployment history.
