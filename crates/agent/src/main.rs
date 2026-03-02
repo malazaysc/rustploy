@@ -183,8 +183,9 @@ impl ResourceCollector {
 
         AgentResourceSnapshot {
             cpu_percent: self.system.global_cpu_info().cpu_usage() as f64,
-            memory_used_bytes: self.system.used_memory().saturating_mul(1024),
-            memory_total_bytes: self.system.total_memory().saturating_mul(1024),
+            // sysinfo already reports memory in bytes on our pinned version.
+            memory_used_bytes: self.system.used_memory(),
+            memory_total_bytes: self.system.total_memory(),
             disk_used_bytes: disk_total_bytes.saturating_sub(disk_available_bytes),
             disk_total_bytes,
             network_rx_bytes,

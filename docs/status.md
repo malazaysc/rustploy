@@ -13,6 +13,7 @@
 - Caddy host parsing for telemetry now handles IPv6 literals and drops empty host values to avoid malformed bucket attribution.
 - Dashboard metrics refresh now drops stale async responses when selected app context changes, preventing out-of-order widget renders.
 - Request Traffic empty-state messaging now uses a fixed-position HTML overlay in the chart shell, preventing stretched/oversized text artifacts from SVG scaling.
+- Agent memory telemetry collection now records sysinfo byte values directly (no extra scaling), so Server Resources memory readings align with actual host totals/usages.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
