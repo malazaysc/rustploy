@@ -9,11 +9,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 ### Changed
 
 - Reworked the embedded web dashboard to match the provided v0 mock style (sidebar navigation, top header, metric cards, and refreshed dark theme) while preserving existing live deploy/log/domain/env workflows.
-- Dashboard shell now anchors `html/body` background and disables vertical overscroll bounce so fast scrolling no longer reveals blank top/bottom gaps.
-- Added graph placeholders to the dashboard for traffic and server resources so all chart regions are visually represented while live metrics integrations are pending.
-- Dashboard "Recent Deployments" panel is now collapsible from its card header.
-- Added a new "Selected Deployment" summary card with condensed deployment metadata and quick status context.
-- Added a dedicated `/logs` explorer page with deployment querying/filtering (app, status, source/deployment search, time window) plus in-page log text filtering controls.
 - Hardened deployment/log rendering by switching selected-deployment and logs explorer result cards to DOM-safe text rendering and improved logs explorer query resilience with per-app partial-failure handling.
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
 - Improved live deployment log robustness and error handling, including tolerant decoding for non-UTF8 runtime output.
@@ -27,6 +22,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
 - Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
 - Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
+- Dashboard shell now anchors `html/body` background and disables vertical overscroll bounce so fast scrolling no longer reveals blank top/bottom gaps.
 - Logs Explorer query execution now ignores stale out-of-order responses so older requests cannot overwrite newer query results.
 - Dashboard domain/env list rendering now uses text-safe DOM nodes to prevent stored XSS from user-provided values.
 - Dashboard now closes active app log SSE streams when app selection is cleared, preventing stale background log polling.
@@ -56,6 +52,10 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App import endpoint with Git-based Next.js/package-manager detection and `rustploy.yaml` parsing (`/api/v1/apps/import`).
 - Rollback endpoint using latest healthy source (`/api/v1/apps/:id/rollback`).
 - Expanded `rustploy-tui` command mode for listing apps/deployments and triggering deploy/rollback with API tokens.
+- Added graph placeholders to the dashboard for traffic and server resources so all chart regions are visually represented while live metrics integrations are pending.
+- Dashboard "Recent Deployments" panel is now collapsible from its card header.
+- Added a new "Selected Deployment" summary card with condensed deployment metadata and quick status context.
+- Added a dedicated `/logs` explorer page with deployment querying/filtering (app, status, source/deployment search, time window) plus in-page log text filtering controls.
 - Structured manifest validation errors for import requests.
 - Effective app config endpoint (`GET /api/v1/apps/:id/config`) and TUI config inspection command.
 - Deployment logs persistence and logs endpoint (`GET /api/v1/apps/:id/deployments/:deployment_id/logs`) with TUI `logs` command.
