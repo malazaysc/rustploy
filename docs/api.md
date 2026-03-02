@@ -70,6 +70,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Dashboard metrics endpoint (`GET /api/v1/dashboard/metrics`) returns live summary cards plus request traffic/resource time series for configurable windows (`1h|24h|7d`) and buckets (`1m|5m|1h`), optionally filtered by `app_id` for request traffic.
 - Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
+- Dashboard metrics client refreshes apply latest-request guards so stale responses are dropped when app scope changes mid-request.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.

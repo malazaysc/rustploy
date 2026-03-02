@@ -124,6 +124,7 @@ struct AppStateConfig {
 struct Database {
     conn: Arc<Mutex<Connection>>,
     caddy_access_log_path: Arc<Mutex<String>>,
+    caddy_access_log_enabled: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug)]
@@ -449,6 +450,7 @@ impl AppState {
         let db = Database::open(&config.db_path)
             .with_context(|| format!("failed to open db at {}", config.db_path))?;
         db.set_caddy_access_log_path(&config.caddy_access_log_path);
+        db.set_caddy_access_log_enabled(config.caddy_access_log_enabled);
 
         if let (Some(email), Some(password)) = (
             config.bootstrap_admin_email.as_deref(),
@@ -632,17 +634,20 @@ pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
             None => true,
         };
         if should_refresh_lookup {
-            let by_host = match build_host_lookup(&state) {
-                Ok(by_host) => by_host,
+            match build_host_lookup(&state) {
+                Ok(by_host) => {
+                    host_lookup_cache = Some(HostLookupCache {
+                        refreshed_at_unix_ms: now,
+                        by_host,
+                    });
+                }
                 Err(error) => {
                     warn!(%error, "failed building caddy host lookup");
-                    continue;
+                    if host_lookup_cache.is_none() {
+                        continue;
+                    }
                 }
-            };
-            host_lookup_cache = Some(HostLookupCache {
-                refreshed_at_unix_ms: now,
-                by_host,
-            });
+            }
         }
         let Some(host_lookup) = host_lookup_cache.as_ref().map(|cache| &cache.by_host) else {
             continue;
@@ -867,6 +872,7 @@ impl Database {
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             caddy_access_log_path: Arc::new(Mutex::new(DEFAULT_CADDY_ACCESS_LOG_PATH.to_string())),
+            caddy_access_log_enabled: Arc::new(Mutex::new(DEFAULT_CADDY_ACCESS_LOG_ENABLED)),
         })
     }
 
@@ -883,6 +889,21 @@ impl Database {
             .lock()
             .expect("caddy access log path mutex poisoned")
             .clone()
+    }
+
+    fn set_caddy_access_log_enabled(&self, enabled: bool) {
+        let mut slot = self
+            .caddy_access_log_enabled
+            .lock()
+            .expect("caddy access log enabled mutex poisoned");
+        *slot = enabled;
+    }
+
+    fn caddy_access_log_enabled(&self) -> bool {
+        *self
+            .caddy_access_log_enabled
+            .lock()
+            .expect("caddy access log enabled mutex poisoned")
     }
 
     fn register_agent(&self, request: &AgentRegisterRequest, now_unix_ms: u64) -> Result<bool> {
@@ -5246,6 +5267,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let deploymentsCollapsed = false;
     let latestDashboardMetrics = null;
     let latestNetworkCounters = null;
+    let dashboardMetricsRequestSeq = 0;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -5620,13 +5642,18 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
 
     async function refreshDashboardMetrics() {
+      const requestSeq = ++dashboardMetricsRequestSeq;
+      const appAtRequest = selectedApp;
       const params = new URLSearchParams();
       params.set('window', '24h');
-      if (selectedApp) {
-        params.set('app_id', selectedApp);
+      if (appAtRequest) {
+        params.set('app_id', appAtRequest);
       }
       const res = await api(`/api/v1/dashboard/metrics?${params.toString()}`);
       const data = await res.json();
+      if (requestSeq !== dashboardMetricsRequestSeq || selectedApp !== appAtRequest) {
+        return;
+      }
       renderDashboardMetrics(data);
     }
 
@@ -8528,7 +8555,12 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         std::env::var("RUSTPLOY_CADDYFILE_PATH").unwrap_or_else(|_| "data/Caddyfile".to_string());
     let upstream = std::env::var("RUSTPLOY_UPSTREAM_ADDR")
         .unwrap_or_else(|_| DEFAULT_CADDY_UPSTREAM.to_string());
-    let caddy_access_log_path = db.caddy_access_log_path();
+    let caddy_access_log_enabled = db.caddy_access_log_enabled();
+    let caddy_access_log_path = if caddy_access_log_enabled {
+        Some(db.caddy_access_log_path())
+    } else {
+        None
+    };
     if let Some(parent) = Path::new(&path).parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -8555,9 +8587,11 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
             continue;
         }
         content.push_str(&format!("{slug}.localhost {{\n"));
-        content.push_str(&format!(
-            "  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n"
-        ));
+        if let Some(log_path) = caddy_access_log_path.as_deref() {
+            content.push_str(&format!(
+                "  log {{\n    output file {log_path}\n    format json\n  }}\n"
+            ));
+        }
         content.push_str(&format!(
             "  reverse_proxy {}:{}\n",
             runtime.upstream_host, runtime.upstream_port
@@ -8575,9 +8609,11 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
             continue;
         }
         content.push_str(&format!("{} {{\n", normalized));
-        content.push_str(&format!(
-            "  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n"
-        ));
+        if let Some(log_path) = caddy_access_log_path.as_deref() {
+            content.push_str(&format!(
+                "  log {{\n    output file {log_path}\n    format json\n  }}\n"
+            ));
+        }
         if domain.tls_mode == "custom" {
             if let (Some(cert), Some(key)) =
                 (domain.cert_path.as_deref(), domain.key_path.as_deref())
@@ -8595,9 +8631,15 @@ fn sync_caddyfile_from_db(db: &Database) -> Result<()> {
         }
         content.push_str("}\n\n");
     }
-    content.push_str(&format!(
-        "*.localhost {{\n  log {{\n    output file {caddy_access_log_path}\n    format json\n  }}\n  reverse_proxy {upstream}\n}}\n\n"
-    ));
+    if let Some(log_path) = caddy_access_log_path.as_deref() {
+        content.push_str(&format!(
+            "*.localhost {{\n  log {{\n    output file {log_path}\n    format json\n  }}\n  reverse_proxy {upstream}\n}}\n\n"
+        ));
+    } else {
+        content.push_str(&format!(
+            "*.localhost {{\n  reverse_proxy {upstream}\n}}\n\n"
+        ));
+    }
 
     fs::write(&path, content).with_context(|| format!("failed writing caddyfile at {path}"))?;
     Ok(())

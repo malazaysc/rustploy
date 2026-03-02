@@ -9,6 +9,7 @@ Rustploy can generate a Caddyfile from app domain mappings.
 - Reverse proxy target is configurable via `RUSTPLOY_UPSTREAM_ADDR` (defaults to `127.0.0.1:8080`).
 - Access logs for app-facing routes are emitted in JSON format to `RUSTPLOY_CADDY_ACCESS_LOG_PATH` (defaults to `/shared/caddy-access.log`) for dashboard traffic telemetry ingestion.
 - Access-log ingestion can be toggled with `RUSTPLOY_CADDY_ACCESS_LOG_ENABLED` (disabled by default unless a custom log path is provided).
+- Generated Caddy route blocks only include `log { ... }` directives when `RUSTPLOY_CADDY_ACCESS_LOG_ENABLED` is enabled.
 - `tls_mode=managed` uses automatic ACME certificates.
 - `tls_mode=custom` uses explicit `cert_path` and `key_path`.
 
