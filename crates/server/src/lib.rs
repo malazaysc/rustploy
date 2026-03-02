@@ -10078,7 +10078,7 @@ mod tests {
         let has_resource_sample =
             metrics_json["server_resources"]
                 .as_array()
-                .map_or(false, |items| {
+                .is_some_and(|items| {
                     items
                         .iter()
                         .any(|point| point["samples"].as_u64().unwrap_or(0) > 0)
