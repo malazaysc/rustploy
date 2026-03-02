@@ -64,8 +64,10 @@ const DEFAULT_ADMIN_EMAIL: &str = "admin@localhost";
 const DEFAULT_ADMIN_PASSWORD: &str = "admin";
 const DEFAULT_CADDY_UPSTREAM: &str = "127.0.0.1:8080";
 const DEFAULT_CADDY_ACCESS_LOG_PATH: &str = "/shared/caddy-access.log";
+const DEFAULT_CADDY_ACCESS_LOG_ENABLED: bool = false;
 const DEFAULT_TELEMETRY_RETENTION_DAYS: u64 = 30;
 const DEFAULT_CADDY_ACCESS_LOG_POLL_INTERVAL_MS: u64 = 2_000;
+const DEFAULT_CADDY_HOST_LOOKUP_CACHE_MS: u64 = 30_000;
 const DEFAULT_TELEMETRY_RETENTION_SWEEP_MS: u64 = 60 * 60 * 1000;
 const CONTROL_PLANE_HOST: &str = "localhost";
 const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
@@ -92,6 +94,7 @@ pub struct AppState {
     webhook_rate_limit_per_minute: u32,
     telemetry_retention_days: u64,
     caddy_access_log_path: String,
+    caddy_access_log_enabled: bool,
     rate_limit_state: Arc<Mutex<HashMap<String, (u64, u32)>>>,
 }
 
@@ -114,6 +117,7 @@ struct AppStateConfig {
     webhook_rate_limit_per_minute: u32,
     telemetry_retention_days: u64,
     caddy_access_log_path: String,
+    caddy_access_log_enabled: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +229,19 @@ struct RequestTrafficBucketDelta {
     total_requests: u64,
     errors_4xx: u64,
     errors_5xx: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CaddyAccessLogReadState {
+    offset: u64,
+    pending_partial: String,
+    initialized: bool,
+}
+
+#[derive(Debug, Clone)]
+struct HostLookupCache {
+    refreshed_at_unix_ms: u64,
+    by_host: HashMap<String, Uuid>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -359,6 +376,15 @@ struct GithubOwner {
 
 impl AppState {
     pub fn from_env() -> Result<Self> {
+        let caddy_access_log_path_env = std::env::var("RUSTPLOY_CADDY_ACCESS_LOG_PATH");
+        let caddy_access_log_enabled_default = if caddy_access_log_path_env.is_ok() {
+            true
+        } else {
+            DEFAULT_CADDY_ACCESS_LOG_ENABLED
+        };
+        let caddy_access_log_path =
+            caddy_access_log_path_env.unwrap_or_else(|_| DEFAULT_CADDY_ACCESS_LOG_PATH.to_string());
+
         Self::from_config(AppStateConfig {
             db_path: std::env::var("RUSTPLOY_DB_PATH")
                 .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string()),
@@ -410,8 +436,11 @@ impl AppState {
                 "RUSTPLOY_TELEMETRY_RETENTION_DAYS",
                 DEFAULT_TELEMETRY_RETENTION_DAYS,
             )?,
-            caddy_access_log_path: std::env::var("RUSTPLOY_CADDY_ACCESS_LOG_PATH")
-                .unwrap_or_else(|_| DEFAULT_CADDY_ACCESS_LOG_PATH.to_string()),
+            caddy_access_log_path,
+            caddy_access_log_enabled: read_env_bool(
+                "RUSTPLOY_CADDY_ACCESS_LOG_ENABLED",
+                caddy_access_log_enabled_default,
+            ),
         })
     }
 
@@ -442,6 +471,7 @@ impl AppState {
             webhook_rate_limit_per_minute: config.webhook_rate_limit_per_minute,
             telemetry_retention_days: config.telemetry_retention_days,
             caddy_access_log_path: config.caddy_access_log_path,
+            caddy_access_log_enabled: config.caddy_access_log_enabled,
             rate_limit_state: Arc::new(Mutex::new(HashMap::new())),
         };
 
@@ -462,6 +492,10 @@ impl AppState {
 
     pub fn caddy_access_log_path(&self) -> &str {
         &self.caddy_access_log_path
+    }
+
+    pub fn caddy_access_log_enabled(&self) -> bool {
+        self.caddy_access_log_enabled
     }
 
     pub fn telemetry_retention_ms(&self) -> u64 {
@@ -518,6 +552,7 @@ impl AppState {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .expect("test state should initialize")
     }
@@ -544,9 +579,8 @@ pub async fn run_reconciler_loop(state: AppState) {
 pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
     let poll_interval = Duration::from_millis(DEFAULT_CADDY_ACCESS_LOG_POLL_INTERVAL_MS);
     let retention_sweep_ms = DEFAULT_TELEMETRY_RETENTION_SWEEP_MS;
-    let mut offset: u64 = 0;
-    let mut pending_partial = String::new();
-    let mut initialized = false;
+    let mut read_state = CaddyAccessLogReadState::default();
+    let mut host_lookup_cache: Option<HostLookupCache> = None;
     let mut last_retention_sweep_unix_ms = 0u64;
 
     loop {
@@ -561,15 +595,26 @@ pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
             last_retention_sweep_unix_ms = now;
         }
 
-        let lines = match read_caddy_access_log_lines(
-            state.caddy_access_log_path(),
-            &mut offset,
-            &mut pending_partial,
-            &mut initialized,
-        ) {
-            Ok(lines) => lines,
-            Err(error) => {
+        let read_result = {
+            let path = state.caddy_access_log_path().to_string();
+            let current_read_state = read_state.clone();
+            tokio::task::spawn_blocking(move || {
+                read_caddy_access_log_lines(&path, current_read_state)
+            })
+            .await
+        };
+
+        let lines = match read_result {
+            Ok(Ok((lines, next_read_state))) => {
+                read_state = next_read_state;
+                lines
+            }
+            Ok(Err(error)) => {
                 warn!(%error, path = state.caddy_access_log_path(), "failed reading caddy access log");
+                continue;
+            }
+            Err(error) => {
+                warn!(%error, "failed joining caddy access log reader task");
                 continue;
             }
         };
@@ -578,7 +623,30 @@ pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
             continue;
         }
 
-        if let Err(error) = ingest_caddy_access_lines(&state, &lines, now) {
+        let should_refresh_lookup = match host_lookup_cache.as_ref() {
+            Some(cache) => {
+                now.saturating_sub(cache.refreshed_at_unix_ms) >= DEFAULT_CADDY_HOST_LOOKUP_CACHE_MS
+            }
+            None => true,
+        };
+        if should_refresh_lookup {
+            let by_host = match build_host_lookup(&state) {
+                Ok(by_host) => by_host,
+                Err(error) => {
+                    warn!(%error, "failed building caddy host lookup");
+                    continue;
+                }
+            };
+            host_lookup_cache = Some(HostLookupCache {
+                refreshed_at_unix_ms: now,
+                by_host,
+            });
+        }
+        let Some(host_lookup) = host_lookup_cache.as_ref().map(|cache| &cache.by_host) else {
+            continue;
+        };
+
+        if let Err(error) = ingest_caddy_access_lines(&state, host_lookup, &lines, now) {
             warn!(%error, "failed ingesting caddy access log lines");
         }
     }
@@ -586,43 +654,43 @@ pub async fn run_caddy_access_log_ingestion_loop(state: AppState) {
 
 fn read_caddy_access_log_lines(
     path: &str,
-    offset: &mut u64,
-    pending_partial: &mut String,
-    initialized: &mut bool,
-) -> Result<Vec<String>> {
+    mut read_state: CaddyAccessLogReadState,
+) -> Result<(Vec<String>, CaddyAccessLogReadState)> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), read_state))
+        }
         Err(error) => {
             return Err(error).with_context(|| format!("failed reading metadata for {path}"))
         }
     };
     let file_len = metadata.len();
-    if !*initialized {
-        *offset = file_len;
-        *initialized = true;
-        return Ok(Vec::new());
+    if !read_state.initialized {
+        read_state.offset = file_len;
+        read_state.initialized = true;
+        return Ok((Vec::new(), read_state));
     }
-    if file_len < *offset {
-        *offset = 0;
-        pending_partial.clear();
+    if file_len < read_state.offset {
+        read_state.offset = 0;
+        read_state.pending_partial.clear();
     }
-    if file_len == *offset {
-        return Ok(Vec::new());
+    if file_len == read_state.offset {
+        return Ok((Vec::new(), read_state));
     }
 
     let mut file = fs::File::open(path).with_context(|| format!("failed opening {path}"))?;
-    file.seek(SeekFrom::Start(*offset))
+    file.seek(SeekFrom::Start(read_state.offset))
         .with_context(|| format!("failed seeking {path}"))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .with_context(|| format!("failed reading appended bytes from {path}"))?;
-    *offset = (*offset).saturating_add(bytes.len() as u64);
+    read_state.offset = read_state.offset.saturating_add(bytes.len() as u64);
 
     let mut buffer = String::new();
-    if !pending_partial.is_empty() {
-        buffer.push_str(pending_partial);
-        pending_partial.clear();
+    if !read_state.pending_partial.is_empty() {
+        buffer.push_str(&read_state.pending_partial);
+        read_state.pending_partial.clear();
     }
     buffer.push_str(&String::from_utf8_lossy(&bytes));
 
@@ -630,7 +698,7 @@ fn read_caddy_access_log_lines(
     let mut parts = buffer.split('\n').peekable();
     while let Some(part) = parts.next() {
         if parts.peek().is_none() && !buffer.ends_with('\n') {
-            pending_partial.push_str(part);
+            read_state.pending_partial.push_str(part);
             break;
         }
         let trimmed = part.trim();
@@ -639,11 +707,15 @@ fn read_caddy_access_log_lines(
         }
         lines.push(trimmed.to_string());
     }
-    Ok(lines)
+    Ok((lines, read_state))
 }
 
-fn ingest_caddy_access_lines(state: &AppState, lines: &[String], now_unix_ms: u64) -> Result<()> {
-    let host_lookup = build_host_lookup(state)?;
+fn ingest_caddy_access_lines(
+    state: &AppState,
+    host_lookup: &HashMap<String, Uuid>,
+    lines: &[String],
+    now_unix_ms: u64,
+) -> Result<()> {
     let mut deltas: HashMap<(u64, String), RequestTrafficBucketDelta> = HashMap::new();
 
     for line in lines {
@@ -8257,14 +8329,22 @@ async fn agent_heartbeat(
     info!(agent_id = %payload.agent_id, traceparent, "agent heartbeat request");
     authorize_agent_request(&headers, &state.agent_shared_token)?;
 
+    let received_unix_ms = now_unix_ms();
+    let clamped_reported_unix_ms = payload.timestamp_unix_ms.min(received_unix_ms);
+    let mut normalized_payload = payload;
+    normalized_payload.timestamp_unix_ms = clamped_reported_unix_ms;
     state
         .db
-        .record_heartbeat(&payload, now_unix_ms())
+        .record_heartbeat(&normalized_payload, received_unix_ms)
         .map_err(internal_error)?;
-    if let Some(snapshot) = payload.resource.as_ref() {
+    if let Some(snapshot) = normalized_payload.resource.as_ref() {
         state
             .db
-            .insert_agent_resource_sample(payload.agent_id, snapshot, payload.timestamp_unix_ms)
+            .insert_agent_resource_sample(
+                normalized_payload.agent_id,
+                snapshot,
+                clamped_reported_unix_ms,
+            )
             .map_err(internal_error)?;
     }
 
@@ -10036,7 +10116,7 @@ mod tests {
         let rich_payload = json!({
             "agent_id": agent_id,
             "agent_version": "0.1.1",
-            "timestamp_unix_ms": now_unix_ms(),
+            "timestamp_unix_ms": u64::MAX,
             "resource": {
                 "cpu_percent": 42.5,
                 "memory_used_bytes": 2147483648u64,
@@ -10109,6 +10189,7 @@ mod tests {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .unwrap();
         let app = create_router(state);
@@ -10230,7 +10311,8 @@ mod tests {
             ),
             "not-json".to_string(),
         ];
-        ingest_caddy_access_lines(&state, &lines, now_unix_ms()).unwrap();
+        let host_lookup = build_host_lookup(&state).unwrap();
+        ingest_caddy_access_lines(&state, &host_lookup, &lines, now_unix_ms()).unwrap();
 
         let app_one_metrics = app
             .clone()
@@ -10350,6 +10432,7 @@ mod tests {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .unwrap();
         let app = create_router(state.clone());
@@ -10617,6 +10700,7 @@ mod tests {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .unwrap();
         let app = create_router(state);
@@ -10714,6 +10798,7 @@ mod tests {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .unwrap();
         let app = create_router(state);
@@ -10781,6 +10866,7 @@ mod tests {
             webhook_rate_limit_per_minute: 10_000,
             telemetry_retention_days: DEFAULT_TELEMETRY_RETENTION_DAYS,
             caddy_access_log_path: DEFAULT_CADDY_ACCESS_LOG_PATH.to_string(),
+            caddy_access_log_enabled: false,
         })
         .unwrap();
         let app = create_router(state);

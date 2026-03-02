@@ -14,7 +14,9 @@ async fn main() -> Result<()> {
     if state.reconciler_enabled() {
         tokio::spawn(run_reconciler_loop(state.clone()));
     }
-    tokio::spawn(run_caddy_access_log_ingestion_loop(state.clone()));
+    if state.caddy_access_log_enabled() {
+        tokio::spawn(run_caddy_access_log_ingestion_loop(state.clone()));
+    }
 
     let addr = read_bind_addr().context("failed to parse bind address")?;
     let listener = tokio::net::TcpListener::bind(addr)

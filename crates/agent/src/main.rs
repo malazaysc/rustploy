@@ -1,4 +1,7 @@
-use std::{env, time::SystemTime};
+use std::{
+    env,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Context, Result};
 use shared::{AgentHeartbeat, AgentRegisterRequest, AgentResourceSnapshot};
@@ -45,13 +48,16 @@ async fn main() -> Result<()> {
         warn!(%error, "agent registration failed");
     }
     let mut resource_collector = ResourceCollector::new();
+    tokio::time::sleep(System::MINIMUM_CPU_UPDATE_INTERVAL).await;
 
     if config.oneshot {
         send_heartbeat(&config, Some(resource_collector.collect())).await?;
         return Ok(());
     }
 
-    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(config.interval_seconds));
+    let heartbeat_interval =
+        Duration::from_secs(config.interval_seconds).max(System::MINIMUM_CPU_UPDATE_INTERVAL);
+    let mut ticker = tokio::time::interval(heartbeat_interval);
 
     loop {
         ticker.tick().await;

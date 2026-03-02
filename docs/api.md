@@ -68,7 +68,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Dashboard domain and env list rendering now uses text-safe DOM node assembly, preserving endpoint contracts while preventing stored script injection from user-controlled fields.
 - Dashboard live-log client now tears down app-level SSE streams when app selection is cleared, preventing stale background requests against `/api/v1/apps/{app_id}/logs/stream`.
 - Dashboard metrics endpoint (`GET /api/v1/dashboard/metrics`) returns live summary cards plus request traffic/resource time series for configurable windows (`1h|24h|7d`) and buckets (`1m|5m|1h`), optionally filtered by `app_id` for request traffic.
-- Agent heartbeat payloads can include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes); older heartbeats without `resource` remain accepted.
+- Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Track internal server refactors in docs even when no API contract fields change.
 - Stream endpoint pushes incremental deployment log chunks whenever new lines arrive from compose/git runtime commands.
 - Stream `logs` events use JSON payloads (`deployment_id`, `logs`, `reset`) over SSE so clients can safely handle escaped content and reconnect snapshots.

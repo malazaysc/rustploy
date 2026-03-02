@@ -18,6 +18,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Dashboard SSE client now consumes structured JSON log events to preserve literal escaped sequences safely.
 - Dashboard metric cards and telemetry widgets now render live backend data (global/per-app request traffic + host resource samples) instead of placeholder values.
 - Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
+- Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
 - CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
 
 ### Fixed
@@ -32,6 +33,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Two-column dashboard layout now uses a constrained grid so the left control stack cannot overlap right-side deployment/runtime panels.
 - App list rows now wrap app IDs safely instead of overflowing beneath action buttons.
 - App rows now use a dedicated text/actions grid so app metadata and action buttons never overlap.
+- Agent resource sample persistence now clamps client-provided timestamps to bounded server receive time to prevent future-skewed telemetry writes.
 
 ### Added
 
