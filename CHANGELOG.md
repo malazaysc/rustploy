@@ -55,6 +55,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App container inventory handlers now run Docker CLI inspection in a blocking task with a timeout, preventing async request-worker stalls when Docker is slow/unresponsive.
 - Container detail healthcheck `last_output` now redacts credential-bearing URL patterns and secret-like `KEY=value` fragments before returning API responses.
 - Container log APIs now return `404` (instead of `500`) when a container disappears between selector resolution and log retrieval.
+- Container log cursor advancement no longer adds `+1ms` after reads, avoiding potential skips when multiple log entries share the same millisecond timestamp.
+- Container log parsing now preserves line whitespace in returned payloads (except trailing `\\r` normalization).
 
 ### Added
 

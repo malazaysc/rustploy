@@ -4107,11 +4107,11 @@ fn parse_container_log_chunk(
     let mut lines = Vec::new();
     let mut max_timestamp_unix_ms: Option<u64> = None;
 
-    for line in String::from_utf8_lossy(stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-    {
+    for raw_line in String::from_utf8_lossy(stdout).lines() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let line = raw_line.trim_end_matches('\r');
         let (timestamp_unix_ms, message) = split_docker_log_line(line);
         if !contains_filter_match(message, contains) {
             continue;
@@ -4123,9 +4123,7 @@ fn parse_container_log_chunk(
         lines.push(line.to_string());
     }
 
-    let next_since_unix_ms = max_timestamp_unix_ms
-        .map(|value| value.saturating_add(1))
-        .or(fallback_cursor_unix_ms);
+    let next_since_unix_ms = max_timestamp_unix_ms.or(fallback_cursor_unix_ms);
     AppContainerLogsChunk {
         logs: lines.join("\n"),
         next_since_unix_ms,
@@ -12220,7 +12218,7 @@ mod tests {
             chunk.logs,
             "2026-03-03T10:00:01.000000000Z health ok".to_string()
         );
-        assert_eq!(chunk.next_since_unix_ms, Some(1_772_532_001_001));
+        assert_eq!(chunk.next_since_unix_ms, Some(1_772_532_001_000));
     }
 
     #[test]
@@ -12232,6 +12230,19 @@ mod tests {
         );
         assert!(chunk.logs.is_empty());
         assert_eq!(chunk.next_since_unix_ms, Some(1234));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_preserves_log_whitespace() {
+        let chunk = parse_container_log_chunk(
+            b"2026-03-03T10:00:00.000000000Z   value with spacing  \n",
+            None,
+            None,
+        );
+        assert_eq!(
+            chunk.logs,
+            "2026-03-03T10:00:00.000000000Z   value with spacing  "
+        );
     }
 
     #[test]

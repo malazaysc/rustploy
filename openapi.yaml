@@ -1364,7 +1364,7 @@ paths:
         '409':
           description: Container selector is ambiguous and matches multiple containers
         '404':
-          description: App or container not found
+          description: App not found, runtime not configured, or container not found
   /apps/{app_id}/containers/{container_id}/logs:
     get:
       summary: Get container logs for app project container
@@ -1427,7 +1427,7 @@ paths:
         '409':
           description: Container selector is ambiguous and matches multiple containers
         '404':
-          description: App or container not found
+          description: App not found, runtime not configured, or container not found
   /apps/{app_id}/containers/{container_id}/logs/stream:
     get:
       summary: Stream container logs via SSE
@@ -1497,7 +1497,7 @@ paths:
         '409':
           description: Container selector is ambiguous and matches multiple containers
         '404':
-          description: App or container not found
+          description: App not found, runtime not configured, or container not found
   /apps/{app_id}/containers/{container_id}/logs/download:
     get:
       summary: Download container logs as plain text
