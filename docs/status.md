@@ -29,6 +29,11 @@
 - Container logs now support reconnect-safe `since` cursors, optional `until` windows, case-insensitive text filtering (`contains`), bounded tail defaults/caps, and download-friendly plain-text responses while preserving original line whitespace in API payloads.
 - Container logs cursor advancement now remains monotonic and advances from parsed timestamps even when filtered lines are not returned, avoiding repeated scans/replay loops with `contains` filters.
 - Live container log streams now emit one reset frame on transient poll failures and suppress repeated failure events until a successful recovery read.
+- Dashboard project workspace now exposes a `Containers` tab with:
+  - container status table (status, ports, uptime, restart count, image),
+  - selected-container metadata (health/networks/mounts/labels/command),
+  - logs viewer controls (contains filter, since/until range, live tail reconnect, and download),
+  - automatic container refresh every 5 seconds plus manual refresh.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
@@ -76,5 +81,5 @@
 ## Last Verified
 
 - Date: 2026-03-03
-- Commit base: `214b854`
-- Note: app runtime introspection now includes project container inventory plus per-container log stream/download APIs for status/port/detail/log visibility; dashboard telemetry remains available via `/api/v1/dashboard/metrics`.
+- Commit base: `93ab1c5`
+- Note: dashboard now includes a project `Containers` tab that consumes existing container inventory/detail/log APIs, with live-log reconnect and explicit empty/loading/error states.

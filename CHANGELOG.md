@@ -25,6 +25,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
 - Container log retrieval now supports per-container `since` cursors, optional `until` range bounds, and case-insensitive text filtering (`contains`) for incremental reads and reconnect-safe consumers.
 - Container log reads now enforce bounded tail behavior (`2000` default, `10000` max; stream bootstrap default remains `200`) to avoid unbounded full-history fetches.
+- Dashboard project workspace now includes a dedicated `Containers` tab with project-scoped container inventory, auto-refreshing status rows, detailed runtime metadata, and integrated per-container logs controls (filter/range/live tail/download).
 
 ### Fixed
 
