@@ -201,9 +201,11 @@ Response includes:
 - `reset` is `true` on initial stream snapshots so clients can replace stale output.
 - `reset` can also be emitted once with empty `logs` if container log polling temporarily fails; normal events resume after recovery.
 - Reconnect clients should pass `next_since_unix_ms` back as `since` to continue without major gaps.
+- Invalid ranges (`since > until`) return `400 Bad Request`.
 - Missing runtime/container resolution returns `404 Not Found`.
 - Ambiguous container selector matches return `409 Conflict`.
 
 `GET /apps/{app_id}/containers/{container_id}/logs/download` returns plain-text logs as an attachment and supports the same filter/range query parameters.
+- Invalid ranges (`since > until`) return `400 Bad Request`.
 - Missing runtime/container resolution returns `404 Not Found`.
 - Ambiguous container selector matches return `409 Conflict`.

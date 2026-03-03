@@ -4113,12 +4113,12 @@ fn parse_container_log_chunk(
         }
         let line = raw_line.trim_end_matches('\r');
         let (timestamp_unix_ms, message) = split_docker_log_line(line);
-        if !contains_filter_match(message, contains) {
-            continue;
-        }
         if let Some(value) = timestamp_unix_ms {
             max_timestamp_unix_ms =
                 Some(max_timestamp_unix_ms.map_or(value, |current| current.max(value)));
+        }
+        if !contains_filter_match(message, contains) {
+            continue;
         }
         lines.push(line.to_string());
     }
@@ -4127,6 +4127,15 @@ fn parse_container_log_chunk(
     AppContainerLogsChunk {
         logs: lines.join("\n"),
         next_since_unix_ms,
+    }
+}
+
+fn advance_since_cursor(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (current, next) {
+        (Some(existing), Some(candidate)) => Some(existing.max(candidate)),
+        (None, Some(candidate)) => Some(candidate),
+        (Some(existing), None) => Some(existing),
+        (None, None) => None,
     }
 }
 
@@ -9004,9 +9013,10 @@ async fn stream_app_container_logs(
                     let mut request_for_stream = request_state
                         .lock()
                         .expect("container logs request state mutex poisoned");
-                    request_for_stream.since_unix_ms = chunk
-                        .next_since_unix_ms
-                        .or(request_for_stream.since_unix_ms);
+                    request_for_stream.since_unix_ms = advance_since_cursor(
+                        request_for_stream.since_unix_ms,
+                        chunk.next_since_unix_ms,
+                    );
                     request_for_stream.tail = None;
                 }
 
@@ -12253,12 +12263,19 @@ mod tests {
     }
 
     #[test]
-    fn parse_container_log_chunk_uses_fallback_cursor_when_no_lines_match() {
+    fn parse_container_log_chunk_advances_cursor_even_for_non_matching_lines() {
         let chunk = parse_container_log_chunk(
-            b"2026-03-03T10:00:00.123456789Z boot complete\n",
-            Some("missing"),
+            b"2026-03-03T10:00:00.123456789Z health ok\n2026-03-03T10:00:01.000000000Z boot complete\n",
+            Some("health"),
             Some(1234),
         );
+        assert_eq!(chunk.logs, "2026-03-03T10:00:00.123456789Z health ok");
+        assert_eq!(chunk.next_since_unix_ms, Some(1_772_532_001_000));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_uses_fallback_cursor_when_no_timestamps_parse() {
+        let chunk = parse_container_log_chunk(b"boot complete\n", Some("missing"), Some(1234));
         assert!(chunk.logs.is_empty());
         assert_eq!(chunk.next_since_unix_ms, Some(1234));
     }
@@ -12281,6 +12298,15 @@ mod tests {
         let status =
             map_container_log_error(anyhow::anyhow!("container disappeared while reading logs"));
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn advance_since_cursor_is_monotonic() {
+        assert_eq!(advance_since_cursor(Some(100), Some(120)), Some(120));
+        assert_eq!(advance_since_cursor(Some(120), Some(100)), Some(120));
+        assert_eq!(advance_since_cursor(None, Some(100)), Some(100));
+        assert_eq!(advance_since_cursor(Some(100), None), Some(100));
+        assert_eq!(advance_since_cursor(None, None), None);
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@
   - `GET /api/v1/apps/{app_id}/containers/{container_id}/logs/stream`
   - `GET /api/v1/apps/{app_id}/containers/{container_id}/logs/download`
 - Container logs now support reconnect-safe `since` cursors, optional `until` windows, case-insensitive text filtering (`contains`), bounded tail defaults/caps, and download-friendly plain-text responses while preserving original line whitespace in API payloads.
+- Container logs cursor advancement now remains monotonic and advances from parsed timestamps even when filtered lines are not returned, avoiding repeated scans/replay loops with `contains` filters.
 - Live container log streams now emit one reset frame on transient poll failures and suppress repeated failure events until a successful recovery read.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.

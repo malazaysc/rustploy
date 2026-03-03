@@ -58,6 +58,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container log cursor advancement no longer adds `+1ms` after reads, avoiding potential skips when multiple log entries share the same millisecond timestamp.
 - Container log parsing now preserves line whitespace in returned payloads (except trailing `\\r` normalization).
 - Container log SSE polling now emits a single `reset` event on first poll failure and suppresses repeated failure noise until recovery.
+- Container log cursor advancement now incorporates parsed timestamps from non-matching lines and stream cursor updates are monotonic, preventing replay loops when `contains` filters are active.
 
 ### Added
 
