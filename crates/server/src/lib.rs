@@ -3994,21 +3994,29 @@ async fn inspect_containers_by_id(
     if container_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let mut args = vec!["inspect".to_string()];
+    let mut inspected = Vec::new();
     for container_id in container_ids {
-        args.push(container_id.clone());
-    }
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let output = run_docker_command_output(&arg_refs, timeout)
-        .await
-        .context("failed executing docker inspect for project containers")?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        anyhow::bail!("docker inspect failed for project containers: {stderr}");
-    }
+        let args = ["inspect", container_id.as_str()];
+        let output = run_docker_command_output(&args, timeout)
+            .await
+            .with_context(|| {
+                format!("failed executing docker inspect for container {container_id}")
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .to_ascii_lowercase();
+            if stderr.contains("no such object") {
+                continue;
+            }
+            anyhow::bail!("docker inspect failed for container {container_id}: {stderr}");
+        }
 
-    serde_json::from_slice::<Vec<DockerInspectContainer>>(&output.stdout)
-        .context("failed parsing docker inspect output")
+        let mut decoded = serde_json::from_slice::<Vec<DockerInspectContainer>>(&output.stdout)
+            .with_context(|| format!("failed parsing docker inspect output for {container_id}"))?;
+        inspected.append(&mut decoded);
+    }
+    Ok(inspected)
 }
 
 async fn run_docker_command_output(
@@ -4055,12 +4063,7 @@ fn map_inspected_container_to_runtime(container: DockerInspectContainer) -> AppC
     let created_at = normalize_docker_timestamp(&container.created);
     let restart_count = container.state.restart_count;
     let health = extract_container_health(container.state.health);
-    let command = container
-        .config
-        .cmd
-        .into_iter()
-        .map(|arg| sanitize_container_command_arg(&arg))
-        .collect::<Vec<_>>();
+    let command = sanitize_container_command(container.config.cmd);
     let labels = container
         .config
         .labels
@@ -4162,6 +4165,40 @@ fn sanitize_container_command_arg(arg: &str) -> String {
         return "[REDACTED]".to_string();
     }
     arg.to_string()
+}
+
+fn sanitize_container_command(args: Vec<String>) -> Vec<String> {
+    const SENSITIVE_FLAGS: &[&str] = &[
+        "--password",
+        "--pass",
+        "--passwd",
+        "-p",
+        "--token",
+        "--api-key",
+        "--access-token",
+        "--secret",
+        "--client-secret",
+    ];
+
+    let mut masked = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            masked.push("[REDACTED]".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        let normalized = arg.trim().to_ascii_lowercase();
+        if SENSITIVE_FLAGS.iter().any(|flag| normalized == *flag) {
+            masked.push(arg);
+            redact_next = true;
+            continue;
+        }
+
+        masked.push(sanitize_container_command_arg(&arg));
+    }
+    masked
 }
 
 fn parse_container_env_var(raw_entry: String) -> Option<AppContainerEnvVar> {
@@ -11432,6 +11469,8 @@ mod tests {
                     "node".to_string(),
                     "server.js".to_string(),
                     "--password=s3cr3t".to_string(),
+                    "--token".to_string(),
+                    "abc123".to_string(),
                     "postgres://user:pass@db:5432/app".to_string(),
                 ],
                 env: vec![
@@ -11538,6 +11577,16 @@ mod tests {
             .command
             .iter()
             .any(|value| value == "--password=[REDACTED]"));
+        let token_flag_index = runtime
+            .details
+            .command
+            .iter()
+            .position(|value| value == "--token")
+            .expect("token flag should be preserved");
+        assert_eq!(
+            runtime.details.command.get(token_flag_index + 1),
+            Some(&"[REDACTED]".to_string())
+        );
         assert!(runtime
             .details
             .command
