@@ -76,6 +76,9 @@ const MAX_CADDY_ACCESS_LOG_READ_BYTES_PER_POLL: u64 = 4 * 1024 * 1024;
 const DEFAULT_CADDY_HOST_LOOKUP_CACHE_MS: u64 = 30_000;
 const DEFAULT_TELEMETRY_RETENTION_SWEEP_MS: u64 = 60 * 60 * 1000;
 const TCP_ENDPOINT_PROBE_CONCURRENCY_LIMIT: usize = 16;
+const DEFAULT_CONTAINER_LOG_TAIL: u32 = 2_000;
+const DEFAULT_CONTAINER_STREAM_TAIL: u32 = 200;
+const MAX_CONTAINER_LOG_TAIL: u32 = 10_000;
 const CONTROL_PLANE_HOST: &str = "localhost";
 const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
 const GLOBAL_TRAFFIC_SCOPE: &str = "__global__";
@@ -4027,11 +4030,21 @@ fn normalize_container_logs_query(
     }
 
     let contains = query.contains.and_then(to_non_empty);
+    let tail = query
+        .tail
+        .map(|value| value.min(MAX_CONTAINER_LOG_TAIL))
+        .or_else(|| {
+            if query.since.is_none() {
+                Some(DEFAULT_CONTAINER_LOG_TAIL)
+            } else {
+                None
+            }
+        });
 
     Ok(AppContainerLogsRequest {
         since_unix_ms: query.since,
         until_unix_ms: query.until,
-        tail: query.tail,
+        tail,
         contains,
     })
 }
@@ -4039,9 +4052,10 @@ fn normalize_container_logs_query(
 fn app_container_stream_request(
     query: AppContainerLogsQuery,
 ) -> Result<AppContainerLogsRequest, StatusCode> {
+    let use_stream_default_tail = query.since.is_none() && query.tail.is_none();
     let mut request = normalize_container_logs_query(query)?;
-    if request.since_unix_ms.is_none() && request.tail.is_none() {
-        request.tail = Some(200);
+    if use_stream_default_tail {
+        request.tail = Some(DEFAULT_CONTAINER_STREAM_TAIL);
     }
     Ok(request)
 }
@@ -4158,6 +4172,18 @@ async fn load_container_log_chunk(
         request.contains.as_deref(),
         Some(started_at_unix_ms.saturating_add(1)),
     ))
+}
+
+fn map_container_log_error(error: anyhow::Error) -> StatusCode {
+    if error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("container disappeared while reading logs")
+    {
+        StatusCode::NOT_FOUND
+    } else {
+        internal_error(error)
+    }
 }
 
 fn sanitize_download_filename_component(raw: &str) -> String {
@@ -8831,7 +8857,7 @@ async fn get_app_container_logs(
         resolve_app_container_runtime(&state, app_id, &container_id).await?;
     let chunk = load_container_log_chunk(&runtime.details.id, &request, Duration::from_secs(8))
         .await
-        .map_err(internal_error)?;
+        .map_err(map_container_log_error)?;
 
     Ok(Json(AppContainerLogsResponse {
         app_id,
@@ -8860,7 +8886,7 @@ async fn download_app_container_logs(
         resolve_app_container_runtime(&state, app_id, &container_id).await?;
     let chunk = load_container_log_chunk(&runtime.details.id, &request, Duration::from_secs(8))
         .await
-        .map_err(internal_error)?;
+        .map_err(map_container_log_error)?;
     let filename = format!(
         "{}-logs.txt",
         sanitize_download_filename_component(&runtime.details.name)
@@ -12166,6 +12192,27 @@ mod tests {
     }
 
     #[test]
+    fn normalize_container_logs_query_applies_safe_tail_defaults() {
+        let defaulted = normalize_container_logs_query(AppContainerLogsQuery {
+            since: None,
+            until: None,
+            tail: None,
+            contains: None,
+        })
+        .unwrap();
+        assert_eq!(defaulted.tail, Some(DEFAULT_CONTAINER_LOG_TAIL));
+
+        let capped = normalize_container_logs_query(AppContainerLogsQuery {
+            since: None,
+            until: None,
+            tail: Some(MAX_CONTAINER_LOG_TAIL + 500),
+            contains: None,
+        })
+        .unwrap();
+        assert_eq!(capped.tail, Some(MAX_CONTAINER_LOG_TAIL));
+    }
+
+    #[test]
     fn parse_container_log_chunk_tracks_cursor_and_filters_text() {
         let stdout = b"2026-03-03T10:00:00.123456789Z boot complete\n2026-03-03T10:00:01.000000000Z health ok\n";
         let chunk = parse_container_log_chunk(stdout, Some("health"), None);
@@ -12185,6 +12232,13 @@ mod tests {
         );
         assert!(chunk.logs.is_empty());
         assert_eq!(chunk.next_since_unix_ms, Some(1234));
+    }
+
+    #[test]
+    fn map_container_log_error_returns_not_found_for_disappeared_container() {
+        let status =
+            map_container_log_error(anyhow::anyhow!("container disappeared while reading logs"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

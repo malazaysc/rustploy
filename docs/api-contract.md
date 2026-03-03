@@ -176,12 +176,14 @@ Response includes:
 - Query parameters:
   - `since` (optional unix ms cursor)
   - `until` (optional unix ms upper bound)
-  - `tail` (optional line count, typically used when `since` is not provided)
+  - `tail` (optional line count, defaults to `2000` when `since` is omitted; capped at `10000`)
   - `contains` (optional case-insensitive substring filter)
 - Response includes:
   - `logs` (newline-delimited text)
   - `next_since_unix_ms` cursor for reconnect/incremental follow-up requests
 - Invalid ranges (`since > until`) return `400 Bad Request`.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.
 
 `GET /apps/{app_id}/containers/{container_id}/logs/stream` emits `event: logs` SSE frames with JSON payload:
 
@@ -198,5 +200,9 @@ Response includes:
 - `tail` defaults to `200` on initial stream requests when `since` is omitted.
 - `reset` is `true` on initial stream snapshots so clients can replace stale output.
 - Reconnect clients should pass `next_since_unix_ms` back as `since` to continue without major gaps.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.
 
 `GET /apps/{app_id}/containers/{container_id}/logs/download` returns plain-text logs as an attachment and supports the same filter/range query parameters.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.

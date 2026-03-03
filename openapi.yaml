@@ -1406,7 +1406,9 @@ paths:
           schema:
             type: integer
             minimum: 0
-          description: Number of latest lines to include when `since` is not supplied.
+            maximum: 10000
+            default: 2000
+          description: Number of latest lines to include when `since` is not supplied (capped at 10000).
         - name: contains
           in: query
           required: false
@@ -1466,6 +1468,8 @@ paths:
           schema:
             type: integer
             minimum: 0
+            maximum: 10000
+            default: 200
           description: Initial tail size; defaults to `200` when no `since` is supplied.
         - name: contains
           in: query
@@ -1533,6 +1537,8 @@ paths:
           schema:
             type: integer
             minimum: 0
+            maximum: 10000
+            default: 2000
         - name: contains
           in: query
           required: false
