@@ -20,6 +20,9 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
 - Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
 - CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
+- Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
+- Runtime container command metadata now sanitizes secret-like `key=value` arguments and credential-bearing URL arguments before returning API payloads.
+- Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
 
 ### Fixed
 
@@ -46,6 +49,9 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Caddy access-log ingestion now caps per-poll file reads to limit peak memory usage when backlog accumulates.
 - Dashboard telemetry error handling now clears stale stat/chart/gauge visuals so old values are not shown as current during API failures.
 - Managed-service reachability probes now run with bounded concurrency to reduce dashboard metrics latency as endpoint counts grow.
+- Container-inventory Docker inspect parsing now tolerates explicit `null` collection fields (`Cmd`, `Env`, `Labels`, `ExposedPorts`, `Ports`, `Networks`, `Mounts`) instead of failing deserialization.
+- App container inventory handlers now run Docker CLI inspection in a blocking task with a timeout, preventing async request-worker stalls when Docker is slow/unresponsive.
+- Container detail healthcheck `last_output` now redacts credential-bearing URL patterns and secret-like `KEY=value` fragments before returning API responses.
 
 ### Added
 
@@ -85,3 +91,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - SQLite telemetry persistence for dashboard widgets (`agent_resource_samples`, `request_traffic_buckets`) with retention pruning.
 - Caddy JSON access-log emission/ingestion path for request traffic aggregation (`RUSTPLOY_CADDY_ACCESS_LOG_PATH`).
 - App runtime probe endpoint (`GET /api/v1/apps/:id/runtime`) and dashboard routing-card integration to show live runtime online/offline state independent of deployment history.
+- App runtime container inventory endpoints:
+  - `GET /api/v1/apps/:id/containers` for project-scoped container summaries (status, ports, image, restart count, health).
+  - `GET /api/v1/apps/:id/containers/:container_id` for detailed container metadata (labels, mounts, networks, exposed ports, masked env vars).

@@ -27,6 +27,9 @@ Base path: `/api/v1` (metrics endpoint is additionally exposed at `/metrics`).
 - Dashboard telemetry: `GET /dashboard/metrics`
 - Apps/import: `POST /apps/import`, `GET /apps`, `POST /apps`
 - App runtime probe: `GET /apps/{app_id}/runtime`
+- App container inventory:
+  - `GET /apps/{app_id}/containers`
+  - `GET /apps/{app_id}/containers/{container_id}`
 - Effective config: `GET /apps/{app_id}/config`
 - Env vars: `GET/PUT /apps/{app_id}/env`, `DELETE /apps/{app_id}/env/{key}`
 - Domains: `GET/POST /apps/{app_id}/domains`
@@ -140,3 +143,25 @@ Response includes:
 - `upstream_host`, `upstream_port`: current runtime endpoint (nullable when unconfigured)
 - `deployment_id`: deployment currently bound to runtime route (nullable when unconfigured)
 - `checked_at_unix_ms`: probe timestamp
+
+## App container inventory endpoints
+
+`GET /apps/{app_id}/containers` returns project-scoped runtime container summaries:
+
+- `project_name`: compose project identifier used for container discovery
+- `items[]` per container:
+  - `id`, `name`, optional `service_name`
+  - `status` (`running`, `restarting`, `paused`, `exited`, `dead`, `unhealthy`, `unknown`)
+  - `started_at`, `restart_count`, `image`
+  - `port_mappings[]` (`container_port`, `protocol`, optional `host_ip`, optional `host_port`)
+  - optional `health` (`status`, `last_output`)
+
+`GET /apps/{app_id}/containers/{container_id}` returns detailed metadata for one runtime container:
+
+- Summary fields above plus:
+  - `created_at`, `command[]`, `labels{}` map
+  - `exposed_ports[]`
+  - `networks[]` (`network_name`, optional `ip_address`, `gateway`, `mac_address`)
+  - `mounts[]` (`mount_type`, optional `source`, `destination`, `mode`, `read_only`)
+  - `env[]` entries include `masked` flag; sensitive values are always redacted
+- If `container_id` is an ambiguous prefix that matches multiple containers, response is `409 Conflict`.

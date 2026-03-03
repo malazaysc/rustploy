@@ -82,6 +82,210 @@ components:
         checked_at_unix_ms:
           type: integer
           format: int64
+    AppContainerPortMapping:
+      type: object
+      required: [container_port, protocol, host_ip, host_port]
+      properties:
+        container_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        protocol:
+          type: string
+        host_ip:
+          type: [string, 'null']
+        host_port:
+          type: [integer, 'null']
+          minimum: 1
+          maximum: 65535
+    AppContainerHealth:
+      type: object
+      required: [status, last_output]
+      properties:
+        status:
+          type: string
+        last_output:
+          type: [string, 'null']
+    AppContainerSummary:
+      type: object
+      required:
+        - id
+        - name
+        - service_name
+        - image
+        - status
+        - started_at
+        - restart_count
+        - port_mappings
+        - health
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        service_name:
+          type: [string, 'null']
+        image:
+          type: string
+        status:
+          type: string
+          enum: [running, restarting, paused, exited, dead, unhealthy, unknown]
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        restart_count:
+          type: integer
+          minimum: 0
+        port_mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerPortMapping'
+        health:
+          oneOf:
+            - $ref: '#/components/schemas/AppContainerHealth'
+            - type: 'null'
+    AppContainerListResponse:
+      type: object
+      required: [app_id, project_name, items]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        project_name:
+          type: string
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerSummary'
+    AppContainerExposedPort:
+      type: object
+      required: [container_port, protocol]
+      properties:
+        container_port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        protocol:
+          type: string
+    AppContainerNetworkAttachment:
+      type: object
+      required: [network_name, ip_address, gateway, mac_address]
+      properties:
+        network_name:
+          type: string
+        ip_address:
+          type: [string, 'null']
+        gateway:
+          type: [string, 'null']
+        mac_address:
+          type: [string, 'null']
+    AppContainerMount:
+      type: object
+      required: [mount_type, source, destination, mode, read_only]
+      properties:
+        mount_type:
+          type: string
+        source:
+          type: [string, 'null']
+        destination:
+          type: string
+        mode:
+          type: string
+        read_only:
+          type: boolean
+    AppContainerEnvVar:
+      type: object
+      required: [key, value, masked]
+      properties:
+        key:
+          type: string
+        value:
+          type: string
+        masked:
+          type: boolean
+    AppContainerDetails:
+      type: object
+      required:
+        - id
+        - name
+        - service_name
+        - image
+        - status
+        - started_at
+        - created_at
+        - restart_count
+        - command
+        - labels
+        - port_mappings
+        - exposed_ports
+        - networks
+        - mounts
+        - env
+        - health
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        service_name:
+          type: [string, 'null']
+        image:
+          type: string
+        status:
+          type: string
+          enum: [running, restarting, paused, exited, dead, unhealthy, unknown]
+        started_at:
+          type: [string, 'null']
+          format: date-time
+        created_at:
+          type: [string, 'null']
+          format: date-time
+        restart_count:
+          type: integer
+          minimum: 0
+        command:
+          type: array
+          items:
+            type: string
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        port_mappings:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerPortMapping'
+        exposed_ports:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerExposedPort'
+        networks:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerNetworkAttachment'
+        mounts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerMount'
+        env:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppContainerEnvVar'
+        health:
+          oneOf:
+            - $ref: '#/components/schemas/AppContainerHealth'
+            - type: 'null'
+    AppContainerDetailsResponse:
+      type: object
+      required: [app_id, project_name, container]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        project_name:
+          type: string
+        container:
+          $ref: '#/components/schemas/AppContainerDetails'
     CreateDeploymentRequest:
       type: object
       properties:
@@ -1079,6 +1283,59 @@ paths:
                 $ref: '#/components/schemas/AppRuntimeHealthResponse'
         '404':
           description: App not found
+  /apps/{app_id}/containers:
+    get:
+      summary: List runtime containers for app compose project
+      operationId: listAppContainers
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Container inventory for app project
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppContainerListResponse'
+        '404':
+          description: App not found
+  /apps/{app_id}/containers/{container_id}:
+    get:
+      summary: Get detailed runtime container metadata for app compose project
+      operationId: getAppContainerDetails
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: container_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Container details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppContainerDetailsResponse'
+        '409':
+          description: Container selector is ambiguous and matches multiple containers
+        '404':
+          description: App or container not found
   /apps/{app_id}/config:
     get:
       summary: Get effective import/build configuration for app

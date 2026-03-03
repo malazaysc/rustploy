@@ -26,18 +26,22 @@ use sha2::{Digest, Sha256};
 use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered,
     AgentResourceSnapshot, AgentStatus, AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse,
-    AppEnvVarListResponse, AppEnvVarSummary, AppListResponse, AppRuntimeHealthResponse, AppSummary,
-    AuthLoginRequest, AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
-    CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
-    CreateTokenResponse, DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary,
-    DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
-    DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
-    EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
-    GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
-    NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
+    AppContainerDetails, AppContainerDetailsResponse, AppContainerEnvVar, AppContainerExposedPort,
+    AppContainerHealth, AppContainerListResponse, AppContainerMount, AppContainerNetworkAttachment,
+    AppContainerPortMapping, AppContainerSummary, AppEnvVarListResponse, AppEnvVarSummary,
+    AppListResponse, AppRuntimeHealthResponse, AppSummary, AuthLoginRequest, AuthSessionResponse,
+    ComposeServiceSummary, ComposeSummary, CreateAppRequest, CreateDeploymentAccepted,
+    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
+    DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary, DependencyProfile,
+    DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus, DeploymentSummary,
+    DetectionResult, DomainListResponse, DomainSummary, EffectiveAppConfigResponse,
+    GithubConnectRequest, GithubIntegrationSummary, GithubWebhookAccepted, HealthResponse,
+    HeartbeatAccepted, ImportAppRequest, ImportAppResponse, NextAction,
+    PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
     PasswordResetRequestedResponse, RepositoryRef, RequestTrafficPoint, ServerResourcePoint,
     SourceRef, TokenListResponse, TokenSummary, UpsertAppEnvVarRequest,
 };
+use tokio::process::Command as TokioCommand;
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -382,6 +386,138 @@ struct GithubRepository {
 #[derive(Debug, Deserialize)]
 struct GithubOwner {
     login: String,
+}
+
+#[derive(Debug)]
+struct AppContainerRuntime {
+    summary: AppContainerSummary,
+    details: AppContainerDetails,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectContainer {
+    #[serde(rename = "Id", default)]
+    id: String,
+    #[serde(rename = "Name", default)]
+    name: String,
+    #[serde(rename = "Created", default)]
+    created: String,
+    #[serde(rename = "Config", default)]
+    config: DockerInspectConfig,
+    #[serde(rename = "State", default)]
+    state: DockerInspectState,
+    #[serde(rename = "NetworkSettings", default)]
+    network_settings: DockerInspectNetworkSettings,
+    #[serde(
+        rename = "Mounts",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    mounts: Vec<DockerInspectMount>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectConfig {
+    #[serde(rename = "Image", default)]
+    image: String,
+    #[serde(rename = "Cmd", default, deserialize_with = "deserialize_null_default")]
+    cmd: Vec<String>,
+    #[serde(rename = "Env", default, deserialize_with = "deserialize_null_default")]
+    env: Vec<String>,
+    #[serde(
+        rename = "Labels",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    labels: HashMap<String, String>,
+    #[serde(
+        rename = "ExposedPorts",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    exposed_ports: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectState {
+    #[serde(rename = "Status", default)]
+    status: String,
+    #[serde(rename = "StartedAt", default)]
+    started_at: String,
+    #[serde(rename = "RestartCount", default)]
+    restart_count: u64,
+    #[serde(rename = "Health", default)]
+    health: Option<DockerInspectHealth>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectHealth {
+    #[serde(rename = "Status", default)]
+    status: String,
+    #[serde(rename = "Log", default, deserialize_with = "deserialize_null_default")]
+    log: Vec<DockerInspectHealthLog>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectHealthLog {
+    #[serde(rename = "Output", default)]
+    output: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectNetworkSettings {
+    #[serde(
+        rename = "Ports",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    ports: HashMap<String, Option<Vec<DockerInspectPortBinding>>>,
+    #[serde(
+        rename = "Networks",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
+    networks: HashMap<String, DockerInspectNetworkAttachment>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectPortBinding {
+    #[serde(rename = "HostIp", default)]
+    host_ip: String,
+    #[serde(rename = "HostPort", default)]
+    host_port: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectNetworkAttachment {
+    #[serde(rename = "IPAddress", default)]
+    ip_address: String,
+    #[serde(rename = "Gateway", default)]
+    gateway: String,
+    #[serde(rename = "MacAddress", default)]
+    mac_address: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DockerInspectMount {
+    #[serde(rename = "Type", default)]
+    mount_type: String,
+    #[serde(rename = "Source")]
+    source: Option<String>,
+    #[serde(rename = "Destination", default)]
+    destination: String,
+    #[serde(rename = "Mode", default)]
+    mode: String,
+    #[serde(rename = "RW", default)]
+    rw: bool,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl AppState {
@@ -3779,6 +3915,538 @@ fn format_bucket_label(bucket_ms: u64) -> &'static str {
     }
 }
 
+fn project_name_for_app(db: &Database, app_id: Uuid) -> Result<(String, bool)> {
+    if let Some(route) = db.app_runtime_route(app_id)? {
+        let project_name = route.project_name.trim();
+        if !project_name.is_empty() {
+            return Ok((project_name.to_string(), true));
+        }
+    }
+    Ok((compose_project_name(app_id), false))
+}
+
+async fn load_project_container_runtimes_with_timeout(
+    project_name: String,
+) -> Result<Vec<AppContainerRuntime>> {
+    let command_timeout = Duration::from_secs(5);
+    let total_timeout = Duration::from_secs(15);
+    let mut items = tokio::time::timeout(total_timeout, async {
+        let container_ids = list_project_container_ids(&project_name, command_timeout).await?;
+        if container_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let items = inspect_containers_by_id(&container_ids, command_timeout)
+            .await?
+            .into_iter()
+            .map(map_inspected_container_to_runtime)
+            .collect::<Vec<_>>();
+        Ok::<Vec<AppContainerRuntime>, anyhow::Error>(items)
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "container runtime inspection timed out after {} seconds",
+            total_timeout.as_secs()
+        )
+    })??;
+    items.sort_by(|a, b| a.summary.name.cmp(&b.summary.name));
+    Ok(items)
+}
+
+fn select_requested_container_details(
+    items: Vec<AppContainerRuntime>,
+    requested: &str,
+) -> std::result::Result<AppContainerDetails, StatusCode> {
+    let mut matches = items
+        .into_iter()
+        .map(|item| item.details)
+        .filter(|details| container_matches_request(details, requested));
+    let selected = matches.next().ok_or(StatusCode::NOT_FOUND)?;
+    if matches.next().is_some() {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(selected)
+}
+
+async fn list_project_container_ids(project_name: &str, timeout: Duration) -> Result<Vec<String>> {
+    if project_name.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let filter = format!("label=com.docker.compose.project={project_name}");
+    let output = run_docker_command_output(
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            filter.as_str(),
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout,
+    )
+    .await
+    .context("failed listing project containers with docker ps")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!("docker ps failed while listing project containers: {stderr}");
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>())
+}
+
+async fn inspect_containers_by_id(
+    container_ids: &[String],
+    timeout: Duration,
+) -> Result<Vec<DockerInspectContainer>> {
+    if container_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut inspected = Vec::new();
+    for container_id in container_ids {
+        let args = ["inspect", container_id.as_str()];
+        let output = run_docker_command_output(&args, timeout)
+            .await
+            .with_context(|| {
+                format!("failed executing docker inspect for container {container_id}")
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr)
+                .trim()
+                .to_ascii_lowercase();
+            if stderr.contains("no such object") {
+                continue;
+            }
+            anyhow::bail!("docker inspect failed for container {container_id}: {stderr}");
+        }
+
+        let mut decoded = serde_json::from_slice::<Vec<DockerInspectContainer>>(&output.stdout)
+            .with_context(|| format!("failed parsing docker inspect output for {container_id}"))?;
+        inspected.append(&mut decoded);
+    }
+    Ok(inspected)
+}
+
+async fn run_docker_command_output(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = TokioCommand::new("docker");
+    command.kill_on_drop(true);
+    for arg in args {
+        command.arg(arg);
+    }
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .with_context(|| {
+            format!(
+                "docker command timed out after {} seconds: docker {}",
+                timeout.as_secs(),
+                args.join(" ")
+            )
+        })?
+        .context("failed executing docker command")?;
+    Ok(output)
+}
+
+fn map_inspected_container_to_runtime(container: DockerInspectContainer) -> AppContainerRuntime {
+    let service_name = container
+        .config
+        .labels
+        .get("com.docker.compose.service")
+        .cloned()
+        .filter(|value| !value.trim().is_empty());
+    let id = container.id;
+    let name = normalize_container_name(&container.name, &id);
+    let image = container.config.image;
+    let status = resolve_container_status(
+        &container.state.status,
+        container
+            .state
+            .health
+            .as_ref()
+            .map(|health| health.status.as_str()),
+    );
+    let started_at = normalize_docker_timestamp(&container.state.started_at);
+    let created_at = normalize_docker_timestamp(&container.created);
+    let restart_count = container.state.restart_count;
+    let health = extract_container_health(container.state.health);
+    let command = sanitize_container_command(container.config.cmd);
+    let labels = container
+        .config
+        .labels
+        .into_iter()
+        .collect::<BTreeMap<String, String>>();
+    let mut port_mappings = extract_container_port_mappings(&container.network_settings.ports);
+    let exposed_ports = extract_container_exposed_ports(&container.config.exposed_ports);
+    for exposed_port in &exposed_ports {
+        let exists = port_mappings.iter().any(|mapping| {
+            mapping.container_port == exposed_port.container_port
+                && mapping.protocol == exposed_port.protocol
+        });
+        if !exists {
+            port_mappings.push(AppContainerPortMapping {
+                container_port: exposed_port.container_port,
+                protocol: exposed_port.protocol.clone(),
+                host_ip: None,
+                host_port: None,
+            });
+        }
+    }
+    port_mappings.sort_by(|a, b| {
+        a.container_port
+            .cmp(&b.container_port)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+            .then_with(|| a.host_port.cmp(&b.host_port))
+    });
+    let mut networks = container
+        .network_settings
+        .networks
+        .into_iter()
+        .map(|(network_name, network)| AppContainerNetworkAttachment {
+            network_name,
+            ip_address: to_non_empty(network.ip_address),
+            gateway: to_non_empty(network.gateway),
+            mac_address: to_non_empty(network.mac_address),
+        })
+        .collect::<Vec<_>>();
+    networks.sort_by(|a, b| a.network_name.cmp(&b.network_name));
+    let mut mounts = container
+        .mounts
+        .into_iter()
+        .map(|mount| AppContainerMount {
+            mount_type: mount.mount_type,
+            source: mount.source.and_then(to_non_empty),
+            destination: mount.destination,
+            mode: mount.mode,
+            read_only: !mount.rw,
+        })
+        .collect::<Vec<_>>();
+    mounts.sort_by(|a, b| a.destination.cmp(&b.destination));
+    let mut env = container
+        .config
+        .env
+        .into_iter()
+        .filter_map(parse_container_env_var)
+        .collect::<Vec<_>>();
+    env.sort_by(|a, b| a.key.cmp(&b.key));
+
+    let summary = AppContainerSummary {
+        id: id.clone(),
+        name: name.clone(),
+        service_name: service_name.clone(),
+        image: image.clone(),
+        status: status.clone(),
+        started_at: started_at.clone(),
+        restart_count,
+        port_mappings: port_mappings.clone(),
+        health: health.clone(),
+    };
+    let details = AppContainerDetails {
+        id,
+        name,
+        service_name,
+        image,
+        status,
+        started_at,
+        created_at,
+        restart_count,
+        command,
+        labels,
+        port_mappings,
+        exposed_ports,
+        networks,
+        mounts,
+        env,
+        health,
+    };
+    AppContainerRuntime { summary, details }
+}
+
+fn sanitize_container_command_arg(arg: &str) -> String {
+    if let Some((key, _value)) = arg.split_once('=') {
+        if should_mask_env_value(key) {
+            return format!("{key}=[REDACTED]");
+        }
+    }
+    if arg.contains("://") && arg.contains('@') {
+        return "[REDACTED]".to_string();
+    }
+    arg.to_string()
+}
+
+fn sanitize_container_command(args: Vec<String>) -> Vec<String> {
+    const SENSITIVE_FLAGS: &[&str] = &[
+        "--password",
+        "--pass",
+        "--passwd",
+        "-p",
+        "--token",
+        "--api-key",
+        "--access-token",
+        "--secret",
+        "--client-secret",
+    ];
+
+    let mut masked = Vec::with_capacity(args.len());
+    let mut redact_next = false;
+    for arg in args {
+        if redact_next {
+            masked.push("[REDACTED]".to_string());
+            redact_next = false;
+            continue;
+        }
+
+        let normalized = arg.trim().to_ascii_lowercase();
+        if SENSITIVE_FLAGS.iter().any(|flag| normalized == *flag) {
+            masked.push(arg);
+            redact_next = true;
+            continue;
+        }
+
+        masked.push(sanitize_container_command_arg(&arg));
+    }
+    masked
+}
+
+fn parse_container_env_var(raw_entry: String) -> Option<AppContainerEnvVar> {
+    let raw = raw_entry.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let (key, value) = match raw.split_once('=') {
+        Some((key, value)) => (key.trim(), value),
+        None => (raw, ""),
+    };
+    if key.is_empty() {
+        return None;
+    }
+    let masked = should_mask_env_value(key);
+    Some(AppContainerEnvVar {
+        key: key.to_string(),
+        value: if masked {
+            "[REDACTED]".to_string()
+        } else {
+            value.to_string()
+        },
+        masked,
+    })
+}
+
+fn should_mask_env_value(key: &str) -> bool {
+    let normalized = key.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return false;
+    }
+    const SECRET_HINTS: &[&str] = &[
+        "SECRET",
+        "TOKEN",
+        "PASSWORD",
+        "PASS",
+        "PWD",
+        "PRIVATE",
+        "API_KEY",
+        "ACCESS_KEY",
+        "CREDENTIAL",
+        "SESSION_KEY",
+    ];
+    if SECRET_HINTS.iter().any(|hint| normalized.contains(hint)) {
+        return true;
+    }
+    if normalized.ends_with("_URL")
+        && (normalized.contains("DATABASE")
+            || normalized.contains("POSTGRES")
+            || normalized.contains("MYSQL")
+            || normalized.contains("MONGO")
+            || normalized.contains("REDIS")
+            || normalized.contains("AMQP")
+            || normalized.contains("RABBIT"))
+    {
+        return true;
+    }
+    false
+}
+
+fn extract_container_health(health: Option<DockerInspectHealth>) -> Option<AppContainerHealth> {
+    let health = health?;
+    let status = health.status.trim().to_ascii_lowercase();
+    if status.is_empty() {
+        return None;
+    }
+    let last_output = health
+        .log
+        .iter()
+        .rev()
+        .find_map(|entry| sanitize_health_output(&entry.output));
+    Some(AppContainerHealth {
+        status,
+        last_output,
+    })
+}
+
+fn sanitize_health_output(raw: &str) -> Option<String> {
+    let value = to_non_empty(raw.to_string())?;
+    if value.contains("://") && value.contains('@') {
+        return Some("[REDACTED]".to_string());
+    }
+    if value.split_whitespace().any(|token| {
+        token
+            .split_once('=')
+            .is_some_and(|(key, _)| should_mask_env_value(key))
+    }) {
+        return Some("[REDACTED]".to_string());
+    }
+    Some(value)
+}
+
+fn extract_container_port_mappings(
+    ports: &HashMap<String, Option<Vec<DockerInspectPortBinding>>>,
+) -> Vec<AppContainerPortMapping> {
+    let mut mappings = Vec::new();
+    for (container_spec, bindings) in ports {
+        let Some((container_port, protocol)) = parse_container_port_spec(container_spec) else {
+            continue;
+        };
+        if let Some(bindings) = bindings {
+            if bindings.is_empty() {
+                mappings.push(AppContainerPortMapping {
+                    container_port,
+                    protocol: protocol.clone(),
+                    host_ip: None,
+                    host_port: None,
+                });
+                continue;
+            }
+            for binding in bindings {
+                mappings.push(AppContainerPortMapping {
+                    container_port,
+                    protocol: protocol.clone(),
+                    host_ip: to_non_empty(binding.host_ip.clone()),
+                    host_port: binding
+                        .host_port
+                        .trim()
+                        .parse::<u16>()
+                        .ok()
+                        .filter(|port| *port > 0),
+                });
+            }
+            continue;
+        }
+        mappings.push(AppContainerPortMapping {
+            container_port,
+            protocol,
+            host_ip: None,
+            host_port: None,
+        });
+    }
+    mappings
+}
+
+fn extract_container_exposed_ports(
+    exposed_ports: &HashMap<String, serde_json::Value>,
+) -> Vec<AppContainerExposedPort> {
+    let mut items = exposed_ports
+        .keys()
+        .filter_map(|raw| parse_container_port_spec(raw))
+        .map(|(container_port, protocol)| AppContainerExposedPort {
+            container_port,
+            protocol,
+        })
+        .collect::<Vec<_>>();
+    items.sort_by(|a, b| {
+        a.container_port
+            .cmp(&b.container_port)
+            .then_with(|| a.protocol.cmp(&b.protocol))
+    });
+    items
+}
+
+fn parse_container_port_spec(raw: &str) -> Option<(u16, String)> {
+    let (port_raw, protocol_raw) = match raw.split_once('/') {
+        Some((port, protocol)) => (port.trim(), protocol.trim()),
+        None => (raw.trim(), "tcp"),
+    };
+    let container_port = port_raw.parse::<u16>().ok()?;
+    let protocol = if protocol_raw.is_empty() {
+        "tcp".to_string()
+    } else {
+        protocol_raw.to_ascii_lowercase()
+    };
+    Some((container_port, protocol))
+}
+
+fn resolve_container_status(state_status: &str, health_status: Option<&str>) -> String {
+    if health_status
+        .map(str::trim)
+        .is_some_and(|value| value.eq_ignore_ascii_case("unhealthy"))
+    {
+        return "unhealthy".to_string();
+    }
+    let normalized = state_status.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        "unknown".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_container_name(raw_name: &str, container_id: &str) -> String {
+    let normalized = raw_name.trim().trim_start_matches('/').to_string();
+    if normalized.is_empty() {
+        container_id.chars().take(12).collect::<String>()
+    } else {
+        normalized
+    }
+}
+
+fn normalize_docker_timestamp(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with("0001-01-01") {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn to_non_empty(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn container_matches_request(details: &AppContainerDetails, requested: &str) -> bool {
+    let needle = requested
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    if needle.is_empty() {
+        return false;
+    }
+    let id = details.id.to_ascii_lowercase();
+    if id == needle || id.starts_with(&needle) {
+        return true;
+    }
+    let name = details
+        .name
+        .trim()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+    if name == needle {
+        return true;
+    }
+    details
+        .service_name
+        .as_deref()
+        .map(|service| service.eq_ignore_ascii_case(&needle))
+        .unwrap_or(false)
+}
+
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -3802,6 +4470,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/v1/apps", get(list_apps).post(create_app))
         .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
         .route("/api/v1/apps/:app_id/runtime", get(get_app_runtime_health))
+        .route("/api/v1/apps/:app_id/containers", get(list_app_containers))
+        .route(
+            "/api/v1/apps/:app_id/containers/:container_id",
+            get(get_app_container_details),
+        )
         .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
         .route(
             "/api/v1/apps/:app_id/env",
@@ -7857,6 +8530,83 @@ async fn get_app_runtime_health(
     Ok(Json(response))
 }
 
+async fn list_app_containers(
+    AxumPath(app_id): AxumPath<Uuid>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AppContainerListResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/containers",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let (project_name, runtime_configured) =
+        project_name_for_app(&state.db, app_id).map_err(internal_error)?;
+    let items = if runtime_configured {
+        load_project_container_runtimes_with_timeout(project_name.clone())
+            .await
+            .map_err(internal_error)?
+    } else {
+        Vec::new()
+    };
+    let summaries = items
+        .into_iter()
+        .map(|item| item.summary)
+        .collect::<Vec<_>>();
+
+    Ok(Json(AppContainerListResponse {
+        app_id,
+        project_name,
+        items: summaries,
+    }))
+}
+
+async fn get_app_container_details(
+    AxumPath((app_id, container_id)): AxumPath<(Uuid, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AppContainerDetailsResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/containers/:container_id",
+    )?;
+
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let (project_name, runtime_configured) =
+        project_name_for_app(&state.db, app_id).map_err(internal_error)?;
+    if !runtime_configured {
+        return Err(StatusCode::NOT_FOUND);
+    }
+    let items = load_project_container_runtimes_with_timeout(project_name.clone())
+        .await
+        .map_err(internal_error)?;
+    let requested = container_id.trim();
+    if requested.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let container = select_requested_container_details(items, requested)?;
+
+    Ok(Json(AppContainerDetailsResponse {
+        app_id,
+        project_name,
+        container,
+    }))
+}
+
 async fn connect_github_repo(
     AxumPath(app_id): AxumPath<Uuid>,
     State(state): State<AppState>,
@@ -10733,6 +11483,251 @@ mod tests {
         assert_eq!(normalize_host_value("   "), None);
     }
 
+    #[test]
+    fn map_inspected_container_masks_secret_env_and_tracks_ports() {
+        let container = DockerInspectContainer {
+            id: "0123456789abcdef".to_string(),
+            name: "/runtime-web-1".to_string(),
+            created: "2026-03-02T00:00:00Z".to_string(),
+            config: DockerInspectConfig {
+                image: "ghcr.io/acme/web:latest".to_string(),
+                cmd: vec![
+                    "node".to_string(),
+                    "server.js".to_string(),
+                    "--password=s3cr3t".to_string(),
+                    "--token".to_string(),
+                    "abc123".to_string(),
+                    "postgres://user:pass@db:5432/app".to_string(),
+                ],
+                env: vec![
+                    "PORT=3000".to_string(),
+                    "DATABASE_URL=postgres://secret".to_string(),
+                ],
+                labels: HashMap::from([
+                    ("com.docker.compose.service".to_string(), "web".to_string()),
+                    (
+                        "com.docker.compose.project".to_string(),
+                        "rustploy-0123456789ab".to_string(),
+                    ),
+                ]),
+                exposed_ports: HashMap::from([
+                    (
+                        "3000/tcp".to_string(),
+                        serde_json::Value::Object(Default::default()),
+                    ),
+                    (
+                        "3001/tcp".to_string(),
+                        serde_json::Value::Object(Default::default()),
+                    ),
+                ]),
+            },
+            state: DockerInspectState {
+                status: "running".to_string(),
+                started_at: "2026-03-02T01:00:00Z".to_string(),
+                restart_count: 2,
+                health: Some(DockerInspectHealth {
+                    status: "unhealthy".to_string(),
+                    log: vec![DockerInspectHealthLog {
+                        output: "probe failed".to_string(),
+                    }],
+                }),
+            },
+            network_settings: DockerInspectNetworkSettings {
+                ports: HashMap::from([(
+                    "3000/tcp".to_string(),
+                    Some(vec![DockerInspectPortBinding {
+                        host_ip: "0.0.0.0".to_string(),
+                        host_port: "32790".to_string(),
+                    }]),
+                )]),
+                networks: HashMap::from([(
+                    "runtime_default".to_string(),
+                    DockerInspectNetworkAttachment {
+                        ip_address: "172.19.0.3".to_string(),
+                        gateway: "172.19.0.1".to_string(),
+                        mac_address: "02:42:ac:13:00:03".to_string(),
+                    },
+                )]),
+            },
+            mounts: vec![DockerInspectMount {
+                mount_type: "volume".to_string(),
+                source: Some("runtime-data".to_string()),
+                destination: "/data".to_string(),
+                mode: "z".to_string(),
+                rw: true,
+            }],
+        };
+
+        let runtime = map_inspected_container_to_runtime(container);
+        assert_eq!(runtime.summary.name, "runtime-web-1");
+        assert_eq!(runtime.summary.service_name.as_deref(), Some("web"));
+        assert_eq!(runtime.summary.status, "unhealthy");
+        assert_eq!(runtime.summary.restart_count, 2);
+        assert_eq!(runtime.summary.port_mappings.len(), 2);
+        assert!(runtime
+            .summary
+            .port_mappings
+            .iter()
+            .any(|mapping| mapping.container_port == 3000 && mapping.host_port == Some(32790)));
+        assert!(runtime
+            .summary
+            .port_mappings
+            .iter()
+            .any(|mapping| mapping.container_port == 3001 && mapping.host_port.is_none()));
+        let env = runtime
+            .details
+            .env
+            .iter()
+            .find(|env| env.key == "DATABASE_URL")
+            .unwrap();
+        assert!(env.masked);
+        assert_eq!(env.value, "[REDACTED]");
+        assert_eq!(
+            runtime
+                .details
+                .health
+                .as_ref()
+                .map(|value| value.status.as_str()),
+            Some("unhealthy")
+        );
+        assert_eq!(
+            runtime
+                .details
+                .health
+                .as_ref()
+                .and_then(|value| value.last_output.as_deref()),
+            Some("probe failed")
+        );
+        assert!(runtime
+            .details
+            .command
+            .iter()
+            .any(|value| value == "--password=[REDACTED]"));
+        let token_flag_index = runtime
+            .details
+            .command
+            .iter()
+            .position(|value| value == "--token")
+            .expect("token flag should be preserved");
+        assert_eq!(
+            runtime.details.command.get(token_flag_index + 1),
+            Some(&"[REDACTED]".to_string())
+        );
+        assert!(runtime
+            .details
+            .command
+            .iter()
+            .any(|value| value == "[REDACTED]"));
+    }
+
+    #[test]
+    fn docker_inspect_allows_explicit_null_collection_fields() {
+        let payload = json!([{
+            "Id": "abc",
+            "Name": "/demo",
+            "Created": "2026-03-02T00:00:00Z",
+            "Config": {
+                "Image": "nginx:latest",
+                "Cmd": null,
+                "Env": null,
+                "Labels": null,
+                "ExposedPorts": null
+            },
+            "State": {
+                "Status": "running",
+                "StartedAt": "2026-03-02T01:00:00Z",
+                "RestartCount": 0,
+                "Health": {
+                    "Status": "healthy",
+                    "Log": null
+                }
+            },
+            "NetworkSettings": {
+                "Ports": null,
+                "Networks": null
+            },
+            "Mounts": null
+        }]);
+
+        let decoded: Vec<DockerInspectContainer> = serde_json::from_value(payload).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].config.cmd.is_empty());
+        assert!(decoded[0].config.env.is_empty());
+        assert!(decoded[0].config.labels.is_empty());
+        assert!(decoded[0].config.exposed_ports.is_empty());
+        assert!(decoded[0].network_settings.ports.is_empty());
+        assert!(decoded[0].network_settings.networks.is_empty());
+        assert!(decoded[0].mounts.is_empty());
+        assert!(decoded[0]
+            .state
+            .health
+            .as_ref()
+            .is_some_and(|health| health.log.is_empty()));
+    }
+
+    #[test]
+    fn sanitize_health_output_masks_credentials_and_secret_pairs() {
+        assert_eq!(
+            sanitize_health_output("postgres://user:pass@db:5432/app"),
+            Some("[REDACTED]".to_string())
+        );
+        assert_eq!(
+            sanitize_health_output("TOKEN=abc123 probe failed"),
+            Some("[REDACTED]".to_string())
+        );
+        assert_eq!(
+            sanitize_health_output("probe failed"),
+            Some("probe failed".to_string())
+        );
+    }
+
+    fn test_runtime_container(
+        id: &str,
+        name: &str,
+        service_name: Option<&str>,
+    ) -> AppContainerRuntime {
+        let summary = AppContainerSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            service_name: service_name.map(ToString::to_string),
+            image: "nginx:latest".to_string(),
+            status: "running".to_string(),
+            started_at: Some("2026-03-02T01:00:00Z".to_string()),
+            restart_count: 0,
+            port_mappings: Vec::new(),
+            health: None,
+        };
+        let details = AppContainerDetails {
+            id: id.to_string(),
+            name: name.to_string(),
+            service_name: service_name.map(ToString::to_string),
+            image: "nginx:latest".to_string(),
+            status: "running".to_string(),
+            started_at: Some("2026-03-02T01:00:00Z".to_string()),
+            created_at: Some("2026-03-02T00:00:00Z".to_string()),
+            restart_count: 0,
+            command: vec!["nginx".to_string()],
+            labels: BTreeMap::new(),
+            port_mappings: Vec::new(),
+            exposed_ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+            health: None,
+        };
+        AppContainerRuntime { summary, details }
+    }
+
+    #[test]
+    fn select_requested_container_details_returns_conflict_when_ambiguous() {
+        let items = vec![
+            test_runtime_container("abc123000000", "web-a", Some("web")),
+            test_runtime_container("abc123999999", "web-b", Some("web")),
+        ];
+        let selected = select_requested_container_details(items, "abc123");
+        assert_eq!(selected.unwrap_err(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn managed_service_reachability_counts_live_tcp_endpoints() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -10781,6 +11776,66 @@ mod tests {
         let payload: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(payload["configured"], json!(false));
         assert_eq!(payload["reachable"], json!(false));
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_containers_list_returns_empty_when_runtime_not_configured() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("containers-empty", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/apps/{}/containers", app_row.id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["items"], json!([]));
+        assert_eq!(
+            payload["project_name"],
+            json!(compose_project_name(app_row.id))
+        );
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_container_details_returns_not_found_when_runtime_not_configured() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("containers-missing-detail", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{}/containers/unknown-container",
+                        app_row.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         cleanup_db(&db_path);
     }
