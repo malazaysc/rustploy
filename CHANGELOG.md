@@ -21,6 +21,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
 - CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
 - Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
+- Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
 
 ### Fixed
 
@@ -47,6 +48,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Caddy access-log ingestion now caps per-poll file reads to limit peak memory usage when backlog accumulates.
 - Dashboard telemetry error handling now clears stale stat/chart/gauge visuals so old values are not shown as current during API failures.
 - Managed-service reachability probes now run with bounded concurrency to reduce dashboard metrics latency as endpoint counts grow.
+- Container-inventory Docker inspect parsing now tolerates explicit `null` collection fields (`Cmd`, `Env`, `Labels`, `ExposedPorts`, `Ports`, `Networks`, `Mounts`) instead of failing deserialization.
+- App container inventory handlers now run Docker CLI inspection in a blocking task with a timeout, preventing async request-worker stalls when Docker is slow/unresponsive.
 
 ### Added
 

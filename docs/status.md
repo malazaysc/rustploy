@@ -21,6 +21,7 @@
 - Dashboard stat-card and routing-copy labels now distinguish deployment history from current runtime liveness to avoid "healthy but offline" confusion.
 - Added `GET /api/v1/apps/{app_id}/runtime` runtime probe and wired dashboard routing panel to display live runtime online/offline state separately from deployment history.
 - Added project-scoped container inventory APIs (`GET /api/v1/apps/{app_id}/containers` and `GET /api/v1/apps/{app_id}/containers/{container_id}`) to expose runtime container status, port mappings, and detailed metadata with secret env-value masking.
+- Container inventory internals now tolerate explicit `null` collection fields from `docker inspect`, execute Docker CLI queries on blocking workers with request timeouts, and return `409` for ambiguous container-id prefix lookups.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.

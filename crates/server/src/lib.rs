@@ -407,7 +407,11 @@ struct DockerInspectContainer {
     state: DockerInspectState,
     #[serde(rename = "NetworkSettings", default)]
     network_settings: DockerInspectNetworkSettings,
-    #[serde(rename = "Mounts", default)]
+    #[serde(
+        rename = "Mounts",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     mounts: Vec<DockerInspectMount>,
 }
 
@@ -415,13 +419,21 @@ struct DockerInspectContainer {
 struct DockerInspectConfig {
     #[serde(rename = "Image", default)]
     image: String,
-    #[serde(rename = "Cmd", default)]
+    #[serde(rename = "Cmd", default, deserialize_with = "deserialize_null_default")]
     cmd: Vec<String>,
-    #[serde(rename = "Env", default)]
+    #[serde(rename = "Env", default, deserialize_with = "deserialize_null_default")]
     env: Vec<String>,
-    #[serde(rename = "Labels", default)]
+    #[serde(
+        rename = "Labels",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     labels: HashMap<String, String>,
-    #[serde(rename = "ExposedPorts", default)]
+    #[serde(
+        rename = "ExposedPorts",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     exposed_ports: HashMap<String, serde_json::Value>,
 }
 
@@ -441,7 +453,7 @@ struct DockerInspectState {
 struct DockerInspectHealth {
     #[serde(rename = "Status", default)]
     status: String,
-    #[serde(rename = "Log", default)]
+    #[serde(rename = "Log", default, deserialize_with = "deserialize_null_default")]
     log: Vec<DockerInspectHealthLog>,
 }
 
@@ -453,9 +465,17 @@ struct DockerInspectHealthLog {
 
 #[derive(Debug, Deserialize, Default)]
 struct DockerInspectNetworkSettings {
-    #[serde(rename = "Ports", default)]
+    #[serde(
+        rename = "Ports",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     ports: HashMap<String, Option<Vec<DockerInspectPortBinding>>>,
-    #[serde(rename = "Networks", default)]
+    #[serde(
+        rename = "Networks",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     networks: HashMap<String, DockerInspectNetworkAttachment>,
 }
 
@@ -489,6 +509,14 @@ struct DockerInspectMount {
     mode: String,
     #[serde(rename = "RW", default)]
     rw: bool,
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 impl AppState {
@@ -3896,6 +3924,23 @@ fn project_name_for_app(db: &Database, app_id: Uuid) -> Result<(String, bool)> {
     Ok((compose_project_name(app_id), false))
 }
 
+async fn load_project_container_runtimes_with_timeout(
+    project_name: String,
+) -> Result<Vec<AppContainerRuntime>> {
+    let timeout = Duration::from_secs(5);
+    let worker =
+        tokio::task::spawn_blocking(move || load_project_container_runtimes(&project_name));
+    match tokio::time::timeout(timeout, worker).await {
+        Ok(joined) => joined
+            .context("container inventory worker task failed")?
+            .context("failed loading project container runtime details"),
+        Err(_) => anyhow::bail!(
+            "container runtime inspection timed out after {} seconds",
+            timeout.as_secs()
+        ),
+    }
+}
+
 fn load_project_container_runtimes(project_name: &str) -> Result<Vec<AppContainerRuntime>> {
     let container_ids = list_project_container_ids(project_name)?;
     if container_ids.is_empty() {
@@ -3908,6 +3953,21 @@ fn load_project_container_runtimes(project_name: &str) -> Result<Vec<AppContaine
         .collect::<Vec<_>>();
     items.sort_by(|a, b| a.summary.name.cmp(&b.summary.name));
     Ok(items)
+}
+
+fn select_requested_container_details(
+    items: Vec<AppContainerRuntime>,
+    requested: &str,
+) -> std::result::Result<AppContainerDetails, StatusCode> {
+    let mut matches = items
+        .into_iter()
+        .map(|item| item.details)
+        .filter(|details| container_matches_request(details, requested));
+    let selected = matches.next().ok_or(StatusCode::NOT_FOUND)?;
+    if matches.next().is_some() {
+        return Err(StatusCode::CONFLICT);
+    }
+    Ok(selected)
 }
 
 fn list_project_container_ids(project_name: &str) -> Result<Vec<String>> {
@@ -8394,7 +8454,9 @@ async fn list_app_containers(
     let (project_name, runtime_configured) =
         project_name_for_app(&state.db, app_id).map_err(internal_error)?;
     let items = if runtime_configured {
-        load_project_container_runtimes(&project_name).map_err(internal_error)?
+        load_project_container_runtimes_with_timeout(project_name.clone())
+            .await
+            .map_err(internal_error)?
     } else {
         Vec::new()
     };
@@ -8432,17 +8494,15 @@ async fn get_app_container_details(
     if !runtime_configured {
         return Err(StatusCode::NOT_FOUND);
     }
-    let items = load_project_container_runtimes(&project_name).map_err(internal_error)?;
+    let items = load_project_container_runtimes_with_timeout(project_name.clone())
+        .await
+        .map_err(internal_error)?;
     let requested = container_id.trim();
     if requested.is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
 
-    let container = items
-        .into_iter()
-        .map(|item| item.details)
-        .find(|details| container_matches_request(details, requested))
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let container = select_requested_container_details(items, requested)?;
 
     Ok(Json(AppContainerDetailsResponse {
         app_id,
@@ -11435,6 +11495,98 @@ mod tests {
                 .and_then(|value| value.last_output.as_deref()),
             Some("probe failed")
         );
+    }
+
+    #[test]
+    fn docker_inspect_allows_explicit_null_collection_fields() {
+        let payload = json!([{
+            "Id": "abc",
+            "Name": "/demo",
+            "Created": "2026-03-02T00:00:00Z",
+            "Config": {
+                "Image": "nginx:latest",
+                "Cmd": null,
+                "Env": null,
+                "Labels": null,
+                "ExposedPorts": null
+            },
+            "State": {
+                "Status": "running",
+                "StartedAt": "2026-03-02T01:00:00Z",
+                "RestartCount": 0,
+                "Health": {
+                    "Status": "healthy",
+                    "Log": null
+                }
+            },
+            "NetworkSettings": {
+                "Ports": null,
+                "Networks": null
+            },
+            "Mounts": null
+        }]);
+
+        let decoded: Vec<DockerInspectContainer> = serde_json::from_value(payload).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert!(decoded[0].config.cmd.is_empty());
+        assert!(decoded[0].config.env.is_empty());
+        assert!(decoded[0].config.labels.is_empty());
+        assert!(decoded[0].config.exposed_ports.is_empty());
+        assert!(decoded[0].network_settings.ports.is_empty());
+        assert!(decoded[0].network_settings.networks.is_empty());
+        assert!(decoded[0].mounts.is_empty());
+        assert!(decoded[0]
+            .state
+            .health
+            .as_ref()
+            .is_some_and(|health| health.log.is_empty()));
+    }
+
+    fn test_runtime_container(
+        id: &str,
+        name: &str,
+        service_name: Option<&str>,
+    ) -> AppContainerRuntime {
+        let summary = AppContainerSummary {
+            id: id.to_string(),
+            name: name.to_string(),
+            service_name: service_name.map(ToString::to_string),
+            image: "nginx:latest".to_string(),
+            status: "running".to_string(),
+            started_at: Some("2026-03-02T01:00:00Z".to_string()),
+            restart_count: 0,
+            port_mappings: Vec::new(),
+            health: None,
+        };
+        let details = AppContainerDetails {
+            id: id.to_string(),
+            name: name.to_string(),
+            service_name: service_name.map(ToString::to_string),
+            image: "nginx:latest".to_string(),
+            status: "running".to_string(),
+            started_at: Some("2026-03-02T01:00:00Z".to_string()),
+            created_at: Some("2026-03-02T00:00:00Z".to_string()),
+            restart_count: 0,
+            command: vec!["nginx".to_string()],
+            labels: BTreeMap::new(),
+            port_mappings: Vec::new(),
+            exposed_ports: Vec::new(),
+            networks: Vec::new(),
+            mounts: Vec::new(),
+            env: Vec::new(),
+            health: None,
+        };
+        AppContainerRuntime { summary, details }
+    }
+
+    #[test]
+    fn select_requested_container_details_returns_conflict_when_ambiguous() {
+        let items = vec![
+            test_runtime_container("abc123000000", "web-a", Some("web")),
+            test_runtime_container("abc123999999", "web-b", Some("web")),
+        ];
+        let selected = select_requested_container_details(items, "abc123");
+        assert_eq!(selected.unwrap_err(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

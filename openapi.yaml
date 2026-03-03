@@ -1332,6 +1332,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppContainerDetailsResponse'
+        '409':
+          description: Container selector is ambiguous and matches multiple containers
         '404':
           description: App or container not found
   /apps/{app_id}/config:

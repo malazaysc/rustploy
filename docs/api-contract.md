@@ -164,3 +164,4 @@ Response includes:
   - `networks[]` (`network_name`, optional `ip_address`, `gateway`, `mac_address`)
   - `mounts[]` (`mount_type`, optional `source`, `destination`, `mode`, `read_only`)
   - `env[]` entries include `masked` flag; sensitive values are always redacted
+- If `container_id` is an ambiguous prefix that matches multiple containers, response is `409 Conflict`.
