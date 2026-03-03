@@ -35,6 +35,8 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - `GET /api/v1/apps`
 - `POST /api/v1/apps/{app_id}/github`
 - `GET /api/v1/apps/{app_id}/runtime`
+- `GET /api/v1/apps/{app_id}/containers`
+- `GET /api/v1/apps/{app_id}/containers/{container_id}`
 - `GET /api/v1/apps/{app_id}/config`
 - `GET /api/v1/apps/{app_id}/env`
 - `PUT /api/v1/apps/{app_id}/env`
@@ -72,6 +74,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Request Traffic no-data messaging now renders via a dashboard HTML overlay (instead of SVG text), with no changes to `/api/v1/dashboard/metrics` request/response fields.
 - Dashboard summary `managed_services_healthy` now reflects currently reachable managed-service TCP endpoints (for rows marked healthy), rather than a raw count of stored managed-service records.
 - App runtime probe endpoint (`GET /api/v1/apps/{app_id}/runtime`) reports whether an app currently has a configured runtime upstream and whether that upstream is reachable via TCP.
+- App container inventory endpoints (`GET /api/v1/apps/{app_id}/containers`, `GET /api/v1/apps/{app_id}/containers/{container_id}`) expose compose-project runtime metadata (status, ports, health, network/mount details) with sensitive env values redacted.
 - Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
 - Agent heartbeat ingestion treats resource-snapshot persistence as best-effort: the API still returns `202 Accepted` when telemetry writes fail, and failures are logged server-side.

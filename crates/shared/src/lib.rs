@@ -116,6 +116,97 @@ pub struct AppRuntimeHealthResponse {
     pub checked_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerPortMapping {
+    pub container_port: u16,
+    pub protocol: String,
+    pub host_ip: Option<String>,
+    pub host_port: Option<u16>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerHealth {
+    pub status: String,
+    pub last_output: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerSummary {
+    pub id: String,
+    pub name: String,
+    pub service_name: Option<String>,
+    pub image: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub restart_count: u64,
+    pub port_mappings: Vec<AppContainerPortMapping>,
+    pub health: Option<AppContainerHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerListResponse {
+    pub app_id: Uuid,
+    pub project_name: String,
+    pub items: Vec<AppContainerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerExposedPort {
+    pub container_port: u16,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerNetworkAttachment {
+    pub network_name: String,
+    pub ip_address: Option<String>,
+    pub gateway: Option<String>,
+    pub mac_address: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerMount {
+    pub mount_type: String,
+    pub source: Option<String>,
+    pub destination: String,
+    pub mode: String,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerEnvVar {
+    pub key: String,
+    pub value: String,
+    pub masked: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerDetails {
+    pub id: String,
+    pub name: String,
+    pub service_name: Option<String>,
+    pub image: String,
+    pub status: String,
+    pub started_at: Option<String>,
+    pub created_at: Option<String>,
+    pub restart_count: u64,
+    pub command: Vec<String>,
+    pub labels: std::collections::BTreeMap<String, String>,
+    pub port_mappings: Vec<AppContainerPortMapping>,
+    pub exposed_ports: Vec<AppContainerExposedPort>,
+    pub networks: Vec<AppContainerNetworkAttachment>,
+    pub mounts: Vec<AppContainerMount>,
+    pub env: Vec<AppContainerEnvVar>,
+    pub health: Option<AppContainerHealth>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerDetailsResponse {
+    pub app_id: Uuid,
+    pub project_name: String,
+    pub container: AppContainerDetails,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
     pub source_ref: Option<String>,
@@ -644,6 +735,64 @@ mod tests {
         );
         let decoded: AppRuntimeHealthResponse =
             serde_json::from_value(encoded).expect("deserialize runtime health");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn app_container_list_response_json_shape_roundtrip() {
+        let app_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let response = AppContainerListResponse {
+            app_id,
+            project_name: "rustploy-444444444444".to_string(),
+            items: vec![AppContainerSummary {
+                id: "abc123".to_string(),
+                name: "web".to_string(),
+                service_name: Some("web".to_string()),
+                image: "nginx:1.27".to_string(),
+                status: "running".to_string(),
+                started_at: Some("2026-03-02T20:20:20Z".to_string()),
+                restart_count: 1,
+                port_mappings: vec![AppContainerPortMapping {
+                    container_port: 80,
+                    protocol: "tcp".to_string(),
+                    host_ip: Some("0.0.0.0".to_string()),
+                    host_port: Some(32768),
+                }],
+                health: Some(AppContainerHealth {
+                    status: "healthy".to_string(),
+                    last_output: Some("ok".to_string()),
+                }),
+            }],
+        };
+        let encoded = serde_json::to_value(&response).expect("serialize container list");
+        assert_eq!(
+            encoded,
+            json!({
+                "app_id": "44444444-4444-4444-4444-444444444444",
+                "project_name": "rustploy-444444444444",
+                "items": [{
+                    "id": "abc123",
+                    "name": "web",
+                    "service_name": "web",
+                    "image": "nginx:1.27",
+                    "status": "running",
+                    "started_at": "2026-03-02T20:20:20Z",
+                    "restart_count": 1,
+                    "port_mappings": [{
+                        "container_port": 80,
+                        "protocol": "tcp",
+                        "host_ip": "0.0.0.0",
+                        "host_port": 32768
+                    }],
+                    "health": {
+                        "status": "healthy",
+                        "last_output": "ok"
+                    }
+                }]
+            })
+        );
+        let decoded: AppContainerListResponse =
+            serde_json::from_value(encoded).expect("deserialize container list");
         assert_eq!(decoded, response);
     }
 }

@@ -20,6 +20,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Agent heartbeats now optionally include host resource telemetry fields while remaining backward compatible with legacy payloads.
 - Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
 - CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
+- Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
 
 ### Fixed
 
@@ -85,3 +86,6 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - SQLite telemetry persistence for dashboard widgets (`agent_resource_samples`, `request_traffic_buckets`) with retention pruning.
 - Caddy JSON access-log emission/ingestion path for request traffic aggregation (`RUSTPLOY_CADDY_ACCESS_LOG_PATH`).
 - App runtime probe endpoint (`GET /api/v1/apps/:id/runtime`) and dashboard routing-card integration to show live runtime online/offline state independent of deployment history.
+- App runtime container inventory endpoints:
+  - `GET /api/v1/apps/:id/containers` for project-scoped container summaries (status, ports, image, restart count, health).
+  - `GET /api/v1/apps/:id/containers/:container_id` for detailed container metadata (labels, mounts, networks, exposed ports, masked env vars).
