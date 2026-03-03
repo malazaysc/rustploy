@@ -141,9 +141,9 @@ components:
           items:
             $ref: '#/components/schemas/AppContainerPortMapping'
         health:
-          type: [object, 'null']
-          allOf:
+          oneOf:
             - $ref: '#/components/schemas/AppContainerHealth'
+            - type: 'null'
     AppContainerListResponse:
       type: object
       required: [app_id, project_name, items]
@@ -272,9 +272,9 @@ components:
           items:
             $ref: '#/components/schemas/AppContainerEnvVar'
         health:
-          type: [object, 'null']
-          allOf:
+          oneOf:
             - $ref: '#/components/schemas/AppContainerHealth'
+            - type: 'null'
     AppContainerDetailsResponse:
       type: object
       required: [app_id, project_name, container]

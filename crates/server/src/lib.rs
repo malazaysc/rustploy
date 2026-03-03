@@ -41,6 +41,7 @@ use shared::{
     PasswordResetRequestedResponse, RepositoryRef, RequestTrafficPoint, ServerResourcePoint,
     SourceRef, TokenListResponse, TokenSummary, UpsertAppEnvVarRequest,
 };
+use tokio::process::Command as TokioCommand;
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -3928,26 +3929,12 @@ async fn load_project_container_runtimes_with_timeout(
     project_name: String,
 ) -> Result<Vec<AppContainerRuntime>> {
     let timeout = Duration::from_secs(5);
-    let worker =
-        tokio::task::spawn_blocking(move || load_project_container_runtimes(&project_name));
-    match tokio::time::timeout(timeout, worker).await {
-        Ok(joined) => joined
-            .context("container inventory worker task failed")?
-            .context("failed loading project container runtime details"),
-        Err(_) => anyhow::bail!(
-            "container runtime inspection timed out after {} seconds",
-            timeout.as_secs()
-        ),
-    }
-}
-
-fn load_project_container_runtimes(project_name: &str) -> Result<Vec<AppContainerRuntime>> {
-    let container_ids = list_project_container_ids(project_name)?;
+    let container_ids = list_project_container_ids(&project_name, timeout).await?;
     if container_ids.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut items = inspect_containers_by_id(&container_ids)?
+    let mut items = inspect_containers_by_id(&container_ids, timeout)
+        .await?
         .into_iter()
         .map(map_inspected_container_to_runtime)
         .collect::<Vec<_>>();
@@ -3970,19 +3957,24 @@ fn select_requested_container_details(
     Ok(selected)
 }
 
-fn list_project_container_ids(project_name: &str) -> Result<Vec<String>> {
+async fn list_project_container_ids(project_name: &str, timeout: Duration) -> Result<Vec<String>> {
     if project_name.trim().is_empty() {
         return Ok(Vec::new());
     }
-    let output = Command::new("docker")
-        .arg("ps")
-        .arg("-a")
-        .arg("--filter")
-        .arg(format!("label=com.docker.compose.project={project_name}"))
-        .arg("--format")
-        .arg("{{.ID}}")
-        .output()
-        .context("failed listing project containers with docker ps")?;
+    let filter = format!("label=com.docker.compose.project={project_name}");
+    let output = run_docker_command_output(
+        &[
+            "ps",
+            "-a",
+            "--filter",
+            filter.as_str(),
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout,
+    )
+    .await
+    .context("failed listing project containers with docker ps")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         anyhow::bail!("docker ps failed while listing project containers: {stderr}");
@@ -3995,18 +3987,20 @@ fn list_project_container_ids(project_name: &str) -> Result<Vec<String>> {
         .collect::<Vec<_>>())
 }
 
-fn inspect_containers_by_id(container_ids: &[String]) -> Result<Vec<DockerInspectContainer>> {
+async fn inspect_containers_by_id(
+    container_ids: &[String],
+    timeout: Duration,
+) -> Result<Vec<DockerInspectContainer>> {
     if container_ids.is_empty() {
         return Ok(Vec::new());
     }
-
-    let mut command = Command::new("docker");
-    command.arg("inspect");
+    let mut args = vec!["inspect".to_string()];
     for container_id in container_ids {
-        command.arg(container_id);
+        args.push(container_id.clone());
     }
-    let output = command
-        .output()
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_docker_command_output(&arg_refs, timeout)
+        .await
         .context("failed executing docker inspect for project containers")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -4015,6 +4009,28 @@ fn inspect_containers_by_id(container_ids: &[String]) -> Result<Vec<DockerInspec
 
     serde_json::from_slice::<Vec<DockerInspectContainer>>(&output.stdout)
         .context("failed parsing docker inspect output")
+}
+
+async fn run_docker_command_output(
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let mut command = TokioCommand::new("docker");
+    command.kill_on_drop(true);
+    for arg in args {
+        command.arg(arg);
+    }
+    let output = tokio::time::timeout(timeout, command.output())
+        .await
+        .with_context(|| {
+            format!(
+                "docker command timed out after {} seconds: docker {}",
+                timeout.as_secs(),
+                args.join(" ")
+            )
+        })?
+        .context("failed executing docker command")?;
+    Ok(output)
 }
 
 fn map_inspected_container_to_runtime(container: DockerInspectContainer) -> AppContainerRuntime {
@@ -4039,7 +4055,12 @@ fn map_inspected_container_to_runtime(container: DockerInspectContainer) -> AppC
     let created_at = normalize_docker_timestamp(&container.created);
     let restart_count = container.state.restart_count;
     let health = extract_container_health(container.state.health);
-    let command = container.config.cmd;
+    let command = container
+        .config
+        .cmd
+        .into_iter()
+        .map(|arg| sanitize_container_command_arg(&arg))
+        .collect::<Vec<_>>();
     let labels = container
         .config
         .labels
@@ -4129,6 +4150,18 @@ fn map_inspected_container_to_runtime(container: DockerInspectContainer) -> AppC
         health,
     };
     AppContainerRuntime { summary, details }
+}
+
+fn sanitize_container_command_arg(arg: &str) -> String {
+    if let Some((key, _value)) = arg.split_once('=') {
+        if should_mask_env_value(key) {
+            return format!("{key}=[REDACTED]");
+        }
+    }
+    if arg.contains("://") && arg.contains('@') {
+        return "[REDACTED]".to_string();
+    }
+    arg.to_string()
 }
 
 fn parse_container_env_var(raw_entry: String) -> Option<AppContainerEnvVar> {
@@ -11395,7 +11428,12 @@ mod tests {
             created: "2026-03-02T00:00:00Z".to_string(),
             config: DockerInspectConfig {
                 image: "ghcr.io/acme/web:latest".to_string(),
-                cmd: vec!["node".to_string(), "server.js".to_string()],
+                cmd: vec![
+                    "node".to_string(),
+                    "server.js".to_string(),
+                    "--password=s3cr3t".to_string(),
+                    "postgres://user:pass@db:5432/app".to_string(),
+                ],
                 env: vec![
                     "PORT=3000".to_string(),
                     "DATABASE_URL=postgres://secret".to_string(),
@@ -11495,6 +11533,16 @@ mod tests {
                 .and_then(|value| value.last_output.as_deref()),
             Some("probe failed")
         );
+        assert!(runtime
+            .details
+            .command
+            .iter()
+            .any(|value| value == "--password=[REDACTED]"));
+        assert!(runtime
+            .details
+            .command
+            .iter()
+            .any(|value| value == "[REDACTED]"));
     }
 
     #[test]

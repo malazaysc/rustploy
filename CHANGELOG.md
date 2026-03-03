@@ -21,6 +21,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Caddy telemetry ingestion now supports explicit enable/disable gating, offloads log file reads to Tokio blocking workers, and caches host lookup maps between poll cycles.
 - CI compatibility follow-up: replaced one clippy-flagged `map_or(false, ...)` usage with `is_some_and(...)` for newer stable toolchains.
 - Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
+- Runtime container command metadata now sanitizes secret-like `key=value` arguments and credential-bearing URL arguments before returning API payloads.
 - Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
 
 ### Fixed
