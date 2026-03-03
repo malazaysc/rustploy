@@ -81,6 +81,7 @@ The canonical OpenAPI source file is [`../openapi.yaml`](../openapi.yaml).
 - Container detail lookups return `409 Conflict` when a container selector is ambiguous (multiple matching containers).
 - Container log endpoints (`/api/v1/apps/{app_id}/containers/{container_id}/logs*`) support `since` cursor reads, optional `until` range bounds, case-insensitive `contains` filtering, SSE live streaming with reconnect cursors, and plain-text download responses.
 - Dashboard `Project Workspace -> Containers` tab now consumes the container inventory/detail/log APIs for a project-scoped runtime view (status table, details panel, filtered log reads, live tail reconnect, and download action) without introducing new wire contract fields.
+- Containers-tab client behavior now includes bounded live-log rendering and tab-aware polling guards while keeping the existing container API contract unchanged.
 - Agent heartbeat payloads may also include optional host resource fields (`cpu_percent`, memory/disk bytes, network RX/TX bytes), and older heartbeats without `resource` are still accepted.
 - Agent heartbeat `timestamp_unix_ms` is client-reported metadata; server persistence clamps it to receive time to prevent skewed telemetry samples.
 - Agent heartbeat ingestion treats resource-snapshot persistence as best-effort: the API still returns `202 Accepted` when telemetry writes fail, and failures are logged server-side.
