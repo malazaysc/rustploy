@@ -6577,8 +6577,22 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (containersTab) containersTab.classList.toggle('active', projectPanel === 'containers');
       if (routingPanel) routingPanel.classList.toggle('hidden', projectPanel !== 'routing');
       if (containersPanel) containersPanel.classList.toggle('hidden', projectPanel !== 'containers');
-      if (projectPanel === 'containers' && selectedApp) {
-        refreshContainers().catch(() => {});
+      if (projectPanel !== 'containers') {
+        stopContainerLogsStream({ preserveLiveFlag: true });
+        return;
+      }
+      if (selectedApp) {
+        refreshContainers()
+          .then(() => {
+            if (
+              selectedState.containerLogsLiveEnabled &&
+              selectedState.selectedContainerId &&
+              !containerLogsStream
+            ) {
+              openContainerLogsStream();
+            }
+          })
+          .catch(() => {});
       }
     }
 
@@ -6742,7 +6756,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
 
     function scheduleContainerLogsReconnect() {
-      if (!selectedState.containerLogsLiveEnabled || !selectedApp || !selectedState.selectedContainerId) {
+      if (
+        projectPanel !== 'containers' ||
+        !selectedState.containerLogsLiveEnabled ||
+        !selectedApp ||
+        !selectedState.selectedContainerId
+      ) {
         return;
       }
       if (containerLogsReconnectTimer) {
@@ -6772,6 +6791,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         if (selectedApp !== appAtStart || selectedState.selectedContainerId !== containerAtStart) {
           return;
         }
+        containerLogsReconnectAttempt = 0;
         let payload = null;
         try {
           payload = JSON.parse(event.data || '{}');

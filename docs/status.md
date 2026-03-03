@@ -35,6 +35,7 @@
   - logs viewer controls (contains filter, since/until range, live tail reconnect, and download),
   - automatic container refresh every 5 seconds plus manual refresh.
 - Containers-tab follow-up hardening now caps live-log `<pre>` growth, adds keyboard row selection (`Enter`/`Space`), and prevents overlapping background refresh calls when the tab is hidden.
+- Containers-tab stream lifecycle now tears down SSE and reconnect timers when switching away from `Containers`, and reconnect backoff resets after logs resume.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.

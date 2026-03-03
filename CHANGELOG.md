@@ -63,6 +63,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Containers-tab live log rendering now caps retained output length to avoid unbounded `<pre>` growth during long sessions.
 - Containers table rows are now keyboard-activatable (`Tab`, `Enter`, `Space`) for accessible container selection.
 - Containers auto-refresh polling now runs only while the `Containers` tab is visible and skips overlapping refreshes.
+- Containers live-log streaming now stops when leaving the `Containers` panel and reconnect backoff resets after successful log events.
 
 ### Added
 
