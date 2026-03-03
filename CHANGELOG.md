@@ -74,6 +74,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Containers table rows are now keyboard-activatable (`Tab`, `Enter`, `Space`) for accessible container selection.
 - Containers auto-refresh polling now runs only while the `Containers` tab is visible and skips overlapping refreshes.
 - Containers live-log streaming now stops when leaving the `Containers` panel and reconnect backoff resets after successful log events.
+- App list row rendering now uses DOM-safe node assembly and handler binding (instead of interpolated `innerHTML`/inline `onclick`) to prevent stored XSS from app names.
+- All-project containers refresh now uses bounded per-app request concurrency and skips background fan-out while the all-project panel is collapsed.
 
 ### Added
 

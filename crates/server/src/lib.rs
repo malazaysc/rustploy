@@ -6606,6 +6606,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let allContainersRequestSeq = 0;
     const CONTAINER_AUTO_REFRESH_INTERVAL_MS = 5000;
     const MAX_CONTAINER_LOG_OUTPUT_CHARS = 250000;
+    const ALL_CONTAINERS_FETCH_CONCURRENCY = 4;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -6681,6 +6682,24 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       if (!(panelKey in panelCollapsed)) return;
       panelCollapsed[panelKey] = !panelCollapsed[panelKey];
       applyPanelCollapsed(panelKey);
+    }
+
+    async function mapWithConcurrency(items, limit, worker) {
+      if (items.length === 0) return [];
+      const results = new Array(items.length);
+      let nextIndex = 0;
+      const workerCount = Math.max(1, Math.min(limit, items.length));
+      const runners = Array.from({ length: workerCount }, async () => {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= items.length) {
+            return;
+          }
+          results[index] = await worker(items[index], index);
+        }
+      });
+      await Promise.all(runners);
+      return results;
     }
 
     function switchProjectPanel(panel) {
@@ -7312,6 +7331,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
 
     async function refreshAllAppContainers({ manual = false, silent = true } = {}) {
+      if (panelCollapsed.allContainers && !manual) {
+        return;
+      }
       const apps = cachedApps.slice();
       if (apps.length === 0) {
         selectedState.allContainers = [];
@@ -7325,8 +7347,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
 
       try {
-        const grouped = await Promise.all(
-          apps.map(async (app) => {
+        const grouped = await mapWithConcurrency(
+          apps,
+          ALL_CONTAINERS_FETCH_CONCURRENCY,
+          async (app) => {
             try {
               const res = await api(`/api/v1/apps/${app.id}/containers`);
               const data = await res.json();
@@ -7344,7 +7368,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
                 error: error.message
               };
             }
-          })
+          }
         );
 
         if (requestSeq !== allContainersRequestSeq) {
@@ -8214,18 +8238,57 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         }
         const li = document.createElement('li');
         li.className = `item-row clickable-row ${selectedApp === app.id ? 'selected' : ''}`.trim();
-        li.innerHTML = `
-          <div class="item-main">
-            <strong>${app.name}</strong>
-            <code>${app.id}</code>
-          </div>
-          <div class="item-actions">
-            <button class="secondary" onclick="selectApp('${app.id}','${app.name}')">Select</button>
-            <button onclick="deploy('${app.id}')">Deploy</button>
-            <button class="secondary" onclick="resyncRebuild('${app.id}')">Resync & Rebuild</button>
-            <button class="secondary" onclick="rollback('${app.id}')">Rollback</button>
-          </div>
-        `;
+        const main = document.createElement('div');
+        main.className = 'item-main';
+        const appName = document.createElement('strong');
+        appName.textContent = app.name;
+        const appId = document.createElement('code');
+        appId.textContent = app.id;
+        main.appendChild(appName);
+        main.appendChild(appId);
+
+        const actions = document.createElement('div');
+        actions.className = 'item-actions';
+
+        const selectBtn = document.createElement('button');
+        selectBtn.className = 'secondary';
+        selectBtn.textContent = 'Select';
+        selectBtn.onclick = (event) => {
+          event.stopPropagation();
+          selectApp(app.id, app.name).catch((error) => {
+            setStatus(`Select app failed: ${error.message}`, 'err');
+          });
+        };
+
+        const deployBtn = document.createElement('button');
+        deployBtn.textContent = 'Deploy';
+        deployBtn.onclick = (event) => {
+          event.stopPropagation();
+          deploy(app.id);
+        };
+
+        const resyncBtn = document.createElement('button');
+        resyncBtn.className = 'secondary';
+        resyncBtn.textContent = 'Resync & Rebuild';
+        resyncBtn.onclick = (event) => {
+          event.stopPropagation();
+          resyncRebuild(app.id);
+        };
+
+        const rollbackBtn = document.createElement('button');
+        rollbackBtn.className = 'secondary';
+        rollbackBtn.textContent = 'Rollback';
+        rollbackBtn.onclick = (event) => {
+          event.stopPropagation();
+          rollback(app.id);
+        };
+
+        actions.appendChild(selectBtn);
+        actions.appendChild(deployBtn);
+        actions.appendChild(resyncBtn);
+        actions.appendChild(rollbackBtn);
+        li.appendChild(main);
+        li.appendChild(actions);
         li.onclick = (event) => {
           if (event.target && event.target.closest('button')) {
             return;

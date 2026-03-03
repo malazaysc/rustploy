@@ -35,6 +35,8 @@
   - logs viewer controls (contains filter, since/until range, live tail reconnect, and download),
   - automatic container refresh every 5 seconds plus manual refresh.
 - Containers tab now also renders an all-project runtime inventory table so operators can see every app container in one view and click through directly into app-scoped details/log tailing.
+- App list rendering in dashboard now builds rows with DOM-safe text nodes/button handlers (no interpolated `innerHTML` actions), closing stored-XSS injection paths for app names.
+- All-project containers refresh now runs with bounded concurrency and is skipped while the all-project panel is collapsed, reducing periodic backend load.
 - Dashboard interaction flow has been simplified with:
   - a new "Quick Workflow" guide card,
   - row-click app selection (plus explicit `Select` action label),
@@ -90,5 +92,5 @@
 ## Last Verified
 
 - Date: 2026-03-03
-- Commit base: `93ab1c5`
+- Commit base: `6176fc6b3705f83fc6638763895770766537ab1f`
 - Note: toolchain/dependency refresh validated with full `cargo test` and dockerized startup against Rust 1.93.
