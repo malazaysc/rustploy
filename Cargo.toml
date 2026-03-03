@@ -5,19 +5,20 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.93"
 license = "Apache-2.0"
 
 [workspace.dependencies]
 anyhow = "1.0"
-axum = { version = "0.7.9", features = ["macros"] }
+axum = { version = "0.8.8", features = ["macros"] }
 hmac = "0.12.1"
 hex = "0.4.3"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-sha2 = "0.10.8"
-tokio = { version = "1.38.1", features = ["full"] }
-tracing = "0.1.40"
+sha2 = "0.10.9"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = { version = "=1.8.0", features = ["serde", "v4"] }
+uuid = { version = "=1.21.0", features = ["serde", "v4"] }

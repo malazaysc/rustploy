@@ -4712,51 +4712,57 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/v1/apps/import", post(import_app))
         .route("/api/v1/apps", get(list_apps).post(create_app))
-        .route("/api/v1/apps/:app_id/github", post(connect_github_repo))
-        .route("/api/v1/apps/:app_id/runtime", get(get_app_runtime_health))
-        .route("/api/v1/apps/:app_id/containers", get(list_app_containers))
+        .route("/api/v1/apps/{app_id}/github", post(connect_github_repo))
+        .route("/api/v1/apps/{app_id}/runtime", get(get_app_runtime_health))
+        .route("/api/v1/apps/{app_id}/containers", get(list_app_containers))
         .route(
-            "/api/v1/apps/:app_id/containers/:container_id",
+            "/api/v1/apps/{app_id}/containers/{container_id}",
             get(get_app_container_details),
         )
         .route(
-            "/api/v1/apps/:app_id/containers/:container_id/logs",
+            "/api/v1/apps/{app_id}/containers/{container_id}/logs",
             get(get_app_container_logs),
         )
         .route(
-            "/api/v1/apps/:app_id/containers/:container_id/logs/stream",
+            "/api/v1/apps/{app_id}/containers/{container_id}/logs/stream",
             get(stream_app_container_logs),
         )
         .route(
-            "/api/v1/apps/:app_id/containers/:container_id/logs/download",
+            "/api/v1/apps/{app_id}/containers/{container_id}/logs/download",
             get(download_app_container_logs),
         )
-        .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
         .route(
-            "/api/v1/apps/:app_id/env",
+            "/api/v1/apps/{app_id}/config",
+            get(get_app_effective_config),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/env",
             get(list_app_env_vars).put(upsert_app_env_var),
         )
-        .route("/api/v1/apps/:app_id/env/:key", delete(delete_app_env_var))
         .route(
-            "/api/v1/apps/:app_id/domains",
+            "/api/v1/apps/{app_id}/env/{key}",
+            delete(delete_app_env_var),
+        )
+        .route(
+            "/api/v1/apps/{app_id}/domains",
             get(list_domains).post(create_domain),
         )
-        .route("/api/v1/apps/:app_id/logs/stream", get(stream_app_logs))
+        .route("/api/v1/apps/{app_id}/logs/stream", get(stream_app_logs))
         .route(
-            "/api/v1/apps/:app_id/deployments",
+            "/api/v1/apps/{app_id}/deployments",
             get(list_app_deployments).post(create_deployment),
         )
         .route(
-            "/api/v1/apps/:app_id/deployments/:deployment_id/logs",
+            "/api/v1/apps/{app_id}/deployments/{deployment_id}/logs",
             get(get_deployment_logs),
         )
-        .route("/api/v1/apps/:app_id/rollback", post(rollback_deployment))
+        .route("/api/v1/apps/{app_id}/rollback", post(rollback_deployment))
         .route(
             "/api/v1/integrations/github/webhook",
             post(handle_github_webhook),
         )
         .route("/api/v1/tokens", get(list_tokens).post(create_token))
-        .route("/api/v1/tokens/:token_id", delete(revoke_token))
+        .route("/api/v1/tokens/{token_id}", delete(revoke_token))
         .route("/api/v1/agents", get(list_agents))
         .route("/api/v1/agents/register", post(register_agent))
         .route("/api/v1/agents/heartbeat", post(agent_heartbeat))
@@ -5831,6 +5837,23 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       min-width: 86px;
       text-align: center;
     }
+    .collapsible-section.collapsed {
+      display: none;
+    }
+    .workflow-list {
+      margin: 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 6px;
+      color: color-mix(in oklab, var(--foreground) 86%, white 14%);
+      font-size: 12px;
+    }
+    .workflow-list li {
+      line-height: 1.4;
+    }
+    .item-row.clickable-row {
+      cursor: pointer;
+    }
     .row {
       display: grid;
       gap: 8px;
@@ -6057,6 +6080,14 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     }
     .container-table tbody tr.selected {
       background: color-mix(in oklab, var(--primary) 14%, transparent);
+    }
+    .container-section-title {
+      margin: 12px 0 8px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .04em;
     }
     .container-cell-main {
       display: grid;
@@ -6322,10 +6353,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div class="stack">
           <article class="card">
             <div class="card-head">
-              <h3>Projects</h3>
+              <h3>Apps (Select One)</h3>
             </div>
             <div class="card-body">
               <ul id="apps" class="list"></ul>
+              <p class="hint">Click a row (or Select) to drive everything in the workspace panels.</p>
             </div>
           </article>
 
@@ -6359,9 +6391,24 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         <div class="stack">
           <article class="card">
             <div class="card-head">
-              <h3>Create App</h3>
+              <h3>Quick Workflow</h3>
             </div>
             <div class="card-body">
+              <ol class="workflow-list">
+                <li>Select an app from the left list.</li>
+                <li>Use <strong>Project Workspace</strong> for routing and containers.</li>
+                <li>Use Deploy/Resync/Rollback actions from the app row.</li>
+                <li>Open <strong>Recent Deployments</strong> logs for rollout details.</li>
+              </ol>
+            </div>
+          </article>
+
+          <article class="card">
+            <div class="card-head">
+              <h3>Create App</h3>
+              <button class="secondary collapse-btn" id="panel-create-app-btn" onclick="togglePanel('createApp')">Show</button>
+            </div>
+            <div class="card-body collapsible-section collapsed" id="panel-create-app-body">
               <div class="row">
                 <input id="app-name" placeholder="my-app" />
                 <button onclick="createApp()">Create App</button>
@@ -6372,8 +6419,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <article class="card">
             <div class="card-head">
               <h3>Import GitHub Repo</h3>
+              <button class="secondary collapse-btn" id="panel-import-repo-btn" onclick="togglePanel('importRepo')">Show</button>
             </div>
-            <div class="card-body">
+            <div class="card-body collapsible-section collapsed" id="panel-import-repo-body">
               <div class="triple">
                 <input id="owner" placeholder="owner" />
                 <input id="repo" placeholder="repo" />
@@ -6424,6 +6472,29 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
                   </table>
                 </div>
                 <p class="hint" id="containers-note">Select an app to inspect project containers.</p>
+                <div class="toolbar-row">
+                  <h4 class="container-section-title" style="margin:0;">All Project Containers</h4>
+                  <button class="secondary collapse-btn" id="panel-all-containers-btn" onclick="togglePanel('allContainers')">Show</button>
+                </div>
+                <div class="collapsible-section collapsed" id="panel-all-containers-body">
+                  <div class="container-table-wrap">
+                    <table class="container-table">
+                      <thead>
+                        <tr>
+                          <th>Project</th>
+                          <th>Container</th>
+                          <th>Status</th>
+                          <th>Ports</th>
+                          <th>Uptime</th>
+                          <th>Restarts</th>
+                          <th>Image</th>
+                        </tr>
+                      </thead>
+                      <tbody id="all-containers-table-body"></tbody>
+                    </table>
+                  </div>
+                  <p class="hint" id="all-containers-note">Loading project container inventory...</p>
+                </div>
 
                 <div class="container-details-grid">
                   <div class="container-details-box">
@@ -6467,8 +6538,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <article class="card">
             <div class="card-head">
               <h3>Domains</h3>
+              <button class="secondary collapse-btn" id="panel-domains-btn" onclick="togglePanel('domains')">Show</button>
             </div>
-            <div class="card-body">
+            <div class="card-body collapsible-section collapsed" id="panel-domains-body">
               <div class="row">
                 <input id="domain" placeholder="app.example.com" />
                 <button onclick="addDomain()">Add Domain</button>
@@ -6480,8 +6552,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           <article class="card">
             <div class="card-head">
               <h3>Environment</h3>
+              <button class="secondary collapse-btn" id="panel-environment-btn" onclick="togglePanel('environment')">Show</button>
             </div>
-            <div class="card-body">
+            <div class="card-body collapsible-section collapsed" id="panel-environment-body">
               <div class="row">
                 <input id="env-key" placeholder="DATABASE_URL" />
                 <input id="env-value" placeholder="value" />
@@ -6499,6 +6572,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
   <script>
     let selectedApp = null;
     let selectedAppName = null;
+    const cachedApps = [];
     let selectedLogsDeploymentId = null;
     let logsStream = null;
     let projectPanel = 'routing';
@@ -6516,6 +6590,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       config: null,
       runtimeHealth: null,
       containers: [],
+      allContainers: [],
       selectedContainerId: null,
       selectedContainerDetails: null,
       containerLogsCursor: null,
@@ -6528,6 +6603,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let latestDashboardMetrics = null;
     let latestNetworkCounters = null;
     let dashboardMetricsRequestSeq = 0;
+    let allContainersRequestSeq = 0;
     const CONTAINER_AUTO_REFRESH_INTERVAL_MS = 5000;
     const MAX_CONTAINER_LOG_OUTPUT_CHARS = 250000;
 
@@ -6567,6 +6643,46 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       applyDeploymentsCollapsed();
     }
 
+    const panelCollapsed = {
+      createApp: true,
+      importRepo: true,
+      domains: true,
+      environment: true,
+      allContainers: true
+    };
+
+    const panelDomIdByKey = {
+      createApp: { body: 'panel-create-app-body', button: 'panel-create-app-btn' },
+      importRepo: { body: 'panel-import-repo-body', button: 'panel-import-repo-btn' },
+      domains: { body: 'panel-domains-body', button: 'panel-domains-btn' },
+      environment: { body: 'panel-environment-body', button: 'panel-environment-btn' },
+      allContainers: { body: 'panel-all-containers-body', button: 'panel-all-containers-btn' }
+    };
+
+    function applyPanelCollapsed(panelKey) {
+      const dom = panelDomIdByKey[panelKey];
+      if (!dom) return;
+      const body = document.getElementById(dom.body);
+      const button = document.getElementById(dom.button);
+      if (!body || !button) return;
+      const collapsed = !!panelCollapsed[panelKey];
+      body.classList.toggle('collapsed', collapsed);
+      button.textContent = collapsed ? 'Show' : 'Hide';
+      button.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    }
+
+    function applyPanelsCollapsed() {
+      for (const key of Object.keys(panelCollapsed)) {
+        applyPanelCollapsed(key);
+      }
+    }
+
+    function togglePanel(panelKey) {
+      if (!(panelKey in panelCollapsed)) return;
+      panelCollapsed[panelKey] = !panelCollapsed[panelKey];
+      applyPanelCollapsed(panelKey);
+    }
+
     function switchProjectPanel(panel) {
       projectPanel = panel === 'containers' ? 'containers' : 'routing';
       const routingTab = document.getElementById('project-tab-routing');
@@ -6582,7 +6698,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         return;
       }
       if (selectedApp) {
-        refreshContainers()
+        Promise.all([refreshContainers(), refreshAllAppContainers()])
           .then(() => {
             if (
               selectedState.containerLogsLiveEnabled &&
@@ -7069,6 +7185,218 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       }
     }
 
+    function renderAllContainersTable({ loading = false, error = null } = {}) {
+      const body = document.getElementById('all-containers-table-body');
+      const note = document.getElementById('all-containers-note');
+      if (!body || !note) return;
+      body.innerHTML = '';
+
+      const makeSingleRow = (message) => {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 7;
+        cell.textContent = message;
+        row.appendChild(cell);
+        body.appendChild(row);
+      };
+
+      if (loading) {
+        note.textContent = 'Loading container inventory for all apps...';
+        makeSingleRow('Loading container inventory for all apps...');
+        return;
+      }
+      if (error) {
+        note.textContent = `Failed loading all-app container inventory: ${error}`;
+        makeSingleRow(`Failed loading all-app container inventory: ${error}`);
+        return;
+      }
+
+      if (cachedApps.length === 0) {
+        note.textContent = 'No apps available.';
+        makeSingleRow('No apps available.');
+        return;
+      }
+
+      const rows = Array.isArray(selectedState.allContainers) ? selectedState.allContainers : [];
+      if (rows.length === 0) {
+        note.textContent = `No runtime containers found across ${cachedApps.length} app(s).`;
+        makeSingleRow('No runtime containers found in any app.');
+        return;
+      }
+
+      note.textContent = `${rows.length} container(s) across ${cachedApps.length} app(s).`;
+
+      for (const rowData of rows) {
+        const { appId, appName, projectName, container } = rowData;
+        const row = document.createElement('tr');
+        if (appId === selectedApp && container.id === selectedState.selectedContainerId) {
+          row.classList.add('selected');
+        }
+        row.onclick = () => openContainerFromAllApps(appId, appName, container.id);
+        row.tabIndex = 0;
+        row.setAttribute('aria-label', `Open ${appName} container ${container.name || container.id}`);
+        row.onkeydown = (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            openContainerFromAllApps(appId, appName, container.id);
+          }
+        };
+
+        const appCell = document.createElement('td');
+        const appMain = document.createElement('div');
+        appMain.className = 'container-cell-main';
+        const appStrong = document.createElement('strong');
+        appStrong.textContent = appName || appId;
+        const appCode = document.createElement('code');
+        appCode.textContent = projectName ? `${appId} · project=${projectName}` : appId;
+        appMain.appendChild(appStrong);
+        appMain.appendChild(appCode);
+        appCell.appendChild(appMain);
+
+        const nameCell = document.createElement('td');
+        const main = document.createElement('div');
+        main.className = 'container-cell-main';
+        const strong = document.createElement('strong');
+        strong.textContent = container.name || container.id;
+        const code = document.createElement('code');
+        code.textContent = container.service_name
+          ? `${container.id} · service=${container.service_name}`
+          : container.id;
+        main.appendChild(strong);
+        main.appendChild(code);
+        nameCell.appendChild(main);
+
+        const statusCell = document.createElement('td');
+        const statusPill = document.createElement('span');
+        statusPill.className = `container-status ${containerStatusClass(container.status)}`;
+        statusPill.textContent = container.status || 'unknown';
+        statusCell.appendChild(statusPill);
+
+        const portsCell = document.createElement('td');
+        portsCell.textContent = formatContainerPorts(container.port_mappings);
+
+        const uptimeCell = document.createElement('td');
+        uptimeCell.textContent = formatContainerUptime(container.started_at);
+
+        const restartCell = document.createElement('td');
+        restartCell.textContent = String(container.restart_count || 0);
+
+        const imageCell = document.createElement('td');
+        imageCell.textContent = container.image || 'n/a';
+
+        row.appendChild(appCell);
+        row.appendChild(nameCell);
+        row.appendChild(statusCell);
+        row.appendChild(portsCell);
+        row.appendChild(uptimeCell);
+        row.appendChild(restartCell);
+        row.appendChild(imageCell);
+        body.appendChild(row);
+      }
+    }
+
+    async function openContainerFromAllApps(appId, appName, containerId) {
+      try {
+        if (selectedApp !== appId) {
+          await selectApp(appId, appName);
+        }
+        if (projectPanel !== 'containers') {
+          switchProjectPanel('containers');
+        }
+        if (containerId && selectedState.selectedContainerId !== containerId) {
+          await selectContainer(containerId);
+        }
+      } catch (error) {
+        setStatus(`Unable to open container details: ${error.message}`, 'err');
+      }
+    }
+
+    async function refreshAllAppContainers({ manual = false, silent = true } = {}) {
+      const apps = cachedApps.slice();
+      if (apps.length === 0) {
+        selectedState.allContainers = [];
+        renderAllContainersTable();
+        return;
+      }
+
+      const requestSeq = ++allContainersRequestSeq;
+      if (manual) {
+        renderAllContainersTable({ loading: true });
+      }
+
+      try {
+        const grouped = await Promise.all(
+          apps.map(async (app) => {
+            try {
+              const res = await api(`/api/v1/apps/${app.id}/containers`);
+              const data = await res.json();
+              return {
+                app,
+                projectName: data.project_name || '',
+                items: Array.isArray(data.items) ? data.items : [],
+                error: null
+              };
+            } catch (error) {
+              return {
+                app,
+                projectName: '',
+                items: [],
+                error: error.message
+              };
+            }
+          })
+        );
+
+        if (requestSeq !== allContainersRequestSeq) {
+          return;
+        }
+
+        const rows = [];
+        let unavailableApps = 0;
+        for (const group of grouped) {
+          if (group.error) {
+            unavailableApps += 1;
+            continue;
+          }
+          for (const container of group.items) {
+            rows.push({
+              appId: group.app.id,
+              appName: group.app.name,
+              projectName: group.projectName,
+              container
+            });
+          }
+        }
+
+        rows.sort((a, b) => {
+          const appCmp = (a.appName || a.appId).localeCompare(b.appName || b.appId);
+          if (appCmp !== 0) return appCmp;
+          return (a.container.name || a.container.id).localeCompare(b.container.name || b.container.id);
+        });
+
+        selectedState.allContainers = rows;
+        renderAllContainersTable();
+        if (unavailableApps > 0) {
+          const note = document.getElementById('all-containers-note');
+          if (note) {
+            note.textContent = `${note.textContent} (${unavailableApps} app(s) unavailable)`;
+          }
+        }
+        if (manual && !silent) {
+          setStatus(`All-project inventory refreshed (${rows.length} container entries).`);
+        }
+      } catch (error) {
+        if (requestSeq !== allContainersRequestSeq) {
+          return;
+        }
+        selectedState.allContainers = [];
+        renderAllContainersTable({ error: error.message });
+        if (manual && !silent) {
+          setStatus(`All-project container refresh failed: ${error.message}`, 'err');
+        }
+      }
+    }
+
     async function loadContainerLogs() {
       const basePath = containerLogBasePath();
       if (!basePath) {
@@ -7157,6 +7485,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       selectedState.containerLogsCursor = null;
       stopContainerLogsStream({ preserveLiveFlag: true });
       renderContainersTable();
+      renderAllContainersTable();
       renderContainerDetails({ loading: true });
       setContainerLogsOutput('(waiting for live logs...)');
       setContainerLogStatus('Loading selected container...');
@@ -7172,6 +7501,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.containerLogsCursor = null;
         stopContainerLogsStream();
         renderContainersTable();
+        renderAllContainersTable();
         renderContainerDetails();
         setContainerLogsOutput('');
         setContainerLogStatus('Select an app to view container logs.');
@@ -7198,11 +7528,14 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const selectedExists = selectedState.containers.some((item) => item.id === previousContainer);
 
         if (selectedState.containers.length === 0) {
+          panelCollapsed.allContainers = false;
+          applyPanelCollapsed('allContainers');
           selectedState.selectedContainerId = null;
           selectedState.selectedContainerDetails = null;
           selectedState.containerLogsCursor = null;
           stopContainerLogsStream();
           renderContainersTable();
+          renderAllContainersTable();
           renderContainerDetails();
           setContainerLogsOutput('');
           setContainerLogStatus('No runtime containers found for this app.');
@@ -7218,11 +7551,13 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           selectedState.selectedContainerDetails = null;
           selectedState.containerLogsCursor = null;
           renderContainersTable();
+          renderAllContainersTable();
           renderContainerDetails({ loading: true });
           setContainerLogsOutput('(waiting for live logs...)');
           await refreshSelectedContainerDetails({ reloadLogs: true, silent: true });
         } else {
           renderContainersTable();
+          renderAllContainersTable();
           await refreshSelectedContainerDetails({ reloadLogs: false, silent: true });
         }
 
@@ -7239,6 +7574,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.containerLogsCursor = null;
         stopContainerLogsStream();
         renderContainersTable({ error: error.message });
+        renderAllContainersTable();
         renderContainerDetails({ error: error.message });
         setContainerLogsOutput('');
         setContainerLogStatus(`Container APIs unavailable: ${error.message}`);
@@ -7250,6 +7586,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
 
     async function manualRefreshContainers() {
       await refreshContainers({ manual: true });
+      await refreshAllAppContainers({ manual: true, silent: true });
     }
 
     function downloadContainerLogs() {
@@ -7824,6 +8161,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     async function refreshApps() {
       const res = await api('/api/v1/apps');
       const data = await res.json();
+      cachedApps.length = 0;
+      for (const app of data.items || []) {
+        cachedApps.push(app);
+      }
       const apps = document.getElementById('apps');
       apps.innerHTML = '';
 
@@ -7838,6 +8179,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.config = null;
         selectedState.runtimeHealth = null;
         selectedState.containers = [];
+        selectedState.allContainers = [];
         selectedState.selectedContainerId = null;
         selectedState.selectedContainerDetails = null;
         selectedState.containerLogsCursor = null;
@@ -7851,6 +8193,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         stopLogsStream();
         stopContainerLogsStream();
         renderContainersTable();
+        renderAllContainersTable();
         renderContainerDetails();
         setContainerLogsOutput('');
         setContainerLogStatus('Select an app to view container logs.');
@@ -7870,19 +8213,27 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
           selectedAppName = app.name;
         }
         const li = document.createElement('li');
-        li.className = `item-row ${selectedApp === app.id ? 'selected' : ''}`.trim();
+        li.className = `item-row clickable-row ${selectedApp === app.id ? 'selected' : ''}`.trim();
         li.innerHTML = `
           <div class="item-main">
             <strong>${app.name}</strong>
             <code>${app.id}</code>
           </div>
           <div class="item-actions">
-            <button class="secondary" onclick="selectApp('${app.id}','${app.name}')">Open</button>
+            <button class="secondary" onclick="selectApp('${app.id}','${app.name}')">Select</button>
             <button onclick="deploy('${app.id}')">Deploy</button>
             <button class="secondary" onclick="resyncRebuild('${app.id}')">Resync & Rebuild</button>
             <button class="secondary" onclick="rollback('${app.id}')">Rollback</button>
           </div>
         `;
+        li.onclick = (event) => {
+          if (event.target && event.target.closest('button')) {
+            return;
+          }
+          selectApp(app.id, app.name).catch((error) => {
+            setStatus(`Select app failed: ${error.message}`, 'err');
+          });
+        };
         apps.appendChild(li);
       }
 
@@ -7903,6 +8254,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         selectedState.config = null;
         selectedState.runtimeHealth = null;
         selectedState.containers = [];
+        selectedState.allContainers = [];
         selectedState.selectedContainerId = null;
         selectedState.selectedContainerDetails = null;
         selectedState.containerLogsCursor = null;
@@ -7912,6 +8264,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         stopLogsStream();
         stopContainerLogsStream();
         renderContainersTable();
+        renderAllContainersTable();
         renderContainerDetails();
         setContainerLogsOutput('');
         setContainerLogStatus('Select an app to view container logs.');
@@ -7921,6 +8274,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         } catch (error) {
           renderDashboardMetricsError(error.message);
         }
+      }
+
+      if (projectPanel === 'containers') {
+        refreshAllAppContainers().catch(() => {});
       }
     }
 
@@ -7990,6 +8347,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       renderSelectedDeployment();
       syncContainerLiveToggle();
       renderContainersTable({ loading: true });
+      renderAllContainersTable();
       renderContainerDetails({ loading: true });
       setContainerLogsOutput('(waiting for live logs...)');
       setContainerLogStatus('Loading project containers...');
@@ -7999,6 +8357,9 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       await refreshEnvVars();
       await refreshAppConfig();
       await refreshContainers();
+      if (projectPanel === 'containers') {
+        await refreshAllAppContainers();
+      }
       try {
         await refreshDashboardMetrics();
       } catch (error) {
@@ -8316,9 +8677,11 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     renderRoutes();
     renderSelectedDeployment();
     applyDeploymentsCollapsed();
+    applyPanelsCollapsed();
     switchProjectPanel('routing');
     syncContainerLiveToggle();
     renderContainersTable();
+    renderAllContainersTable();
     renderContainerDetails();
     setContainerLogsOutput('');
     setContainerLogStatus('Select a container to view logs.');
@@ -8336,12 +8699,12 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     setInterval(() => refreshApps().catch(() => {}), 15000);
     setInterval(() => refreshDeployments().catch(() => {}), 4000);
     setInterval(async () => {
-      if (!selectedApp || projectPanel !== 'containers' || containersRefreshInFlight) {
+      if (projectPanel !== 'containers' || containersRefreshInFlight) {
         return;
       }
       containersRefreshInFlight = true;
       try {
-        await refreshContainers();
+        await Promise.all([refreshContainers(), refreshAllAppContainers()]);
       } catch (_) {
       } finally {
         containersRefreshInFlight = false;
