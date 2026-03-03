@@ -6505,6 +6505,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let containerLogsStream = null;
     let containerLogsReconnectTimer = null;
     let containerLogsReconnectAttempt = 0;
+    let containersRefreshInFlight = false;
     let statusTimeout = null;
     const selectedState = {
       domains: [],
@@ -6528,6 +6529,7 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
     let latestNetworkCounters = null;
     let dashboardMetricsRequestSeq = 0;
     const CONTAINER_AUTO_REFRESH_INTERVAL_MS = 5000;
+    const MAX_CONTAINER_LOG_OUTPUT_CHARS = 250000;
 
     function normalizeDeploymentStatus(value) {
       return (value || 'queued').toString().toLowerCase();
@@ -6701,7 +6703,10 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         const normalizedCurrent = (current === '(no container logs)' || current === '(waiting for live logs...)')
           ? ''
           : current;
-        output.textContent = normalizedCurrent ? `${normalizedCurrent}\n${text}` : text;
+        const combined = normalizedCurrent ? `${normalizedCurrent}\n${text}` : text;
+        output.textContent = combined.length > MAX_CONTAINER_LOG_OUTPUT_CHARS
+          ? combined.slice(combined.length - MAX_CONTAINER_LOG_OUTPUT_CHARS)
+          : combined;
       }
       if (document.getElementById('container-log-autoscroll')?.checked) {
         output.scrollTop = output.scrollHeight;
@@ -6988,7 +6993,20 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
         if (container.id === selectedState.selectedContainerId) {
           row.classList.add('selected');
         }
-        row.onclick = () => selectContainer(container.id);
+        const activateRow = () => selectContainer(container.id);
+        row.onclick = activateRow;
+        row.tabIndex = 0;
+        row.setAttribute(
+          'aria-selected',
+          container.id === selectedState.selectedContainerId ? 'true' : 'false'
+        );
+        row.setAttribute('aria-label', `Open container ${container.name || container.id}`);
+        row.onkeydown = (event) => {
+          if (event.key === 'Enter' || event.key === ' ') {
+            event.preventDefault();
+            activateRow();
+          }
+        };
 
         const nameCell = document.createElement('td');
         const main = document.createElement('div');
@@ -8297,7 +8315,18 @@ const DASHBOARD_HTML: &str = r#"<!doctype html>
       });
     setInterval(() => refreshApps().catch(() => {}), 15000);
     setInterval(() => refreshDeployments().catch(() => {}), 4000);
-    setInterval(() => refreshContainers().catch(() => {}), CONTAINER_AUTO_REFRESH_INTERVAL_MS);
+    setInterval(async () => {
+      if (!selectedApp || projectPanel !== 'containers' || containersRefreshInFlight) {
+        return;
+      }
+      containersRefreshInFlight = true;
+      try {
+        await refreshContainers();
+      } catch (_) {
+      } finally {
+        containersRefreshInFlight = false;
+      }
+    }, CONTAINER_AUTO_REFRESH_INTERVAL_MS);
     setInterval(() => refreshRuntimeHealth().catch(() => {}), 8000);
     setInterval(() => refreshEnvVars().catch(() => {}), 10000);
     setInterval(() => refreshDashboardMetrics().catch((error) => renderDashboardMetricsError(error.message)), 10000);
