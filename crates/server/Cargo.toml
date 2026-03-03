@@ -17,6 +17,7 @@ sha2.workspace = true
 shared = { path = "../shared" }
 tokio.workspace = true
 tokio-stream = "0.1"
+time = { version = "0.3", features = ["parsing"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

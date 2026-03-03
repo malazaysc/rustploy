@@ -23,6 +23,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
 - Runtime container command metadata now sanitizes secret-like `key=value` arguments and credential-bearing URL arguments before returning API payloads.
 - Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
+- Container log retrieval now supports per-container `since` cursors, optional `until` range bounds, and case-insensitive text filtering (`contains`) for incremental reads and reconnect-safe consumers.
+- Container log reads now enforce bounded tail behavior (`2000` default, `10000` max; stream bootstrap default remains `200`) to avoid unbounded full-history fetches.
 
 ### Fixed
 
@@ -52,6 +54,11 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container-inventory Docker inspect parsing now tolerates explicit `null` collection fields (`Cmd`, `Env`, `Labels`, `ExposedPorts`, `Ports`, `Networks`, `Mounts`) instead of failing deserialization.
 - App container inventory handlers now run Docker CLI inspection in a blocking task with a timeout, preventing async request-worker stalls when Docker is slow/unresponsive.
 - Container detail healthcheck `last_output` now redacts credential-bearing URL patterns and secret-like `KEY=value` fragments before returning API responses.
+- Container log APIs now return `404` (instead of `500`) when a container disappears between selector resolution and log retrieval.
+- Container log cursor advancement no longer adds `+1ms` after reads, avoiding potential skips when multiple log entries share the same millisecond timestamp.
+- Container log parsing now preserves line whitespace in returned payloads (except trailing `\\r` normalization).
+- Container log SSE polling now emits a single `reset` event on first poll failure and suppresses repeated failure noise until recovery.
+- Container log cursor advancement now incorporates parsed timestamps from non-matching lines and stream cursor updates are monotonic, preventing replay loops when `contains` filters are active.
 
 ### Added
 
@@ -94,3 +101,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App runtime container inventory endpoints:
   - `GET /api/v1/apps/:id/containers` for project-scoped container summaries (status, ports, image, restart count, health).
   - `GET /api/v1/apps/:id/containers/:container_id` for detailed container metadata (labels, mounts, networks, exposed ports, masked env vars).
+- App runtime container log endpoints:
+  - `GET /api/v1/apps/:id/containers/:container_id/logs` for filtered/range-bounded log chunks with `next_since_unix_ms` cursor.
+  - `GET /api/v1/apps/:id/containers/:container_id/logs/stream` for live SSE container logs with reconnect cursor semantics.
+  - `GET /api/v1/apps/:id/containers/:container_id/logs/download` for attachment-style plain-text log export over selected windows.

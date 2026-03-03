@@ -27,20 +27,21 @@ use shared::{
     AgentHeartbeat, AgentListResponse, AgentRegisterRequest, AgentRegistered,
     AgentResourceSnapshot, AgentStatus, AgentSummary, ApiError, ApiErrorDetail, ApiErrorResponse,
     AppContainerDetails, AppContainerDetailsResponse, AppContainerEnvVar, AppContainerExposedPort,
-    AppContainerHealth, AppContainerListResponse, AppContainerMount, AppContainerNetworkAttachment,
-    AppContainerPortMapping, AppContainerSummary, AppEnvVarListResponse, AppEnvVarSummary,
-    AppListResponse, AppRuntimeHealthResponse, AppSummary, AuthLoginRequest, AuthSessionResponse,
-    ComposeServiceSummary, ComposeSummary, CreateAppRequest, CreateDeploymentAccepted,
-    CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest, CreateTokenResponse,
-    DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary, DependencyProfile,
-    DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus, DeploymentSummary,
-    DetectionResult, DomainListResponse, DomainSummary, EffectiveAppConfigResponse,
-    GithubConnectRequest, GithubIntegrationSummary, GithubWebhookAccepted, HealthResponse,
-    HeartbeatAccepted, ImportAppRequest, ImportAppResponse, NextAction,
-    PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
+    AppContainerHealth, AppContainerListResponse, AppContainerLogsResponse, AppContainerMount,
+    AppContainerNetworkAttachment, AppContainerPortMapping, AppContainerSummary,
+    AppEnvVarListResponse, AppEnvVarSummary, AppListResponse, AppRuntimeHealthResponse, AppSummary,
+    AuthLoginRequest, AuthSessionResponse, ComposeServiceSummary, ComposeSummary, CreateAppRequest,
+    CreateDeploymentAccepted, CreateDeploymentRequest, CreateDomainRequest, CreateTokenRequest,
+    CreateTokenResponse, DashboardMetricsResponse, DashboardMetricsScope, DashboardSummary,
+    DependencyProfile, DeploymentListResponse, DeploymentLogsResponse, DeploymentStatus,
+    DeploymentSummary, DetectionResult, DomainListResponse, DomainSummary,
+    EffectiveAppConfigResponse, GithubConnectRequest, GithubIntegrationSummary,
+    GithubWebhookAccepted, HealthResponse, HeartbeatAccepted, ImportAppRequest, ImportAppResponse,
+    NextAction, PasswordResetConfirmRequest, PasswordResetConfirmedResponse, PasswordResetRequest,
     PasswordResetRequestedResponse, RepositoryRef, RequestTrafficPoint, ServerResourcePoint,
     SourceRef, TokenListResponse, TokenSummary, UpsertAppEnvVarRequest,
 };
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tokio::process::Command as TokioCommand;
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
 use tracing::{error, info, warn};
@@ -75,6 +76,9 @@ const MAX_CADDY_ACCESS_LOG_READ_BYTES_PER_POLL: u64 = 4 * 1024 * 1024;
 const DEFAULT_CADDY_HOST_LOOKUP_CACHE_MS: u64 = 30_000;
 const DEFAULT_TELEMETRY_RETENTION_SWEEP_MS: u64 = 60 * 60 * 1000;
 const TCP_ENDPOINT_PROBE_CONCURRENCY_LIMIT: usize = 16;
+const DEFAULT_CONTAINER_LOG_TAIL: u32 = 2_000;
+const DEFAULT_CONTAINER_STREAM_TAIL: u32 = 200;
+const MAX_CONTAINER_LOG_TAIL: u32 = 10_000;
 const CONTROL_PLANE_HOST: &str = "localhost";
 const CONTROL_PLANE_ALT_HOST: &str = "rustploy.localhost";
 const GLOBAL_TRAFFIC_SCOPE: &str = "__global__";
@@ -392,6 +396,28 @@ struct GithubOwner {
 struct AppContainerRuntime {
     summary: AppContainerSummary,
     details: AppContainerDetails,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+struct AppContainerLogsQuery {
+    since: Option<u64>,
+    until: Option<u64>,
+    tail: Option<u32>,
+    contains: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AppContainerLogsRequest {
+    since_unix_ms: Option<u64>,
+    until_unix_ms: Option<u64>,
+    tail: Option<u32>,
+    contains: Option<String>,
+}
+
+#[derive(Debug)]
+struct AppContainerLogsChunk {
+    logs: String,
+    next_since_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -3953,19 +3979,237 @@ async fn load_project_container_runtimes_with_timeout(
     Ok(items)
 }
 
-fn select_requested_container_details(
+fn select_requested_container_runtime(
     items: Vec<AppContainerRuntime>,
     requested: &str,
-) -> std::result::Result<AppContainerDetails, StatusCode> {
+) -> std::result::Result<AppContainerRuntime, StatusCode> {
     let mut matches = items
         .into_iter()
-        .map(|item| item.details)
-        .filter(|details| container_matches_request(details, requested));
+        .filter(|item| container_matches_request(&item.details, requested));
     let selected = matches.next().ok_or(StatusCode::NOT_FOUND)?;
     if matches.next().is_some() {
         return Err(StatusCode::CONFLICT);
     }
     Ok(selected)
+}
+
+async fn resolve_app_container_runtime(
+    state: &AppState,
+    app_id: Uuid,
+    container_id: &str,
+) -> Result<(String, AppContainerRuntime), StatusCode> {
+    if !state.db.app_exists(app_id).map_err(internal_error)? {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let (project_name, runtime_configured) =
+        project_name_for_app(&state.db, app_id).map_err(internal_error)?;
+    if !runtime_configured {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let requested = container_id.trim();
+    if requested.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
+    let items = load_project_container_runtimes_with_timeout(project_name.clone())
+        .await
+        .map_err(internal_error)?;
+    let container = select_requested_container_runtime(items, requested)?;
+    Ok((project_name, container))
+}
+
+fn normalize_container_logs_query(
+    query: AppContainerLogsQuery,
+) -> Result<AppContainerLogsRequest, StatusCode> {
+    if let (Some(since), Some(until)) = (query.since, query.until) {
+        if since > until {
+            return Err(StatusCode::BAD_REQUEST);
+        }
+    }
+
+    let contains = query.contains.and_then(to_non_empty);
+    let tail = query
+        .tail
+        .map(|value| value.min(MAX_CONTAINER_LOG_TAIL))
+        .or_else(|| {
+            if query.since.is_none() {
+                Some(DEFAULT_CONTAINER_LOG_TAIL)
+            } else {
+                None
+            }
+        });
+
+    Ok(AppContainerLogsRequest {
+        since_unix_ms: query.since,
+        until_unix_ms: query.until,
+        tail,
+        contains,
+    })
+}
+
+fn app_container_stream_request(
+    query: AppContainerLogsQuery,
+) -> Result<AppContainerLogsRequest, StatusCode> {
+    let use_stream_default_tail = query.since.is_none() && query.tail.is_none();
+    let mut request = normalize_container_logs_query(query)?;
+    if use_stream_default_tail {
+        request.tail = Some(DEFAULT_CONTAINER_STREAM_TAIL);
+    }
+    Ok(request)
+}
+
+fn docker_timestamp_from_unix_ms(value: u64) -> String {
+    let seconds = value / 1_000;
+    let millis = value % 1_000;
+    if millis == 0 {
+        seconds.to_string()
+    } else {
+        format!("{seconds}.{millis:03}")
+    }
+}
+
+fn parse_docker_timestamp_unix_ms(raw: &str) -> Option<u64> {
+    let parsed = OffsetDateTime::parse(raw, &Rfc3339).ok()?;
+    let unix_seconds = parsed.unix_timestamp();
+    if unix_seconds < 0 {
+        return None;
+    }
+    let unix_seconds = u64::try_from(unix_seconds).ok()?;
+    Some(unix_seconds.saturating_mul(1_000) + u64::from(parsed.millisecond()))
+}
+
+fn split_docker_log_line(line: &str) -> (Option<u64>, &str) {
+    let Some((prefix, remainder)) = line.split_once(' ') else {
+        return (None, line);
+    };
+    let timestamp = parse_docker_timestamp_unix_ms(prefix);
+    if timestamp.is_none() {
+        return (None, line);
+    }
+    (timestamp, remainder)
+}
+
+fn contains_filter_match(line: &str, query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return true;
+    };
+    line.to_ascii_lowercase()
+        .contains(&query.to_ascii_lowercase())
+}
+
+fn parse_container_log_chunk(
+    stdout: &[u8],
+    contains: Option<&str>,
+    fallback_cursor_unix_ms: Option<u64>,
+) -> AppContainerLogsChunk {
+    let mut lines = Vec::new();
+    let mut max_timestamp_unix_ms: Option<u64> = None;
+
+    for raw_line in String::from_utf8_lossy(stdout).lines() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let line = raw_line.trim_end_matches('\r');
+        let (timestamp_unix_ms, message) = split_docker_log_line(line);
+        if let Some(value) = timestamp_unix_ms {
+            max_timestamp_unix_ms =
+                Some(max_timestamp_unix_ms.map_or(value, |current| current.max(value)));
+        }
+        if !contains_filter_match(message, contains) {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+
+    let next_since_unix_ms = max_timestamp_unix_ms.or(fallback_cursor_unix_ms);
+    AppContainerLogsChunk {
+        logs: lines.join("\n"),
+        next_since_unix_ms,
+    }
+}
+
+fn advance_since_cursor(current: Option<u64>, next: Option<u64>) -> Option<u64> {
+    match (current, next) {
+        (Some(existing), Some(candidate)) => Some(existing.max(candidate)),
+        (None, Some(candidate)) => Some(candidate),
+        (Some(existing), None) => Some(existing),
+        (None, None) => None,
+    }
+}
+
+async fn load_container_log_chunk(
+    container_id: &str,
+    request: &AppContainerLogsRequest,
+    timeout: Duration,
+) -> Result<AppContainerLogsChunk> {
+    let started_at_unix_ms = now_unix_ms();
+    let mut args = vec!["logs".to_string(), "--timestamps".to_string()];
+    if let Some(since) = request.since_unix_ms {
+        args.push("--since".to_string());
+        args.push(docker_timestamp_from_unix_ms(since));
+    }
+    if let Some(until) = request.until_unix_ms {
+        args.push("--until".to_string());
+        args.push(docker_timestamp_from_unix_ms(until));
+    }
+    if let Some(tail) = request.tail {
+        args.push("--tail".to_string());
+        args.push(tail.to_string());
+    }
+    args.push(container_id.to_string());
+
+    let args_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = run_docker_command_output(&args_refs, timeout)
+        .await
+        .with_context(|| format!("failed reading docker logs for container {container_id}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .to_ascii_lowercase();
+        if stderr.contains("no such container") || stderr.contains("no such object") {
+            anyhow::bail!("container disappeared while reading logs");
+        }
+        anyhow::bail!("docker logs failed for container {container_id}: {stderr}");
+    }
+
+    Ok(parse_container_log_chunk(
+        &output.stdout,
+        request.contains.as_deref(),
+        Some(started_at_unix_ms.saturating_add(1)),
+    ))
+}
+
+fn map_container_log_error(error: anyhow::Error) -> StatusCode {
+    if error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("container disappeared while reading logs")
+    {
+        StatusCode::NOT_FOUND
+    } else {
+        internal_error(error)
+    }
+}
+
+fn sanitize_download_filename_component(raw: &str) -> String {
+    let mut value = raw
+        .trim()
+        .trim_start_matches('/')
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' || ch == '.' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if value.is_empty() {
+        value = "container".to_string();
+    }
+    value
 }
 
 async fn list_project_container_ids(project_name: &str, timeout: Duration) -> Result<Vec<String>> {
@@ -4474,6 +4718,18 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/v1/apps/:app_id/containers/:container_id",
             get(get_app_container_details),
+        )
+        .route(
+            "/api/v1/apps/:app_id/containers/:container_id/logs",
+            get(get_app_container_logs),
+        )
+        .route(
+            "/api/v1/apps/:app_id/containers/:container_id/logs/stream",
+            get(stream_app_container_logs),
+        )
+        .route(
+            "/api/v1/apps/:app_id/containers/:container_id/logs/download",
+            get(download_app_container_logs),
         )
         .route("/api/v1/apps/:app_id/config", get(get_app_effective_config))
         .route(
@@ -8580,31 +8836,253 @@ async fn get_app_container_details(
         "GET",
         "/api/v1/apps/:app_id/containers/:container_id",
     )?;
-
-    if !state.db.app_exists(app_id).map_err(internal_error)? {
-        return Err(StatusCode::NOT_FOUND);
-    }
-
-    let (project_name, runtime_configured) =
-        project_name_for_app(&state.db, app_id).map_err(internal_error)?;
-    if !runtime_configured {
-        return Err(StatusCode::NOT_FOUND);
-    }
-    let items = load_project_container_runtimes_with_timeout(project_name.clone())
-        .await
-        .map_err(internal_error)?;
-    let requested = container_id.trim();
-    if requested.is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-
-    let container = select_requested_container_details(items, requested)?;
+    let (project_name, runtime) =
+        resolve_app_container_runtime(&state, app_id, &container_id).await?;
 
     Ok(Json(AppContainerDetailsResponse {
         app_id,
         project_name,
-        container,
+        container: runtime.details,
     }))
+}
+
+async fn get_app_container_logs(
+    AxumPath((app_id, container_id)): AxumPath<(Uuid, String)>,
+    Query(query): Query<AppContainerLogsQuery>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AppContainerLogsResponse>, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/containers/:container_id/logs",
+    )?;
+    let request = normalize_container_logs_query(query)?;
+    let (project_name, runtime) =
+        resolve_app_container_runtime(&state, app_id, &container_id).await?;
+    let chunk = load_container_log_chunk(&runtime.details.id, &request, Duration::from_secs(8))
+        .await
+        .map_err(map_container_log_error)?;
+
+    Ok(Json(AppContainerLogsResponse {
+        app_id,
+        project_name,
+        container_id: runtime.details.id,
+        logs: chunk.logs,
+        next_since_unix_ms: chunk.next_since_unix_ms,
+    }))
+}
+
+async fn download_app_container_logs(
+    AxumPath((app_id, container_id)): AxumPath<(Uuid, String)>,
+    Query(query): Query<AppContainerLogsQuery>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<impl IntoResponse, StatusCode> {
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/containers/:container_id/logs/download",
+    )?;
+    let request = normalize_container_logs_query(query)?;
+    let (_project_name, runtime) =
+        resolve_app_container_runtime(&state, app_id, &container_id).await?;
+    let chunk = load_container_log_chunk(&runtime.details.id, &request, Duration::from_secs(8))
+        .await
+        .map_err(map_container_log_error)?;
+    let filename = format!(
+        "{}-logs.txt",
+        sanitize_download_filename_component(&runtime.details.name)
+    );
+
+    Ok((
+        [(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )],
+        chunk.logs,
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct ContainerStreamLogsEventPayload {
+    container_id: String,
+    logs: String,
+    reset: bool,
+    next_since_unix_ms: Option<u64>,
+}
+
+fn encode_container_stream_logs_event_payload(
+    container_id: &str,
+    logs: &str,
+    reset: bool,
+    next_since_unix_ms: Option<u64>,
+) -> Result<String> {
+    serde_json::to_string(&ContainerStreamLogsEventPayload {
+        container_id: container_id.to_string(),
+        logs: logs.to_string(),
+        reset,
+        next_since_unix_ms,
+    })
+    .context("failed encoding container logs stream payload")
+}
+
+async fn stream_app_container_logs(
+    AxumPath((app_id, container_id)): AxumPath<(Uuid, String)>,
+    Query(query): Query<AppContainerLogsQuery>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl tokio_stream::Stream<Item = std::result::Result<Event, Infallible>>>, StatusCode>
+{
+    authorize_api_request(
+        &state,
+        &headers,
+        RequiredScope::Read,
+        "GET",
+        "/api/v1/apps/:app_id/containers/:container_id/logs/stream",
+    )?;
+    let request = app_container_stream_request(query)?;
+    let (_project_name, runtime) =
+        resolve_app_container_runtime(&state, app_id, &container_id).await?;
+    let container_id = runtime.details.id;
+    let container_id_for_logs = Arc::new(container_id.clone());
+    let request_state = Arc::new(Mutex::new(request));
+    let first_poll_state = Arc::new(Mutex::new(true));
+    let sent_empty_state = Arc::new(Mutex::new(false));
+    let stream_error_state = Arc::new(Mutex::new(false));
+    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(1_000)))
+        .then(move |_| {
+            let container_id = container_id_for_logs.clone();
+            let request_state = request_state.clone();
+            let first_poll_state = first_poll_state.clone();
+            let sent_empty_state = sent_empty_state.clone();
+            let stream_error_state = stream_error_state.clone();
+            async move {
+                let call_request = request_state
+                    .lock()
+                    .expect("container logs request state mutex poisoned")
+                    .clone();
+                let chunk = match load_container_log_chunk(
+                    &container_id,
+                    &call_request,
+                    Duration::from_secs(8),
+                )
+                .await
+                {
+                    Ok(value) => {
+                        *stream_error_state
+                            .lock()
+                            .expect("container logs stream error mutex poisoned") = false;
+                        value
+                    }
+                    Err(error) => {
+                        let mut had_error = stream_error_state
+                            .lock()
+                            .expect("container logs stream error mutex poisoned");
+                        if *had_error {
+                            return None;
+                        }
+                        *had_error = true;
+                        warn!(%error, %app_id, %container_id, "failed loading app container logs");
+                        let payload = match encode_container_stream_logs_event_payload(
+                            &container_id,
+                            "",
+                            true,
+                            call_request.since_unix_ms,
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(encode_error) => {
+                                warn!(
+                                    %encode_error,
+                                    %app_id,
+                                    %container_id,
+                                    "failed encoding reset payload after app container logs stream error"
+                                );
+                                return None;
+                            }
+                        };
+                        return Some(Ok(Event::default().event("logs").data(payload)));
+                    }
+                };
+
+                {
+                    let mut request_for_stream = request_state
+                        .lock()
+                        .expect("container logs request state mutex poisoned");
+                    request_for_stream.since_unix_ms = advance_since_cursor(
+                        request_for_stream.since_unix_ms,
+                        chunk.next_since_unix_ms,
+                    );
+                    request_for_stream.tail = None;
+                }
+
+                let mut first_poll = first_poll_state
+                    .lock()
+                    .expect("container logs first poll mutex poisoned");
+                let mut sent_empty_reset = sent_empty_state
+                    .lock()
+                    .expect("container logs empty state mutex poisoned");
+                let next_since_unix_ms = request_state
+                    .lock()
+                    .expect("container logs request state mutex poisoned")
+                    .since_unix_ms;
+
+                let payload = if chunk.logs.is_empty() {
+                    if !*first_poll || *sent_empty_reset {
+                        *first_poll = false;
+                        return None;
+                    }
+                    *sent_empty_reset = true;
+                    *first_poll = false;
+                    match encode_container_stream_logs_event_payload(
+                        &container_id,
+                        "",
+                        true,
+                        next_since_unix_ms,
+                    ) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                %app_id,
+                                %container_id,
+                                "failed encoding empty app container logs stream payload"
+                            );
+                            return None;
+                        }
+                    }
+                } else {
+                    *sent_empty_reset = false;
+                    let reset = *first_poll;
+                    *first_poll = false;
+                    match encode_container_stream_logs_event_payload(
+                        &container_id,
+                        &chunk.logs,
+                        reset,
+                        next_since_unix_ms,
+                    ) {
+                        Ok(encoded) => encoded,
+                        Err(error) => {
+                            warn!(
+                                %error,
+                                %app_id,
+                                %container_id,
+                                "failed encoding app container logs stream payload"
+                            );
+                            return None;
+                        }
+                    }
+                };
+
+                Some(Ok(Event::default().event("logs").data(payload)))
+            }
+        })
+        .filter_map(|event| event);
+    Ok(Sse::new(stream).keep_alive(KeepAlive::new().text("keepalive")))
 }
 
 async fn connect_github_repo(
@@ -11719,13 +12197,116 @@ mod tests {
     }
 
     #[test]
-    fn select_requested_container_details_returns_conflict_when_ambiguous() {
+    fn select_requested_container_runtime_returns_conflict_when_ambiguous() {
         let items = vec![
             test_runtime_container("abc123000000", "web-a", Some("web")),
             test_runtime_container("abc123999999", "web-b", Some("web")),
         ];
-        let selected = select_requested_container_details(items, "abc123");
+        let selected = select_requested_container_runtime(items, "abc123");
         assert_eq!(selected.unwrap_err(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn stream_request_defaults_to_tail_when_since_is_missing() {
+        let request = app_container_stream_request(AppContainerLogsQuery {
+            since: None,
+            until: None,
+            tail: None,
+            contains: None,
+        })
+        .unwrap();
+        assert_eq!(request.tail, Some(200));
+        assert_eq!(request.since_unix_ms, None);
+    }
+
+    #[test]
+    fn normalize_container_logs_query_rejects_invalid_ranges() {
+        let invalid = normalize_container_logs_query(AppContainerLogsQuery {
+            since: Some(200),
+            until: Some(100),
+            tail: None,
+            contains: None,
+        });
+        assert_eq!(invalid.unwrap_err(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn normalize_container_logs_query_applies_safe_tail_defaults() {
+        let defaulted = normalize_container_logs_query(AppContainerLogsQuery {
+            since: None,
+            until: None,
+            tail: None,
+            contains: None,
+        })
+        .unwrap();
+        assert_eq!(defaulted.tail, Some(DEFAULT_CONTAINER_LOG_TAIL));
+
+        let capped = normalize_container_logs_query(AppContainerLogsQuery {
+            since: None,
+            until: None,
+            tail: Some(MAX_CONTAINER_LOG_TAIL + 500),
+            contains: None,
+        })
+        .unwrap();
+        assert_eq!(capped.tail, Some(MAX_CONTAINER_LOG_TAIL));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_tracks_cursor_and_filters_text() {
+        let stdout = b"2026-03-03T10:00:00.123456789Z boot complete\n2026-03-03T10:00:01.000000000Z health ok\n";
+        let chunk = parse_container_log_chunk(stdout, Some("health"), None);
+        assert_eq!(
+            chunk.logs,
+            "2026-03-03T10:00:01.000000000Z health ok".to_string()
+        );
+        assert_eq!(chunk.next_since_unix_ms, Some(1_772_532_001_000));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_advances_cursor_even_for_non_matching_lines() {
+        let chunk = parse_container_log_chunk(
+            b"2026-03-03T10:00:00.123456789Z health ok\n2026-03-03T10:00:01.000000000Z boot complete\n",
+            Some("health"),
+            Some(1234),
+        );
+        assert_eq!(chunk.logs, "2026-03-03T10:00:00.123456789Z health ok");
+        assert_eq!(chunk.next_since_unix_ms, Some(1_772_532_001_000));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_uses_fallback_cursor_when_no_timestamps_parse() {
+        let chunk = parse_container_log_chunk(b"boot complete\n", Some("missing"), Some(1234));
+        assert!(chunk.logs.is_empty());
+        assert_eq!(chunk.next_since_unix_ms, Some(1234));
+    }
+
+    #[test]
+    fn parse_container_log_chunk_preserves_log_whitespace() {
+        let chunk = parse_container_log_chunk(
+            b"2026-03-03T10:00:00.000000000Z   value with spacing  \n",
+            None,
+            None,
+        );
+        assert_eq!(
+            chunk.logs,
+            "2026-03-03T10:00:00.000000000Z   value with spacing  "
+        );
+    }
+
+    #[test]
+    fn map_container_log_error_returns_not_found_for_disappeared_container() {
+        let status =
+            map_container_log_error(anyhow::anyhow!("container disappeared while reading logs"));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn advance_since_cursor_is_monotonic() {
+        assert_eq!(advance_since_cursor(Some(100), Some(120)), Some(120));
+        assert_eq!(advance_since_cursor(Some(120), Some(100)), Some(120));
+        assert_eq!(advance_since_cursor(None, Some(100)), Some(100));
+        assert_eq!(advance_since_cursor(Some(100), None), Some(100));
+        assert_eq!(advance_since_cursor(None, None), None);
     }
 
     #[tokio::test]
@@ -11836,6 +12417,90 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_container_logs_returns_not_found_when_runtime_not_configured() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("containers-missing-logs", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{}/containers/unknown-container/logs",
+                        app_row.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_container_logs_reject_invalid_time_range() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("containers-invalid-range", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{}/containers/web/logs?since=20&until=10",
+                        app_row.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn app_container_logs_stream_reject_invalid_time_range() {
+        let db_path = test_db_path();
+        let state = AppState::for_tests(&db_path, None);
+        let app_row = state
+            .db
+            .create_app("containers-invalid-stream-range", now_unix_ms())
+            .unwrap()
+            .unwrap();
+        let app = create_router(state);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/v1/apps/{}/containers/web/logs/stream?since=20&until=10",
+                        app_row.id
+                    ))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         cleanup_db(&db_path);
     }

@@ -30,6 +30,9 @@ Base path: `/api/v1` (metrics endpoint is additionally exposed at `/metrics`).
 - App container inventory:
   - `GET /apps/{app_id}/containers`
   - `GET /apps/{app_id}/containers/{container_id}`
+  - `GET /apps/{app_id}/containers/{container_id}/logs`
+  - `GET /apps/{app_id}/containers/{container_id}/logs/stream`
+  - `GET /apps/{app_id}/containers/{container_id}/logs/download`
 - Effective config: `GET /apps/{app_id}/config`
 - Env vars: `GET/PUT /apps/{app_id}/env`, `DELETE /apps/{app_id}/env/{key}`
 - Domains: `GET/POST /apps/{app_id}/domains`
@@ -165,3 +168,44 @@ Response includes:
   - `mounts[]` (`mount_type`, optional `source`, `destination`, `mode`, `read_only`)
   - `env[]` entries include `masked` flag; sensitive values are always redacted
 - If `container_id` is an ambiguous prefix that matches multiple containers, response is `409 Conflict`.
+
+## App container logs endpoints
+
+`GET /apps/{app_id}/containers/{container_id}/logs` returns a filtered container log chunk:
+
+- Query parameters:
+  - `since` (optional unix ms cursor)
+  - `until` (optional unix ms upper bound)
+  - `tail` (optional line count, defaults to `2000` when `since` is omitted; capped at `10000`)
+  - `contains` (optional case-insensitive substring filter)
+- Response includes:
+  - `logs` (newline-delimited text)
+  - `next_since_unix_ms` cursor for reconnect/incremental follow-up requests
+- Invalid ranges (`since > until`) return `400 Bad Request`.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.
+
+`GET /apps/{app_id}/containers/{container_id}/logs/stream` emits `event: logs` SSE frames with JSON payload:
+
+```json
+{
+  "container_id": "3ef8fd7f5356",
+  "logs": "2026-03-03T10:00:00.123456789Z service ready",
+  "reset": false,
+  "next_since_unix_ms": 1772532000124
+}
+```
+
+- Stream supports `since`, `until`, `tail`, and `contains` query parameters.
+- `tail` defaults to `200` on initial stream requests when `since` is omitted.
+- `reset` is `true` on initial stream snapshots so clients can replace stale output.
+- `reset` can also be emitted once with empty `logs` if container log polling temporarily fails; normal events resume after recovery.
+- Reconnect clients should pass `next_since_unix_ms` back as `since` to continue without major gaps.
+- Invalid ranges (`since > until`) return `400 Bad Request`.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.
+
+`GET /apps/{app_id}/containers/{container_id}/logs/download` returns plain-text logs as an attachment and supports the same filter/range query parameters.
+- Invalid ranges (`since > until`) return `400 Bad Request`.
+- Missing runtime/container resolution returns `404 Not Found`.
+- Ambiguous container selector matches return `409 Conflict`.

@@ -286,6 +286,35 @@ components:
           type: string
         container:
           $ref: '#/components/schemas/AppContainerDetails'
+    AppContainerLogsResponse:
+      type: object
+      required: [app_id, project_name, container_id, logs, next_since_unix_ms]
+      properties:
+        app_id:
+          type: string
+          format: uuid
+        project_name:
+          type: string
+        container_id:
+          type: string
+        logs:
+          type: string
+        next_since_unix_ms:
+          type: [integer, 'null']
+          format: int64
+    AppContainerStreamLogsEventPayload:
+      type: object
+      required: [container_id, logs, reset, next_since_unix_ms]
+      properties:
+        container_id:
+          type: string
+        logs:
+          type: string
+        reset:
+          type: boolean
+        next_since_unix_ms:
+          type: [integer, 'null']
+          format: int64
     CreateDeploymentRequest:
       type: object
       properties:
@@ -1332,6 +1361,203 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AppContainerDetailsResponse'
+        '409':
+          description: Container selector is ambiguous and matches multiple containers
+        '404':
+          description: App not found, runtime not configured, or container not found
+  /apps/{app_id}/containers/{container_id}/logs:
+    get:
+      summary: Get container logs for app project container
+      operationId: getAppContainerLogs
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: container_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Unix-ms cursor for incremental reads.
+        - name: until
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Inclusive upper bound (unix ms) for bounded reads.
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+            default: 2000
+          description: Number of latest lines to include when `since` is not supplied (capped at 10000).
+        - name: contains
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Case-insensitive substring filter applied to log message text.
+      responses:
+        '200':
+          description: Container logs chunk
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppContainerLogsResponse'
+        '400':
+          description: Invalid query (for example `since > until`)
+        '409':
+          description: Container selector is ambiguous and matches multiple containers
+        '404':
+          description: App not found, runtime not configured, or container not found
+  /apps/{app_id}/containers/{container_id}/logs/stream:
+    get:
+      summary: Stream container logs via SSE
+      operationId: streamAppContainerLogs
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: container_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Unix-ms cursor for reconnect-safe incremental reads.
+        - name: until
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+            default: 200
+          description: Initial tail size; defaults to `200` when no `since` is supplied.
+        - name: contains
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Server sent events
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Emits `event: logs` frames where `data` is a JSON object matching
+                  `AppContainerStreamLogsEventPayload`.
+              examples:
+                logs:
+                  summary: Incremental container logs event
+                  value: |
+                    event: logs
+                    data: {"container_id":"3ef8fd7f5356","logs":"2026-03-03T10:00:00.123456789Z service ready","reset":false,"next_since_unix_ms":1772532000124}
+        '400':
+          description: Invalid query (for example `since > until`)
+        '409':
+          description: Container selector is ambiguous and matches multiple containers
+        '404':
+          description: App not found, runtime not configured, or container not found
+  /apps/{app_id}/containers/{container_id}/logs/download:
+    get:
+      summary: Download container logs as plain text
+      operationId: downloadAppContainerLogs
+      security:
+        - bearerAuth: []
+        - cookieAuth: []
+      parameters:
+        - name: app_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: container_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: until
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+        - name: tail
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+            default: 2000
+        - name: contains
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Downloadable plain-text container logs
+          headers:
+            Content-Disposition:
+              schema:
+                type: string
+              description: Attachment filename
+          content:
+            text/plain:
+              schema:
+                type: string
+        '400':
+          description: Invalid query (for example `since > until`)
         '409':
           description: Container selector is ambiguous and matches multiple containers
         '404':
