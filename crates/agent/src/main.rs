@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use shared::{AgentHeartbeat, AgentRegisterRequest, AgentResourceSnapshot};
-use sysinfo::{CpuExt, DiskExt, NetworkExt, NetworksExt, System, SystemExt};
+use sysinfo::{Disks, Networks, System, MINIMUM_CPU_UPDATE_INTERVAL};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -27,6 +27,8 @@ struct AgentConfig {
 #[derive(Debug)]
 struct ResourceCollector {
     system: System,
+    disks: Disks,
+    networks: Networks,
 }
 
 #[tokio::main]
@@ -49,7 +51,7 @@ async fn main() -> Result<()> {
         warn!(%error, "agent registration failed");
     }
     let mut resource_collector = ResourceCollector::new();
-    tokio::time::sleep(System::MINIMUM_CPU_UPDATE_INTERVAL).await;
+    tokio::time::sleep(MINIMUM_CPU_UPDATE_INTERVAL).await;
 
     if config.oneshot {
         send_heartbeat(&config, Some(resource_collector.collect())).await?;
@@ -57,7 +59,7 @@ async fn main() -> Result<()> {
     }
 
     let heartbeat_interval =
-        Duration::from_secs(config.interval_seconds).max(System::MINIMUM_CPU_UPDATE_INTERVAL);
+        Duration::from_secs(config.interval_seconds).max(MINIMUM_CPU_UPDATE_INTERVAL);
     let mut ticker = tokio::time::interval(heartbeat_interval);
 
     loop {
@@ -144,25 +146,26 @@ async fn send_heartbeat(
 impl ResourceCollector {
     fn new() -> Self {
         let mut system = System::new_all();
-        system.refresh_cpu();
+        system.refresh_cpu_all();
         system.refresh_memory();
-        system.refresh_disks_list();
-        system.refresh_disks();
-        system.refresh_networks_list();
-        system.refresh_networks();
-        Self { system }
+        let disks = Disks::new_with_refreshed_list();
+        let networks = Networks::new_with_refreshed_list();
+        Self {
+            system,
+            disks,
+            networks,
+        }
     }
 
     fn collect(&mut self) -> AgentResourceSnapshot {
-        self.system.refresh_cpu();
+        self.system.refresh_cpu_all();
         self.system.refresh_memory();
-        self.system.refresh_disks();
-        self.system.refresh_networks();
+        self.disks.refresh(true);
+        self.networks.refresh(true);
 
-        let (disk_total_bytes, disk_available_bytes) = aggregate_disk_capacity(self.system.disks());
+        let (disk_total_bytes, disk_available_bytes) = aggregate_disk_capacity(self.disks.list());
         let (network_rx_bytes, network_tx_bytes) =
-            self.system
-                .networks()
+            self.networks
                 .iter()
                 .fold((0u64, 0u64), |(rx, tx), (_name, data)| {
                     (
@@ -172,7 +175,7 @@ impl ResourceCollector {
                 });
 
         AgentResourceSnapshot {
-            cpu_percent: self.system.global_cpu_info().cpu_usage() as f64,
+            cpu_percent: self.system.global_cpu_usage() as f64,
             // sysinfo already reports memory in bytes on our pinned version.
             memory_used_bytes: self.system.used_memory(),
             memory_total_bytes: self.system.total_memory(),
@@ -197,9 +200,7 @@ fn aggregate_disk_capacity(disks: &[sysinfo::Disk]) -> (u64, u64) {
     let mut available = 0u64;
 
     for disk in disks {
-        let fs_name = std::str::from_utf8(disk.file_system())
-            .unwrap_or_default()
-            .to_ascii_lowercase();
+        let fs_name = disk.file_system().to_string_lossy().to_ascii_lowercase();
         if should_skip_filesystem(&fs_name) {
             continue;
         }

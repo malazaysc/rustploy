@@ -8,6 +8,8 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 
 ### Changed
 
+- Upgraded project toolchain baseline to Rust 1.93 (`Dockerfile` builder image + workspace `rust-version`) and refreshed workspace dependency requirements to current releases.
+- Updated core crates to current major/minor lines, including `axum 0.8`, `rusqlite 0.38`, `sysinfo 0.38`, and `uuid 1.21`.
 - Reworked the embedded web dashboard to match the provided v0 mock style (sidebar navigation, top header, metric cards, and refreshed dark theme) while preserving existing live deploy/log/domain/env workflows.
 - Hardened deployment/log rendering by switching selected-deployment and logs explorer result cards to DOM-safe text rendering and improved logs explorer query resilience with per-app partial-failure handling.
 - Internal clippy-driven cleanup in `crates/server/src/lib.rs` (removed needless borrows); no user-visible behavior change.
@@ -25,9 +27,18 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
 - Container log retrieval now supports per-container `since` cursors, optional `until` range bounds, and case-insensitive text filtering (`contains`) for incremental reads and reconnect-safe consumers.
 - Container log reads now enforce bounded tail behavior (`2000` default, `10000` max; stream bootstrap default remains `200`) to avoid unbounded full-history fetches.
+- Dashboard project workspace now includes a dedicated `Containers` tab with project-scoped container inventory, auto-refreshing status rows, detailed runtime metadata, and integrated per-container logs controls (filter/range/live tail/download).
+- Containers workspace now includes an all-project container inventory table (cross-app view) with direct click-through into app-specific container details and logs.
+- Dashboard UX pass to reduce operator confusion:
+  - added a `Quick Workflow` card,
+  - changed app action copy from `Open` to `Select`,
+  - enabled row-click app selection in the app list,
+  - collapsed secondary setup/config panels by default (`Create App`, `Import GitHub Repo`, `Domains`, `Environment`).
 
 ### Fixed
 
+- Migrated HTTP route definitions to `axum 0.8` path parameter syntax (`{param}`), restoring route matching under the upgraded router version.
+- Updated agent resource collection for `sysinfo 0.38` API changes (separate `Disks`/`Networks` collectors, new CPU usage APIs, and `OsStr` filesystem handling).
 - SSE log payload encoding now escapes carriage returns as well as newlines to prevent stream panics on runtime logs.
 - Dashboard live logs no longer retain stale content when active deployment changes before new log lines are written.
 - Manual deployment log view now synchronizes stream deployment selection to avoid mixed incremental output.
@@ -59,6 +70,12 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container log parsing now preserves line whitespace in returned payloads (except trailing `\\r` normalization).
 - Container log SSE polling now emits a single `reset` event on first poll failure and suppresses repeated failure noise until recovery.
 - Container log cursor advancement now incorporates parsed timestamps from non-matching lines and stream cursor updates are monotonic, preventing replay loops when `contains` filters are active.
+- Containers-tab live log rendering now caps retained output length to avoid unbounded `<pre>` growth during long sessions.
+- Containers table rows are now keyboard-activatable (`Tab`, `Enter`, `Space`) for accessible container selection.
+- Containers auto-refresh polling now runs only while the `Containers` tab is visible and skips overlapping refreshes.
+- Containers live-log streaming now stops when leaving the `Containers` panel and reconnect backoff resets after successful log events.
+- App list row rendering now uses DOM-safe node assembly and handler binding (instead of interpolated `innerHTML`/inline `onclick`) to prevent stored XSS from app names.
+- All-project containers refresh now uses bounded per-app request concurrency and skips background fan-out while the all-project panel is collapsed.
 
 ### Added
 

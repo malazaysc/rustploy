@@ -158,6 +158,7 @@ Response includes:
   - `started_at`, `restart_count`, `image`
   - `port_mappings[]` (`container_port`, `protocol`, optional `host_ip`, optional `host_port`)
   - optional `health` (`status`, `last_output`)
+- Dashboard all-project container inventory is an aggregation pattern only (`GET /apps` followed by per-app `GET /apps/{app_id}/containers` calls); there is no dedicated cross-project containers endpoint in the wire contract.
 
 `GET /apps/{app_id}/containers/{container_id}` returns detailed metadata for one runtime container:
 

@@ -29,6 +29,22 @@
 - Container logs now support reconnect-safe `since` cursors, optional `until` windows, case-insensitive text filtering (`contains`), bounded tail defaults/caps, and download-friendly plain-text responses while preserving original line whitespace in API payloads.
 - Container logs cursor advancement now remains monotonic and advances from parsed timestamps even when filtered lines are not returned, avoiding repeated scans/replay loops with `contains` filters.
 - Live container log streams now emit one reset frame on transient poll failures and suppress repeated failure events until a successful recovery read.
+- Dashboard project workspace now exposes a `Containers` tab with:
+  - container status table (status, ports, uptime, restart count, image),
+  - selected-container metadata (health/networks/mounts/labels/command),
+  - logs viewer controls (contains filter, since/until range, live tail reconnect, and download),
+  - automatic container refresh every 5 seconds plus manual refresh.
+- Containers tab now also renders an all-project runtime inventory table so operators can see every app container in one view and click through directly into app-scoped details/log tailing.
+- App list rendering in dashboard now builds rows with DOM-safe text nodes/button handlers (no interpolated `innerHTML` actions), closing stored-XSS injection paths for app names.
+- All-project containers refresh now runs with bounded concurrency and is skipped while the all-project panel is collapsed, reducing periodic backend load.
+- Dashboard interaction flow has been simplified with:
+  - a new "Quick Workflow" guide card,
+  - row-click app selection (plus explicit `Select` action label),
+  - secondary setup/config panels (`Create App`, `Import`, `Domains`, `Environment`) collapsed by default.
+- Containers-tab follow-up hardening now caps live-log `<pre>` growth, adds keyboard row selection (`Enter`/`Space`), and prevents overlapping background refresh calls when the tab is hidden.
+- Containers-tab stream lifecycle now tears down SSE and reconnect timers when switching away from `Containers`, and reconnect backoff resets after logs resume.
+- Build/runtime toolchain now targets Rust 1.93 (Docker builder + workspace `rust-version`) to keep local dockerized builds aligned with current stable requirements.
+- Workspace dependency set has been refreshed to current releases (including `axum 0.8`, `rusqlite 0.38`, `sysinfo 0.38`, and `uuid 1.21`) with compatibility fixes for updated APIs.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
@@ -76,5 +92,5 @@
 ## Last Verified
 
 - Date: 2026-03-03
-- Commit base: `214b854`
-- Note: app runtime introspection now includes project container inventory plus per-container log stream/download APIs for status/port/detail/log visibility; dashboard telemetry remains available via `/api/v1/dashboard/metrics`.
+- Commit base: `c23122353764fa11ba8244d95ef76f5d6ee21d36`
+- Note: toolchain/dependency refresh validated with full `cargo test` and dockerized startup against Rust 1.93.
