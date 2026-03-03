@@ -23,6 +23,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Runtime container env metadata returned by new container-inspection APIs now redacts sensitive values using key-based secret heuristics.
 - Runtime container command metadata now sanitizes secret-like `key=value` arguments and credential-bearing URL arguments before returning API payloads.
 - Container detail lookup now returns `409 Conflict` when a selector ambiguously matches multiple containers instead of returning an arbitrary first match.
+- Container log retrieval now supports per-container `since` cursors, optional `until` range bounds, and case-insensitive text filtering (`contains`) for incremental reads and reconnect-safe consumers.
 
 ### Fixed
 
@@ -94,3 +95,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - App runtime container inventory endpoints:
   - `GET /api/v1/apps/:id/containers` for project-scoped container summaries (status, ports, image, restart count, health).
   - `GET /api/v1/apps/:id/containers/:container_id` for detailed container metadata (labels, mounts, networks, exposed ports, masked env vars).
+- App runtime container log endpoints:
+  - `GET /api/v1/apps/:id/containers/:container_id/logs` for filtered/range-bounded log chunks with `next_since_unix_ms` cursor.
+  - `GET /api/v1/apps/:id/containers/:container_id/logs/stream` for live SSE container logs with reconnect cursor semantics.
+  - `GET /api/v1/apps/:id/containers/:container_id/logs/download` for attachment-style plain-text log export over selected windows.

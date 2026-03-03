@@ -207,6 +207,15 @@ pub struct AppContainerDetailsResponse {
     pub container: AppContainerDetails,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppContainerLogsResponse {
+    pub app_id: Uuid,
+    pub project_name: String,
+    pub container_id: String,
+    pub logs: String,
+    pub next_since_unix_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateDeploymentRequest {
     pub source_ref: Option<String>,
@@ -793,6 +802,32 @@ mod tests {
         );
         let decoded: AppContainerListResponse =
             serde_json::from_value(encoded).expect("deserialize container list");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn app_container_logs_response_json_shape_roundtrip() {
+        let app_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+        let response = AppContainerLogsResponse {
+            app_id,
+            project_name: "rustploy-444444444444".to_string(),
+            container_id: "abc123".to_string(),
+            logs: "2026-03-03T00:00:00.000000000Z boot complete".to_string(),
+            next_since_unix_ms: Some(1_709_440_000_123),
+        };
+        let encoded = serde_json::to_value(&response).expect("serialize container logs response");
+        assert_eq!(
+            encoded,
+            json!({
+                "app_id": "44444444-4444-4444-4444-444444444444",
+                "project_name": "rustploy-444444444444",
+                "container_id": "abc123",
+                "logs": "2026-03-03T00:00:00.000000000Z boot complete",
+                "next_since_unix_ms": 1709440000123u64
+            })
+        );
+        let decoded: AppContainerLogsResponse =
+            serde_json::from_value(encoded).expect("deserialize container logs response");
         assert_eq!(decoded, response);
     }
 }

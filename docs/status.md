@@ -22,6 +22,11 @@
 - Added `GET /api/v1/apps/{app_id}/runtime` runtime probe and wired dashboard routing panel to display live runtime online/offline state separately from deployment history.
 - Added project-scoped container inventory APIs (`GET /api/v1/apps/{app_id}/containers` and `GET /api/v1/apps/{app_id}/containers/{container_id}`) to expose runtime container status, port mappings, and detailed metadata with secret env-value masking.
 - Container inventory internals now tolerate explicit `null` collection fields from `docker inspect`, execute Docker CLI queries on blocking workers with request timeouts, and return `409` for ambiguous container-id prefix lookups.
+- Added per-container logs APIs for compose runtime containers:
+  - `GET /api/v1/apps/{app_id}/containers/{container_id}/logs`
+  - `GET /api/v1/apps/{app_id}/containers/{container_id}/logs/stream`
+  - `GET /api/v1/apps/{app_id}/containers/{container_id}/logs/download`
+- Container logs now support reconnect-safe `since` cursors, optional `until` windows, case-insensitive text filtering (`contains`), and download-friendly plain-text responses.
 - Added a stronger operations panel with a collapsible "Recent Deployments" card plus a dedicated "Selected Deployment" summary card for condensed status/metadata.
 - Dedicated Logs Explorer page (`/logs`) now supports deployment queries and filtering across app/status/source/time window, plus text filtering within loaded deployment logs.
 - Logs Explorer query flow now tolerates per-app fetch failures (partial results mode), ignores stale out-of-order query responses, and uses DOM-safe rendering for deployment summaries/results.
@@ -69,5 +74,5 @@
 ## Last Verified
 
 - Date: 2026-03-03
-- Commit base: `2d1e7f8`
-- Note: app runtime introspection now includes project container inventory endpoints for per-container status/port/detail visibility; dashboard telemetry remains available via `/api/v1/dashboard/metrics`.
+- Commit base: `214b854`
+- Note: app runtime introspection now includes project container inventory plus per-container log stream/download APIs for status/port/detail/log visibility; dashboard telemetry remains available via `/api/v1/dashboard/metrics`.
