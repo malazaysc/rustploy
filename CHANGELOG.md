@@ -51,6 +51,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Managed-service reachability probes now run with bounded concurrency to reduce dashboard metrics latency as endpoint counts grow.
 - Container-inventory Docker inspect parsing now tolerates explicit `null` collection fields (`Cmd`, `Env`, `Labels`, `ExposedPorts`, `Ports`, `Networks`, `Mounts`) instead of failing deserialization.
 - App container inventory handlers now run Docker CLI inspection in a blocking task with a timeout, preventing async request-worker stalls when Docker is slow/unresponsive.
+- Container detail healthcheck `last_output` now redacts credential-bearing URL patterns and secret-like `KEY=value` fragments before returning API responses.
 
 ### Added
 
