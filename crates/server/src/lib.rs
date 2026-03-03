@@ -4280,11 +4280,26 @@ fn extract_container_health(health: Option<DockerInspectHealth>) -> Option<AppCo
         .log
         .iter()
         .rev()
-        .find_map(|entry| to_non_empty(entry.output.clone()));
+        .find_map(|entry| sanitize_health_output(&entry.output));
     Some(AppContainerHealth {
         status,
         last_output,
     })
+}
+
+fn sanitize_health_output(raw: &str) -> Option<String> {
+    let value = to_non_empty(raw.to_string())?;
+    if value.contains("://") && value.contains('@') {
+        return Some("[REDACTED]".to_string());
+    }
+    if value.split_whitespace().any(|token| {
+        token
+            .split_once('=')
+            .is_some_and(|(key, _)| should_mask_env_value(key))
+    }) {
+        return Some("[REDACTED]".to_string());
+    }
+    Some(value)
 }
 
 fn extract_container_port_mappings(
@@ -11648,6 +11663,22 @@ mod tests {
             .health
             .as_ref()
             .is_some_and(|health| health.log.is_empty()));
+    }
+
+    #[test]
+    fn sanitize_health_output_masks_credentials_and_secret_pairs() {
+        assert_eq!(
+            sanitize_health_output("postgres://user:pass@db:5432/app"),
+            Some("[REDACTED]".to_string())
+        );
+        assert_eq!(
+            sanitize_health_output("TOKEN=abc123 probe failed"),
+            Some("[REDACTED]".to_string())
+        );
+        assert_eq!(
+            sanitize_health_output("probe failed"),
+            Some("probe failed".to_string())
+        );
     }
 
     fn test_runtime_container(
