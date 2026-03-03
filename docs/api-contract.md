@@ -199,6 +199,7 @@ Response includes:
 - Stream supports `since`, `until`, `tail`, and `contains` query parameters.
 - `tail` defaults to `200` on initial stream requests when `since` is omitted.
 - `reset` is `true` on initial stream snapshots so clients can replace stale output.
+- `reset` can also be emitted once with empty `logs` if container log polling temporarily fails; normal events resume after recovery.
 - Reconnect clients should pass `next_since_unix_ms` back as `since` to continue without major gaps.
 - Missing runtime/container resolution returns `404 Not Found`.
 - Ambiguous container selector matches return `409 Conflict`.

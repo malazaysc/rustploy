@@ -8944,12 +8944,14 @@ async fn stream_app_container_logs(
     let request_state = Arc::new(Mutex::new(request));
     let first_poll_state = Arc::new(Mutex::new(true));
     let sent_empty_state = Arc::new(Mutex::new(false));
+    let stream_error_state = Arc::new(Mutex::new(false));
     let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(1_000)))
         .then(move |_| {
             let container_id = container_id_for_logs.clone();
             let request_state = request_state.clone();
             let first_poll_state = first_poll_state.clone();
             let sent_empty_state = sent_empty_state.clone();
+            let stream_error_state = stream_error_state.clone();
             async move {
                 let call_request = request_state
                     .lock()
@@ -8962,10 +8964,39 @@ async fn stream_app_container_logs(
                 )
                 .await
                 {
-                    Ok(value) => value,
+                    Ok(value) => {
+                        *stream_error_state
+                            .lock()
+                            .expect("container logs stream error mutex poisoned") = false;
+                        value
+                    }
                     Err(error) => {
+                        let mut had_error = stream_error_state
+                            .lock()
+                            .expect("container logs stream error mutex poisoned");
+                        if *had_error {
+                            return None;
+                        }
+                        *had_error = true;
                         warn!(%error, %app_id, %container_id, "failed loading app container logs");
-                        return None;
+                        let payload = match encode_container_stream_logs_event_payload(
+                            &container_id,
+                            "",
+                            true,
+                            call_request.since_unix_ms,
+                        ) {
+                            Ok(encoded) => encoded,
+                            Err(encode_error) => {
+                                warn!(
+                                    %encode_error,
+                                    %app_id,
+                                    %container_id,
+                                    "failed encoding reset payload after app container logs stream error"
+                                );
+                                return None;
+                            }
+                        };
+                        return Some(Ok(Event::default().event("logs").data(payload)));
                     }
                 };
 

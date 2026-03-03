@@ -57,6 +57,7 @@ The format is based on Keep a Changelog and this project aims to follow Semantic
 - Container log APIs now return `404` (instead of `500`) when a container disappears between selector resolution and log retrieval.
 - Container log cursor advancement no longer adds `+1ms` after reads, avoiding potential skips when multiple log entries share the same millisecond timestamp.
 - Container log parsing now preserves line whitespace in returned payloads (except trailing `\\r` normalization).
+- Container log SSE polling now emits a single `reset` event on first poll failure and suppresses repeated failure noise until recovery.
 
 ### Added
 
