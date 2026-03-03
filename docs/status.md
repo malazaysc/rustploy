@@ -92,5 +92,5 @@
 ## Last Verified
 
 - Date: 2026-03-03
-- Commit base: `6176fc6b3705f83fc6638763895770766537ab1f`
+- Commit base: `c23122353764fa11ba8244d95ef76f5d6ee21d36`
 - Note: toolchain/dependency refresh validated with full `cargo test` and dockerized startup against Rust 1.93.
