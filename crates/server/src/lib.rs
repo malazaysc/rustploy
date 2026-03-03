@@ -3928,16 +3928,27 @@ fn project_name_for_app(db: &Database, app_id: Uuid) -> Result<(String, bool)> {
 async fn load_project_container_runtimes_with_timeout(
     project_name: String,
 ) -> Result<Vec<AppContainerRuntime>> {
-    let timeout = Duration::from_secs(5);
-    let container_ids = list_project_container_ids(&project_name, timeout).await?;
-    if container_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut items = inspect_containers_by_id(&container_ids, timeout)
-        .await?
-        .into_iter()
-        .map(map_inspected_container_to_runtime)
-        .collect::<Vec<_>>();
+    let command_timeout = Duration::from_secs(5);
+    let total_timeout = Duration::from_secs(15);
+    let mut items = tokio::time::timeout(total_timeout, async {
+        let container_ids = list_project_container_ids(&project_name, command_timeout).await?;
+        if container_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let items = inspect_containers_by_id(&container_ids, command_timeout)
+            .await?
+            .into_iter()
+            .map(map_inspected_container_to_runtime)
+            .collect::<Vec<_>>();
+        Ok::<Vec<AppContainerRuntime>, anyhow::Error>(items)
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "container runtime inspection timed out after {} seconds",
+            total_timeout.as_secs()
+        )
+    })??;
     items.sort_by(|a, b| a.summary.name.cmp(&b.summary.name));
     Ok(items)
 }
